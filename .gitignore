@@ -1,0 +1,97 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ---- Packaging / build output ----
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+MANIFEST
+
+# ---- Test & type-check caches ----
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+
+# ---- Spool / mailbox artifacts ----
+# The file mailbox is runtime state, never source. A committed request or a stale
+# heartbeat is worse than useless: data_get_blob caches by path forever, so a
+# resurrected response file can be served in place of a live one.
+#
+# Anchored to spool directories on purpose. Bare `req/` and `res/` rules would
+# also swallow protocol test fixtures, silently — and a fixture that git ignores
+# is a test suite quietly checking nothing.
+mcp_spool/
+/spool/
+*.spool/
+heartbeat.json
+bridge.lock
+
+# Local spool/install overrides (ARMORPAINT_MCP_CONFIG points at one of these).
+# The usual home is %APPDATA%\armorpaint-mcp\config.json, outside the repo — but
+# a checked-in copy would carry one machine's absolute paths to everyone else's.
+/config.json
+armorpaint-mcp.json
+
+# ---- Local configuration ----
+# Machine-specific ArmorPaint paths; never shared.
+.env
+.env.*
+!.env.example
+.mcp.json
+local_settings.py
+*.local.json
+
+# ---- Patch working files ----
+# apply_viewport_patch.py writes temp + os.replace; a crash mid-write can leave these.
+*.tmp
+*.orig
+*.rej
+
+# ---- Logs & scratch ----
+*.log
+logs/
+scratch/
+tmp/
+
+# ---- Editors & OS ----
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Test fixtures stay tracked ----
+# Last word wins in gitignore. Protocol tests ship sample request/response and
+# heartbeat files; the rules above must not reach into them.
+!tests/fixtures/**

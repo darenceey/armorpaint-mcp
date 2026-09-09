@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "armorpaint-mcp"
+version = "1.0.0"
+description = "MCP server that drives ArmorPaint 1.0 through a minic bridge plugin over a file mailbox."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.2.0",
+]
+keywords = ["mcp", "armorpaint", "texturing", "pbr", "3d"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+
+[project.scripts]
+armorpaint-mcp = "armorpaint_mcp.server:run"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["armorpaint_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "armorpaint_mcp",
+    "docs",
+    "plugin",
+    "patch",
+    "tests",
+]

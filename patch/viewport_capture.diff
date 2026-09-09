@@ -1,0 +1,45 @@
+diff --git a/paint/sources/functions.h b/paint/sources/functions.h
+index 6ac4ebd..3e47922 100644
+--- a/paint/sources/functions.h
++++ b/paint/sources/functions.h
+@@ -412,6 +412,7 @@ void                      viewport_update_camera_type(i32 camera_type);
+ void                      viewport_capture_screenshot();
+ void                      viewport_capture_screenshot_to(gpu_texture_t *target, float x, float y, float w, float h);
+ void                      viewport_save_texture(gpu_texture_t *screenshot);
++void                      viewport_save_texture_to_file(gpu_texture_t *screenshot, char *path); // armorpaint-mcp
+ void                      viewport_capture_video_begin();
+ void                      viewport_capture_video_end();
+ void                      tab_fonts_draw(ui_handle_t *htab);
+diff --git a/paint/sources/minic_api_list.h b/paint/sources/minic_api_list.h
+index 4fecf98..35cb1fc 100644
+--- a/paint/sources/minic_api_list.h
++++ b/paint/sources/minic_api_list.h
+@@ -542,6 +542,7 @@ X1(context_select_tool, "v(i i)", v, i)
+ X3(gpu_create_render_target, "p:gpu_texture_t(i width,i height,i format)", p, i, i, i)
+ X5(viewport_capture_screenshot_to, "v(p:gpu_texture_t target,f x,f y,f w,f h)", v, p, f, f, f, f)
+ X1(viewport_save_texture, "v(p:gpu_texture_t screenshot)", v, p)
++X2(viewport_save_texture_to_file, "v(p:gpu_texture_t screenshot,p:char path)", v, p, p) // armorpaint-mcp
+ X1(project_reskin_mesh, "b(i frame)", b, i)
+ X0(iron_delay_idle_sleep, "v()", v)
+ 
+diff --git a/paint/sources/viewport.c b/paint/sources/viewport.c
+index 19658eb..4f3e1d9 100644
+--- a/paint/sources/viewport.c
++++ b/paint/sources/viewport.c
+@@ -116,6 +116,16 @@ void viewport_save_texture(gpu_texture_t *screenshot) {
+ 	import_texture_run(abs, true);
+ }
+ 
++// --- armorpaint-mcp: begin -------------------------------------------------------
++// Write a captured viewport texture straight to a PNG on disk.
++// Upstream's viewport_save_texture() encodes into the project's in-memory packed_assets, which an
++// external process cannot read. This variant uses iron_write_png so an MCP agent can see its work.
++void viewport_save_texture_to_file(gpu_texture_t *screenshot, char *path) {
++	iron_write_png(path, gpu_get_texture_pixels(screenshot), screenshot->width, screenshot->height, 0);
++}
++// --- armorpaint-mcp: end ---------------------------------------------------------
++
++
+ void viewport_capture_screenshot() {
+ 	render_target_t *rt  = any_map_get(render_path_render_targets, "last");
+ 	gpu_texture_t   *tex = rt->_image;
