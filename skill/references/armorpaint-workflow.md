@@ -73,7 +73,11 @@ ap_material_create "wear_pass"          -> new material, becomes active
 ap_node_add / ap_node_set_value / ap_node_connect ...
 ap_node_set_value ... (kind=float|color|vector|button)
 <update>                                -> re-parse; nothing is live until this runs
-ap_material_set_channels base=0 rough=1 met=0 nor=0 ...
+ap_material_set_channels base=false roughness=true metallic=false normal=false ...
+                                        (booleans, and the full channel names: base,
+                                         opacity, occlusion, roughness, metallic, normal,
+                                         height, emission, subsurface. An abbreviation is
+                                         silently ignored, leaving that channel unchanged.)
 ap_fill_layer                           -> writes only the enabled channels
 ```
 
@@ -114,7 +118,9 @@ Guards that make it a silent no-op: no layer selected, or the layer is a group.
 Strokes exist, and they are the least reliable thing you can do blind.
 
 ```
-ap_select_tool 0                    (0 brush, 1 eraser, 2 fill, 3 decal, ... 13 bake)
+ap_select_tool tool=brush           (a NAME, not an index: bake blur brush clone colorid
+                                     cursor decal eraser fill material particle picker
+                                     select text)
 ap_set_brush radius=0.5 opacity=1.0 hardness=0.8 scale=1.0 angle=0 blending=0
 ap_paint_stroke_world  "x,y,z; x,y,z; ..."      -> N x script_paint_world + paint_end
 ap_paint_stroke        "x,y; x,y; ..."          -> N x script_paint + paint_end

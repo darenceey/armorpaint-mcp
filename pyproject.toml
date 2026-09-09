@@ -8,7 +8,10 @@ version = "1.0.0"
 description = "MCP server that drives ArmorPaint 1.0 through a minic bridge plugin over a file mailbox."
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.2.0",
+    # Upper bound is load-bearing: mcp 2.x dropped the low-level @server.list_tools() /
+    # @server.call_tool() decorators this server is written against, so an unpinned
+    # install resolves to 2.x and fails at import with an AttributeError.
+    "mcp>=1.2.0,<2",
 ]
 keywords = ["mcp", "armorpaint", "texturing", "pbr", "3d"]
 classifiers = [
@@ -33,5 +36,5 @@ include = [
     "docs",
     "plugin",
     "patch",
-    "tests",
+    "skill",
 ]

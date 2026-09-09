@@ -609,7 +609,12 @@ def sweep_orphans(spool: Path, max_age_s: float = ORPHAN_MAX_AGE_S) -> int:
     """
     removed = 0
     now = time.time()
-    for sub, patterns in ((RES_DIR, ("*.json", "*.done")), (REQ_DIR, ("*.json.tmp",))):
+    # req/*.json is swept too: a server killed before its own timeout leaves one
+    # behind, and the bridge would otherwise execute it on ArmorPaint's next
+    # start. The bridge drains req/ at startup for the same reason; this is the
+    # other half, for when the bridge is already running. The 24h floor keeps it
+    # clear of any live request (the longest op deadline here is 900 s).
+    for sub, patterns in ((RES_DIR, ("*.json", "*.done")), (REQ_DIR, ("*.json.tmp", "*.json"))):
         directory = spool / sub
         if not directory.is_dir():
             continue

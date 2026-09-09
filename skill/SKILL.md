@@ -155,9 +155,9 @@ independent of the mesh's UVs — ideal for judging a procedural look before com
 writes the **same filenames** as a layer export, so always bake into its own directory.
 
 **Level 5 — the human's eyes.** For anything about read, feel, or art direction, set the viewport
-channel for them (`ap_set_display_channel`, `0` lit / `1` base color / `4` roughness / `5` metallic /
-`2` normal) and ask a specific question: "does the wear read as edge wear or as noise?" Do not ask
-"does it look good".
+channel for them (`ap_set_display_channel mode=lit` / `base_color` / `roughness` / `metallic` /
+`normal_map` — a name, not an index) and ask a specific question: "does the wear read as edge wear
+or as noise?" Do not ask "does it look good".
 
 **Level 0 — check which of these you actually need.** `ap_get_app_info` reports `viewport_patch`.
 When it is `true` (`docs/UPSTREAM_CHANGES.md`, source builds only) `ap_capture_viewport` writes a

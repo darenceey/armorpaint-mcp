@@ -837,7 +837,7 @@ struct. Unlisted fields are unreachable; there is no offset arithmetic escape ha
 | `xray` | int | RW | |
 | `capturing_screenshot` | bool | RW | `make_tilesheet.c:88` |
 
-**18 fields. The real `context_t` has well over a hundred** — `format_type`, `layers_export`,
+**16 fields. The real `context_t` has well over a hundred** — `format_type`, `layers_export`,
 `layer_preview_dirty`, `rtdirty`, `texture_export_path`, `envmap_angle`, `show_envmap_blur` and the
 rest are **not** exposed.
 

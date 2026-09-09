@@ -10,11 +10,16 @@ and export textures — against a **stock, unmodified ArmorPaint**, including th
 > This is an independent third-party tool. Please do not file ArmorPaint bugs for it, and do not
 > file its bugs upstream.
 
-> **Status: pre-release.** The wire protocol, the plugin-API reference (derived by reading
-> ArmorPaint's source, not its docs), and the optional native patch are complete and in this tree.
-> The server and the bridge plugin are still being built, so **the install steps below run ahead of
-> the code.** The tool index is the surface being implemented; every entry in it is backed by a
-> named ArmorPaint binding rather than a hope.
+> **Status: works, lightly travelled.** All 58 tools are implemented and were exercised against a
+> live ArmorPaint 1.0: a 66-call sweep covering 42 tools returned **60 OK, 6 structured errors (all
+> deliberate bad-input probes), 0 crashes or timeouts**, at 15–513 ms per call. That includes the
+> destructive surface — `project_new`, `project_open`, `project_save_as`, `material_delete`,
+> `export_*` and the paint ops — run against a scratch project.
+>
+> What that does **not** cover: **Windows is the only platform tested.** The Linux and macOS paths
+> are written but unexercised. Long painting sessions, huge meshes and 4K exports are untested, and
+> the optional viewport patch has only been built against the pinned commit named in
+> `docs/UPSTREAM_CHANGES.md`. Expect rough edges outside the tested path, and please report them.
 
 ---
 
@@ -71,7 +76,7 @@ The byte-level contract is [docs/PROTOCOL.md](docs/PROTOCOL.md).
 |---|---|
 | ArmorPaint | **1.0** (the current C/minic generation). The plugin system in the pre-2025 Haxe/Kha builds is a different thing entirely and is not supported. |
 | OS | Windows 10/11 verified. Linux/macOS should work — the protocol is plain files — but are untested. |
-| Python | 3.10+ |
+| Python | 3.11+ |
 | MCP client | Anything that can launch a stdio MCP server (Claude Code, Claude Desktop, …) |
 | Compiler | **None.** Not for the core toolkit. Only the optional viewport patch needs a self-built ArmorPaint. |
 
@@ -83,7 +88,8 @@ Short version; the careful one is [docs/INSTALL.md](docs/INSTALL.md).
    `<ArmorPaint>/data/plugins/`. (That directory is beside `ArmorPaint.exe`, and it already
    contains `autosave.c`, `converter.c` and friends — that is how you know you found it.)
 2. **Enable it.** In ArmorPaint: **Plugins** tab → **Preferences** button → the **Plugins** list →
-   tick `mcp_bridge`. It starts immediately; no restart. The choice is remembered, and the plugin
+   tick `armorpaint_mcp_bridge` (the list shows the filename without its extension). It starts
+   immediately; no restart. The choice is remembered, and the plugin
    auto-starts on subsequent launches.
 3. **Install the server.** `pip install -e .` in this repo (or point `uv` at the directory).
 4. **Register it with your client.** In `.mcp.json`:
@@ -180,7 +186,7 @@ find its inputs and confirm its outputs, without a second tool server.
 
 | Tool | Does |
 |---|---|
-| `ap_get_context` | The workhorse read: tool, brush, layer, material, viewport mode, … (18 fields) |
+| `ap_get_context` | The workhorse read: tool, brush, layer, material, viewport mode, … (15 fields) |
 | `ap_get_config` | The 16 readable config fields |
 | `ap_set_config` | Write those same 16 (`layer_res`, `camera_fov`, `workspace`, `workflow`, …) |
 | `ap_get_main_object` | The active paint object: name, visibility, transform |
@@ -207,7 +213,7 @@ find its inputs and confirm its outputs, without a second tool server.
 vector / button).
 
 Node types are Blender-style uppercase identifiers — `TEX_NOISE`, `TEX_BRICK`, `RGB`, `MIX_RGB` —
-and `ap_node_add` validates against the 68 legal names rather than passing an unknown string into
+and `ap_node_add` validates against the 76 legal names rather than passing an unknown string into
 the app. The list is in `docs/MINIC_DIALECT_AND_API.md` §2.6.
 
 **Painting & viewport** (7)

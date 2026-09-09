@@ -14,7 +14,7 @@ tested, so this document is written for it.
   more decisive check: the install directory contains `data\plugins\*.c`. If the plugins there are
   `.js` or `.hx` instead, you have a pre-2025 Haxe/Kha build and nothing in this repository applies
   to it.
-- **Python 3.10 or newer** — `python --version`.
+- **Python 3.11 or newer** — `python --version`. (`pyproject.toml` sets `requires-python = ">=3.11"`; pip refuses to install on 3.10.)
 - **An MCP client** that launches stdio servers (Claude Code, Claude Desktop, …).
 
 No compiler is required. The optional viewport patch (step 8) is the only part that needs one.
@@ -102,7 +102,8 @@ In ArmorPaint:
 
 1. Open the **Plugins** tab (a sidebar tab).
 2. Click **Preferences** — this opens the Preferences box already on its Plugins section.
-3. Find **mcp_bridge** in the list and **tick its checkbox.**
+3. Find **armorpaint_mcp_bridge** in the list and **tick its checkbox.** (The list shows each
+   plugin's filename with the extension stripped, so it matches `armorpaint_mcp_bridge.c`.)
 
 The plugin starts the moment you tick it — there is no restart, and no "apply". Close the
 Preferences box; that is when ArmorPaint writes the setting to `config.json`, so the plugin will

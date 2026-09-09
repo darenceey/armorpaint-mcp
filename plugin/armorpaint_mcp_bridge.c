@@ -125,6 +125,19 @@ char *last_op       = "-";
 char *last_id       = "-";
 char *last_error    = "-";
 
+// capture_viewport's render target, kept between calls.
+//
+// gpu_create_render_target is bound, but NO destructor is: gpu_delete_texture
+// exists in the engine (iron.h:854) and is simply absent from minic's binding
+// table, so a plugin can never free a target it allocates. Allocating one per
+// request would leak ~4 MB of VRAM per 1024x1024 capture, and a see -> adjust
+// -> see loop is the whole point of the op. Reusing one target makes the steady
+// state free. Changing the capture SIZE still abandons the previous target, so
+// callers should keep the size stable within a session.
+void *capture_tex;
+int   capture_w = 0;
+int   capture_h = 0;
+
 // Pre-formatted panel lines. on_ui runs every frame the Plugins tab is open and
 // string() allocates from a heap nothing ever collects, so formatting there
 // would leak steadily for as long as the tab is visible. These are rebuilt only
@@ -2272,12 +2285,20 @@ char *dispatch(void *m) {
 		if (i2 > 4096) {
 			return fail("bad_args", "height must be 16..4096");
 		}
-		void *tex2 = gpu_create_render_target(i1, i2, GPU_TEXTURE_FORMAT_RGBA32);
-		if (tex2 == NULL) {
+		// Reuse the cached target; only a size change reallocates. See the
+		// capture_tex declaration for why this cannot be freed instead.
+		if (capture_tex == NULL || capture_w != i1 || capture_h != i2) {
+			capture_tex = gpu_create_render_target(i1, i2, GPU_TEXTURE_FORMAT_RGBA32);
+			capture_w   = i1;
+			capture_h   = i2;
+		}
+		if (capture_tex == NULL) {
+			capture_w = 0;
+			capture_h = 0;
 			return fail("internal", "gpu_create_render_target returned null");
 		}
-		viewport_capture_screenshot_to(tex2, 0.0, 0.0, i1, i2);
-		viewport_save_texture_to_file(tex2, s1);
+		viewport_capture_screenshot_to(capture_tex, 0.0, 0.0, i1, i2);
+		viewport_save_texture_to_file(capture_tex, s1);
 		if (c != NULL) {
 			c->capturing_screenshot = 0;
 			c->ddirty               = 2;
@@ -2537,6 +2558,30 @@ void main() {
 	path_heartbeat = string("%s/heartbeat.json", spool_root);
 	path_lock      = string("%s/bridge.lock", spool_root);
 	ui_version     = string("bridge %s", BRIDGE_VERSION);
+
+	// Drain anything still sitting in req/ from a previous run.
+	//
+	// The server refuses to write a request unless it can already see a live
+	// heartbeat, so nothing found here at start can belong to a live session --
+	// these are requests whose server was killed before its own timeout could
+	// unlink them. Without this they would be executed now, replaying a
+	// destructive op nobody asked for (project_open discarding unsaved work,
+	// say) minutes or days after it was abandoned.
+	any_array_t *stale = file_read_directory(dir_req);
+	if (stale != NULL) {
+		int   sn = stale->length;
+		char *snm;
+		for (int si = 0; si < sn; ++si) {
+			snm = stale->buffer[si];
+			if (snm != NULL) {
+				if (ends_with(snm, ".json")) {
+					del_file(string("%s/%s", dir_req, snm));
+				}
+			}
+		}
+		array_free(stale);
+		free(stale);
+	}
 
 	json_encode_begin();
 	json_encode_i32("v", ENVELOPE_V);
