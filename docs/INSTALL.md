@@ -4,8 +4,11 @@ Two halves have to be installed: a **plugin inside ArmorPaint**, and a **Python 
 client launches. They find each other through a directory of files (the *spool*), so the only
 configuration that matters is that both agree on where that directory is.
 
-Linux and macOS should work — nothing in the design is Windows-specific — but only Windows has been
-tested, so this document is written for it.
+This document is written for Windows. **On Linux**, the differences are few and are covered in
+the README's [Linux notes](../README.md#linux-notes). The spool needs no configuration there (it
+is always `~/.local/share/armorpaint-mcp/spool`), and a distro package's root-owned
+`data/plugins` needs a one-time `sudo ln -s` of the bridge. macOS follows the Linux code path but
+is untested.
 
 ## 0. Prerequisites
 
@@ -134,6 +137,9 @@ It prints the resolved spool directory and the rule that chose it. If `source` s
 a per-user default, discovery did not find your ArmorPaint — see step 6.
 
 ## 6. Point both halves at the same spool
+
+*(Windows. On Linux and macOS both halves use the per-user path described in the README's Linux
+notes, and steps 3–4 below do not apply.)*
 
 The spool is the mailbox directory. Its default is `<ArmorPaint data dir>\mcp_spool` — the plugin's
 own default, because ArmorPaint's `data` directory is the only stable location a plugin can name

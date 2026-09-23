@@ -27,15 +27,18 @@
 // SPOOL LAYOUT (all paths use forward slashes; backslash escapes truncate
 // minic string literals)
 //
-//   <data>/mcp_spool/req/<id>.json     server -> plugin   (server writes atomically)
-//   <data>/mcp_spool/res/<id>.json     plugin -> server   (body)
-//   <data>/mcp_spool/res/<id>.done     plugin -> server   (commit marker: byte length)
-//   <data>/mcp_spool/heartbeat.json    plugin -> server   (~1 Hz liveness)
-//   <data>/mcp_spool/bridge.lock       plugin -> server   (written once at start)
+//   <spool>/req/<id>.json     server -> plugin   (server writes atomically)
+//   <spool>/res/<id>.json     plugin -> server   (body)
+//   <spool>/res/<id>.done     plugin -> server   (commit marker: byte length)
+//   <spool>/heartbeat.json    plugin -> server   (~1 Hz liveness)
+//   <spool>/bridge.lock       plugin -> server   (written once at start)
 //
-// <data> is data_path(), i.e. "./data/" relative to ArmorPaint's working
-// directory. The resolved path is logged to the console at start and is
-// reported by get_app_info.
+// <spool> is, on Windows, data_path() + "mcp_spool", i.e. "./data/mcp_spool"
+// relative to ArmorPaint's working directory. On Linux and macOS it is an
+// ABSOLUTE per-user path (see find_home()), because there a relative path does
+// not name one directory: reads resolve it against the executable's directory
+// and writes against the working directory. The resolved path is logged to the
+// console at start and is reported by get_app_info.
 //
 // ---------------------------------------------------------------------------
 // REQUEST SHAPE — READ THIS BEFORE CHANGING THE SERVER
@@ -74,7 +77,7 @@
 // ---------------------------------------------------------------------------
 // DIALECT CONSTRAINTS OBSERVED HERE (see docs/MINIC_DIALECT_AND_API.md)
 //   * main() is the LAST function; anything after it is never registered.
-//   * 23 functions + main, against a silent hard cap of 32. Every operation is
+//   * 28 functions + main, against a silent hard cap of 32. Every operation is
 //     an else-if ARM inside dispatch(), never its own function.
 //   * no switch, no ternary, no casts, no i++ inside an expression, no #define,
 //     no fixed-size local arrays (they leak from a shared 512-slot pool).
@@ -103,6 +106,10 @@ int MAX_LIST_ITEMS    = 64;
 // to be a flag rather than a try: set it to 1 only after applying the patch and
 // rebuilding.
 int HAVE_VIEWPORT_PATCH = 0;
+
+// 1 on Windows, set first thing in main(). No binding reports the platform, but
+// data_path() is "." PATH_SEP "data" PATH_SEP (engine.c), so its separator does.
+int is_windows = 0;
 
 void        *plugin;
 ui_handle_t *h_panel;
@@ -148,6 +155,12 @@ char *ui_version = "-";
 // dispatch() return channel: the arms return the inner JSON object and set r_ok.
 int r_ok = 1;
 
+// Set by the quit arm. The app exits at the end of this frame without calling
+// on_delete, so handle_one removes the heartbeat itself once the reply is
+// committed; otherwise the server sees a frozen heartbeat and blames a modal
+// dialog instead of reporting that ArmorPaint is not running.
+int quitting = 0;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -184,13 +197,20 @@ char *jesc(char *s) {
 //   iron_file_exists  "E:/x/f"->0     "E:\\x\\f"->1    "./x/f"->1
 //
 // Relative paths are fine for exists() but not for delete(), and backslashes
-// satisfy both, so normalising unconditionally is the one safe rule. The rest of
-// the plugin keeps '/' because minic string literals treat '\' as an escape
-// introducer and an unrecognised escape truncates the literal -- so the
+// satisfy both, so on Windows normalising unconditionally is the one safe rule.
+// The rest of the plugin keeps '/' because minic string literals treat '\' as an
+// escape introducer and an unrecognised escape truncates the literal -- so the
 // conversion lives here, at the boundary, and nowhere else.
+//
+// Windows ONLY. On Linux iron_delete_file shells  rm "<path>"  and a backslash
+// is an ordinary filename character there, so converting made every delete
+// fail -- and an undeleted request replays forever (see del_file).
 char *win_path(char *p) {
 	if (p == NULL) {
 		return NULL;
+	}
+	if (!is_windows) {
+		return p;
 	}
 	return string_replace_all(p, "/", "\\");
 }
@@ -216,6 +236,71 @@ int file_here(char *p) {
 	}
 	return iron_file_exists(win_path(p));
 }
+
+// Can this process create a file directly inside directory d? Probes with a
+// real write, because no binding reports permissions or ownership.
+int writable_dir(char *d) {
+	if (!iron_is_directory(d)) {
+		return 0;
+	}
+	char *probe = string("%s/.armorpaint_mcp_probe", d);
+	iron_file_save_bytes(probe, sys_string_to_buffer("1"), 0);
+	int ok = file_here(probe);
+	if (ok) {
+		del_file(probe);
+	}
+	return ok;
+}
+
+// POSIX only: this user's home directory, or NULL.
+//
+// The spool must be an ABSOLUTE path on Linux, because Iron resolves a relative
+// one two different ways: file reads (data_get_blob, iron_file_exists) prefix
+// the executable's directory (iron_file.c, fileslocation), while writes, mkdir,
+// rm and directory listings use the process working directory. A relative
+// spool therefore splits in two -- requests land in one directory and are read
+// from another, and a system-wide install such as /usr/lib/armorpaint is not
+// writable at all. getenv is not bound, so HOME cannot be read; instead, look
+// for the one home directory under `root` that this process can write into.
+// Other users' homes refuse the probe write. macOS's /Users/Shared is
+// world-writable, so it is skipped by name.
+char *find_home(char *root) {
+	if (!iron_is_directory(root)) {
+		return NULL;
+	}
+	any_array_t *names = file_read_directory(root);
+	if (names == NULL) {
+		return NULL;
+	}
+	char *found = NULL;
+	char *cand;
+	char *nm;
+	int   n = names->length;
+	for (int hi = 0; hi < n; ++hi) {
+		nm = names->buffer[hi];
+		if (nm != NULL) {
+			if (!string_equals(nm, "Shared")) {
+				cand = string("%s/%s", root, nm);
+				if (writable_dir(cand)) {
+					found = cand;
+					break;
+				}
+			}
+		}
+	}
+	array_free(names);
+	free(names);
+	return found;
+}
+
+// BOOL FIELDS REGISTERED AS INT. ArmorPaint registers several C `bool` struct
+// fields with MINIC_I rather than MINIC_B (minic_api.c): the nine
+// slot_material_t paint_* channels, config_t brush_live / node_previews /
+// material_live, context_t xray and project_t is_bgra. minic then loads and
+// stores them as 4-byte int32 (minic.c minic_load/minic_store), so
+//   * a READ picks up the three bytes that follow -- mask with `& 255`;
+//   * a WRITE clobbers them -- measured: setting paint_base alone turned
+//     paint_opac off. Always write  x->f = (x->f & ~255) | v.
 
 // There is no atoi binding anywhere in the table, so integers arrive as text and
 // are converted here. Unparseable input yields 0, never an error.
@@ -455,6 +540,10 @@ int id_ok(char *s) {
 // file -- anything able to write into the spool bypasses the server entirely,
 // so the check has to exist on this side too.
 //
+// On Linux and macOS that shell is sh, which still expands $(...), `...` and
+// $VAR inside double quotes, so  /tmp/$(cmd)  would run cmd. Those characters
+// are refused on every platform: they are vanishingly rare in real paths.
+//
 // The length cap is the same call's other hazard: it copies into a 1024-byte
 // stack buffer with strcpy/strcat and no bounds check.
 int path_ok(char *p) {
@@ -475,6 +564,12 @@ int path_ok(char *p) {
 		return 0;
 	}
 	if (string_index_of(p, "\r") >= 0) {
+		return 0;
+	}
+	if (string_index_of(p, "$") >= 0) {
+		return 0;
+	}
+	if (string_index_of(p, "`") >= 0) {
 		return 0;
 	}
 	return 1;
@@ -940,6 +1035,7 @@ char *dispatch(void *m) {
 		// iron_stop() only clears the run-loop flag (iron_system.c:209), so this
 		// frame finishes normally and handle_one still commits the reply below.
 		script_quit();
+		quitting = 1;
 		json_encode_begin();
 		json_encode_bool("quitting", 1);
 		return json_encode_end();
@@ -956,7 +1052,7 @@ char *dispatch(void *m) {
 			return fail("bad_args", "missing 'path'");
 		}
 		if (!path_ok(s1)) {
-			return fail("bad_args", "'path' is empty, over-long, or contains a quote or newline");
+			return fail("bad_args", "'path' is empty, over-long, or contains a quote, newline, $ or backtick");
 		}
 		if (!file_here(s1)) {
 			return fail("not_found", string("no such file: %s", s1));
@@ -987,7 +1083,7 @@ char *dispatch(void *m) {
 			return fail("bad_args", "missing 'path'");
 		}
 		if (!path_ok(s1)) {
-			return fail("bad_args", "'path' is empty, over-long, or contains a quote or newline");
+			return fail("bad_args", "'path' is empty, over-long, or contains a quote, newline, $ or backtick");
 		}
 		// "Save as" is filepath_set + save; there is no dedicated binding.
 		project_filepath_set(s1);
@@ -1025,7 +1121,7 @@ char *dispatch(void *m) {
 		}
 		else {
 			json_encode_string("format_version", jesc(pr->version));
-			json_encode_i32("is_bgra", pr->is_bgra);
+			json_encode_i32("is_bgra", (pr->is_bgra & 255) != 0);
 			json_encode_string("envmap", jesc(pr->envmap));
 			json_encode_f32("envmap_strength", pr->envmap_strength);
 			json_encode_f32("envmap_angle", pr->envmap_angle);
@@ -1056,19 +1152,28 @@ char *dispatch(void *m) {
 		if (pr == NULL) {
 			return fail("no_project", "no project runtime");
 		}
-		if (pr->assets == NULL) {
-			return fail("no_project", "project has no asset list");
-		}
-		n = pr->assets->length;
+		// project_t.assets is the SERIALISED texture_assets list, filled at
+		// save/load. The live list is g_project->_->assets, and project_t's `_`
+		// is not a registered field. Measured: new project -> import -> this
+		// list stays NULL until the first save, then shows the asset.
 		json_encode_begin();
-		json_encode_i32("count", n);
-		if (n > MAX_LIST_ITEMS) {
-			n = MAX_LIST_ITEMS;
+		json_encode_bool("live", 0);
+		json_encode_string("caveat", "project_t.assets is written only at save/load: empty before the first save and blind to imports made since the last save");
+		if (pr->assets == NULL) {
+			json_encode_i32("count", 0);
+			json_encode_i32("returned", 0);
+			json_encode_string("names", "");
 		}
-		json_encode_i32("returned", n);
-		json_encode_string("names", sa_names(pr->assets, MAX_LIST_ITEMS));
+		else {
+			n = pr->assets->length;
+			json_encode_i32("count", n);
+			if (n > MAX_LIST_ITEMS) {
+				n = MAX_LIST_ITEMS;
+			}
+			json_encode_i32("returned", n);
+			json_encode_string("names", sa_names(pr->assets, MAX_LIST_ITEMS));
+		}
 		json_encode_string("delimiter", "|");
-		json_encode_bool("live", 1);
 		return json_encode_end();
 	}
 	else if (string_equals(op, "project_list_scripts")) {
@@ -1103,20 +1208,17 @@ char *dispatch(void *m) {
 			return fail("bad_args", "missing 'path'");
 		}
 		if (!path_ok(s1)) {
-			return fail("bad_args", "'path' is empty, over-long, or contains a quote or newline");
+			return fail("bad_args", "'path' is empty, over-long, or contains a quote, newline, $ or backtick");
 		}
 		if (!file_here(s1)) {
 			return fail("not_found", string("no such file: %s", s1));
 		}
 		// Dispatched by extension inside ArmorPaint: texture, mesh, or .arm material.
 		script_import_asset(s1, 0);
+		// No asset count here: pr->assets is a save/load snapshot and would
+		// report the import as missing (see project_list_texture_assets).
 		json_encode_begin();
 		json_encode_string("path", jesc(s1));
-		if (pr != NULL) {
-			if (pr->assets != NULL) {
-				json_encode_i32("asset_count", pr->assets->length);
-			}
-		}
 		return json_encode_end();
 	}
 	else if (string_equals(op, "import_envmap")) {
@@ -1125,7 +1227,7 @@ char *dispatch(void *m) {
 			return fail("bad_args", "missing 'path'");
 		}
 		if (!path_ok(s1)) {
-			return fail("bad_args", "'path' is empty, over-long, or contains a quote or newline");
+			return fail("bad_args", "'path' is empty, over-long, or contains a quote, newline, $ or backtick");
 		}
 		if (!file_here(s1)) {
 			return fail("not_found", string("no such file: %s", s1));
@@ -1165,7 +1267,7 @@ char *dispatch(void *m) {
 			return fail("bad_args", "missing 'directory' (export_texture_run takes a DIRECTORY, not a filename)");
 		}
 		if (!path_ok(s1)) {
-			return fail("bad_args", "'directory' is empty, over-long, or contains a quote or newline");
+			return fail("bad_args", "'directory' is empty, over-long, or contains a quote, newline, $ or backtick");
 		}
 		iron_create_directory(s1);
 		if (!iron_is_directory(s1)) {
@@ -1200,7 +1302,7 @@ char *dispatch(void *m) {
 			return fail("bad_args", "missing 'directory'");
 		}
 		if (!path_ok(s1)) {
-			return fail("bad_args", "'directory' is empty, over-long, or contains a quote or newline");
+			return fail("bad_args", "'directory' is empty, over-long, or contains a quote, newline, $ or backtick");
 		}
 		iron_create_directory(s1);
 		if (!iron_is_directory(s1)) {
@@ -1230,7 +1332,7 @@ char *dispatch(void *m) {
 			return fail("bad_args", "missing 'path' (the extension is added: <path>.obj)");
 		}
 		if (!path_ok(s1)) {
-			return fail("bad_args", "'path' is empty, over-long, or contains a quote or newline");
+			return fail("bad_args", "'path' is empty, over-long, or contains a quote, newline, $ or backtick");
 		}
 		script_export_mesh(s1);
 		s2 = string("%s.obj", s1);
@@ -1245,7 +1347,7 @@ char *dispatch(void *m) {
 			return fail("bad_args", "missing 'path' (should end in .arm)");
 		}
 		if (!path_ok(s1)) {
-			return fail("bad_args", "'path' is empty, over-long, or contains a quote or newline");
+			return fail("bad_args", "'path' is empty, over-long, or contains a quote, newline, $ or backtick");
 		}
 		script_export_material(s1);
 		json_encode_begin();
@@ -1261,7 +1363,7 @@ char *dispatch(void *m) {
 			return fail("bad_args", "missing 'path'");
 		}
 		if (!path_ok(s1)) {
-			return fail("bad_args", "'path' is empty, over-long, or contains a quote or newline");
+			return fail("bad_args", "'path' is empty, over-long, or contains a quote, newline, $ or backtick");
 		}
 		if (!iron_is_directory(s1)) {
 			return fail("not_found", string("not a directory: %s", s1));
@@ -1293,7 +1395,7 @@ char *dispatch(void *m) {
 			return fail("bad_args", "missing 'path'");
 		}
 		if (!path_ok(s1)) {
-			return fail("bad_args", "'path' is empty, over-long, or contains a quote or newline");
+			return fail("bad_args", "'path' is empty, over-long, or contains a quote, newline, $ or backtick");
 		}
 		i1 = 0;
 		if (starts_with(s1, "/")) {
@@ -1317,13 +1419,18 @@ char *dispatch(void *m) {
 			return fail("bad_args", "missing 'path'");
 		}
 		if (!path_ok(s1)) {
-			return fail("bad_args", "'path' is empty, over-long, or contains a quote or newline");
+			return fail("bad_args", "'path' is empty, over-long, or contains a quote, newline, $ or backtick");
 		}
 		iron_create_directory(s1);
 		json_encode_begin();
 		json_encode_string("path", jesc(s1));
 		json_encode_bool("is_directory", iron_is_directory(s1));
-		json_encode_string("note", "intermediate directories are NOT created; make each parent first");
+		if (is_windows) {
+			json_encode_string("note", "intermediate directories are NOT created; make each parent first");
+		}
+		else {
+			json_encode_string("note", "mkdir -p: intermediate directories are created too");
+		}
 		return json_encode_end();
 	}
 
@@ -1335,7 +1442,7 @@ char *dispatch(void *m) {
 		json_encode_begin();
 		json_encode_i32("tool", c->tool);
 		json_encode_i32("viewport_mode", c->viewport_mode);
-		json_encode_i32("xray", c->xray);
+		json_encode_i32("xray", (c->xray & 255) != 0);
 		json_encode_i32("brush_blending", c->brush_blending);
 		json_encode_f32("brush_radius", c->brush_radius);
 		json_encode_f32("brush_opacity", c->brush_opacity);
@@ -1372,9 +1479,9 @@ char *dispatch(void *m) {
 		json_encode_i32("layer_res", cf->layer_res);
 		json_encode_i32("undo_steps", cf->undo_steps);
 		json_encode_f32("camera_fov", cf->camera_fov);
-		json_encode_i32("brush_live", cf->brush_live);
-		json_encode_i32("node_previews", cf->node_previews);
-		json_encode_i32("material_live", cf->material_live);
+		json_encode_i32("brush_live", (cf->brush_live & 255) != 0);
+		json_encode_i32("node_previews", (cf->node_previews & 255) != 0);
+		json_encode_i32("material_live", (cf->material_live & 255) != 0);
 		json_encode_i32("workspace", cf->workspace);
 		json_encode_i32("workflow", cf->workflow);
 		json_encode_string("keymap", jesc(cf->keymap));
@@ -1429,15 +1536,15 @@ char *dispatch(void *m) {
 		}
 		s1 = arg(m, "brush_live");
 		if (s1 != NULL) {
-			cf->brush_live = to_bool(s1);
+			cf->brush_live = (cf->brush_live & ~255) | to_bool(s1);
 		}
 		s1 = arg(m, "node_previews");
 		if (s1 != NULL) {
-			cf->node_previews = to_bool(s1);
+			cf->node_previews = (cf->node_previews & ~255) | to_bool(s1);
 		}
 		s1 = arg(m, "material_live");
 		if (s1 != NULL) {
-			cf->material_live = to_bool(s1);
+			cf->material_live = (cf->material_live & ~255) | to_bool(s1);
 		}
 		// The map's value strings are substrings of the request text and the map
 		// is dropped at the end of this frame, so copy before handing the host a
@@ -1458,9 +1565,9 @@ char *dispatch(void *m) {
 		json_encode_i32("layer_res", cf->layer_res);
 		json_encode_i32("undo_steps", cf->undo_steps);
 		json_encode_f32("camera_fov", cf->camera_fov);
-		json_encode_i32("brush_live", cf->brush_live);
-		json_encode_i32("node_previews", cf->node_previews);
-		json_encode_i32("material_live", cf->material_live);
+		json_encode_i32("brush_live", (cf->brush_live & 255) != 0);
+		json_encode_i32("node_previews", (cf->node_previews & 255) != 0);
+		json_encode_i32("material_live", (cf->material_live & 255) != 0);
 		json_encode_i32("workspace", cf->workspace);
 		json_encode_i32("workflow", cf->workflow);
 		json_encode_string("keymap", jesc(cf->keymap));
@@ -1618,7 +1725,7 @@ char *dispatch(void *m) {
 		s1 = arg(m, "path");
 		if (s1 != NULL) {
 			if (!path_ok(s1)) {
-				return fail("bad_args", "'path' is empty, over-long, or contains a quote or newline");
+				return fail("bad_args", "'path' is empty, over-long, or contains a quote, newline, $ or backtick");
 			}
 			if (!file_here(s1)) {
 				return fail("not_found", string("no such file: %s", s1));
@@ -1665,15 +1772,15 @@ char *dispatch(void *m) {
 		}
 		// Reported under server.py's PAINT_CHANNELS names, not slot_material_t's
 		// abbreviations, so what comes back matches what set_channels takes.
-		json_encode_bool("base", mt->paint_base);
-		json_encode_bool("opacity", mt->paint_opac);
-		json_encode_bool("occlusion", mt->paint_occ);
-		json_encode_bool("roughness", mt->paint_rough);
-		json_encode_bool("metallic", mt->paint_met);
-		json_encode_bool("normal", mt->paint_nor);
-		json_encode_bool("height", mt->paint_height);
-		json_encode_bool("emission", mt->paint_emis);
-		json_encode_bool("subsurface", mt->paint_subs);
+		json_encode_bool("base", (mt->paint_base & 255) != 0);
+		json_encode_bool("opacity", (mt->paint_opac & 255) != 0);
+		json_encode_bool("occlusion", (mt->paint_occ & 255) != 0);
+		json_encode_bool("roughness", (mt->paint_rough & 255) != 0);
+		json_encode_bool("metallic", (mt->paint_met & 255) != 0);
+		json_encode_bool("normal", (mt->paint_nor & 255) != 0);
+		json_encode_bool("height", (mt->paint_height & 255) != 0);
+		json_encode_bool("emission", (mt->paint_emis & 255) != 0);
+		json_encode_bool("subsurface", (mt->paint_subs & 255) != 0);
 		return json_encode_end();
 	}
 	else if (string_equals(op, "material_list")) {
@@ -1797,50 +1904,50 @@ char *dispatch(void *m) {
 		// the op answers ok and changes nothing.
 		s1 = arg(m, "base");
 		if (s1 != NULL) {
-			mt->paint_base = to_bool(s1);
+			mt->paint_base = (mt->paint_base & ~255) | to_bool(s1);
 		}
 		s1 = arg(m, "opacity");
 		if (s1 != NULL) {
-			mt->paint_opac = to_bool(s1);
+			mt->paint_opac = (mt->paint_opac & ~255) | to_bool(s1);
 		}
 		s1 = arg(m, "occlusion");
 		if (s1 != NULL) {
-			mt->paint_occ = to_bool(s1);
+			mt->paint_occ = (mt->paint_occ & ~255) | to_bool(s1);
 		}
 		s1 = arg(m, "roughness");
 		if (s1 != NULL) {
-			mt->paint_rough = to_bool(s1);
+			mt->paint_rough = (mt->paint_rough & ~255) | to_bool(s1);
 		}
 		s1 = arg(m, "metallic");
 		if (s1 != NULL) {
-			mt->paint_met = to_bool(s1);
+			mt->paint_met = (mt->paint_met & ~255) | to_bool(s1);
 		}
 		s1 = arg(m, "normal");
 		if (s1 != NULL) {
-			mt->paint_nor = to_bool(s1);
+			mt->paint_nor = (mt->paint_nor & ~255) | to_bool(s1);
 		}
 		s1 = arg(m, "height");
 		if (s1 != NULL) {
-			mt->paint_height = to_bool(s1);
+			mt->paint_height = (mt->paint_height & ~255) | to_bool(s1);
 		}
 		s1 = arg(m, "emission");
 		if (s1 != NULL) {
-			mt->paint_emis = to_bool(s1);
+			mt->paint_emis = (mt->paint_emis & ~255) | to_bool(s1);
 		}
 		s1 = arg(m, "subsurface");
 		if (s1 != NULL) {
-			mt->paint_subs = to_bool(s1);
+			mt->paint_subs = (mt->paint_subs & ~255) | to_bool(s1);
 		}
 		json_encode_begin();
-		json_encode_bool("base", mt->paint_base);
-		json_encode_bool("opacity", mt->paint_opac);
-		json_encode_bool("occlusion", mt->paint_occ);
-		json_encode_bool("roughness", mt->paint_rough);
-		json_encode_bool("metallic", mt->paint_met);
-		json_encode_bool("normal", mt->paint_nor);
-		json_encode_bool("height", mt->paint_height);
-		json_encode_bool("emission", mt->paint_emis);
-		json_encode_bool("subsurface", mt->paint_subs);
+		json_encode_bool("base", (mt->paint_base & 255) != 0);
+		json_encode_bool("opacity", (mt->paint_opac & 255) != 0);
+		json_encode_bool("occlusion", (mt->paint_occ & 255) != 0);
+		json_encode_bool("roughness", (mt->paint_rough & 255) != 0);
+		json_encode_bool("metallic", (mt->paint_met & 255) != 0);
+		json_encode_bool("normal", (mt->paint_nor & 255) != 0);
+		json_encode_bool("height", (mt->paint_height & 255) != 0);
+		json_encode_bool("emission", (mt->paint_emis & 255) != 0);
+		json_encode_bool("subsurface", (mt->paint_subs & 255) != 0);
 		return json_encode_end();
 	}
 	else if (string_equals(op, "material_update")) {
@@ -2269,7 +2376,7 @@ char *dispatch(void *m) {
 			return fail("bad_args", "missing 'path'");
 		}
 		if (!path_ok(s1)) {
-			return fail("bad_args", "'path' is empty, over-long, or contains a quote or newline");
+			return fail("bad_args", "'path' is empty, over-long, or contains a quote, newline, $ or backtick");
 		}
 		i1 = arg_i(m, "width", 1024);
 		i2 = arg_i(m, "height", 1024);
@@ -2406,6 +2513,11 @@ void handle_one(char *name) {
 	busy   = 0;
 	int ms = (sys_time() - t0) * 1000.0;
 	reply(id, r_ok, inner, ms);
+	if (quitting) {
+		del_file(path_heartbeat);
+		del_file(path_lock);
+		return;
+	}
 	write_heartbeat(); // clear busy promptly rather than waiting for the 1 Hz tick
 }
 
@@ -2545,12 +2657,43 @@ void main() {
 	// on Windows. Normalise it: backslashes inside minic string literals are
 	// escape sequences and any unrecognised one truncates the string at that
 	// point, so every path this plugin handles stays forward-slashed.
+	is_windows = string_index_of(data_path(), "\\") >= 0;
 	char *base = string_replace_all(data_path(), "\\", "/");
 	spool_root = string("%smcp_spool", base);
+
+	// Linux/macOS: an absolute per-user spool, the same path the server derives
+	// from $HOME (transport.py _per_user_spool). Why it cannot stay relative:
+	// see find_home().
+	char *home = NULL;
+	if (!is_windows) {
+		if (writable_dir("/root")) {
+			home = "/root";
+		}
+		if (home == NULL) {
+			home = find_home("/home");
+		}
+		if (home == NULL) {
+			home = find_home("/var/home");
+		}
+		if (home == NULL) {
+			home = find_home("/Users");
+		}
+		if (home == NULL) {
+			console_error(string("armorpaint-mcp: could not find a writable home directory; falling back to %s, which will not work on this platform", spool_root));
+		}
+		else if (iron_is_directory(string("%s/Library/Application Support", home))) {
+			spool_root = string("%s/Library/Application Support/armorpaint-mcp/spool", home);
+		}
+		else {
+			spool_root = string("%s/.local/share/armorpaint-mcp/spool", home);
+		}
+	}
 	dir_req    = string("%s/req", spool_root);
 	dir_res    = string("%s/res", spool_root);
 
-	// Created parent-first: iron_create_directory does not build intermediates.
+	// Created parent-first: on Windows iron_create_directory does not build
+	// intermediates. On POSIX it is mkdir -p, so the first call builds the whole
+	// per-user path.
 	iron_create_directory(spool_root);
 	iron_create_directory(dir_req);
 	iron_create_directory(dir_res);

@@ -55,12 +55,17 @@ Spool directory discovery (first hit wins)
 2. A config file: ``$ARMORPAINT_MCP_CONFIG``, else ``%APPDATA%/armorpaint-mcp/config.json``,
    ``~/.config/armorpaint-mcp/config.json``, ``~/.armorpaint-mcp.json``. Recognised keys:
    ``{"spool": "<abs path>"}`` or ``{"armorpaint_dir": "<install root>"}``.
-3. ``$ARMORPAINT_DIR`` / ``$ARMORPAINT_EXE``, then a short list of common install roots,
-   each accepted only if it really contains ``data/plugins``. The spool is
+3. **Linux / macOS:** the per-user spool, ``~/.local/share/armorpaint-mcp/spool`` (macOS:
+   ``~/Library/Application Support/armorpaint-mcp/spool``). This is the plugin's own
+   default there: it cannot use a relative path, because Iron resolves relative *reads*
+   against the executable's directory and relative *writes* against the working
+   directory, so it finds the user's home and uses this absolute path instead.
+4. **Windows:** ``$ARMORPAINT_DIR`` / ``$ARMORPAINT_EXE``, then a short list of common
+   install roots, each accepted only if it really contains ``data/plugins``. The spool is
    ``<install>/data/mcp_spool`` — the plugin's own default, because ``data_path()``
    (``engine.c:1782``) is the only stable directory a plugin can name.
-4. Last resort: a per-user directory (``%LOCALAPPDATA%/armorpaint-mcp/spool``). This only
-   works if the plugin is pointed at the same path, so errors say so out loud.
+5. Windows last resort: a per-user directory (``%LOCALAPPDATA%/armorpaint-mcp/spool``).
+   This only works if the plugin is pointed at the same path, so errors say so out loud.
 
 Nothing in this module blocks without a deadline.
 """
@@ -229,6 +234,7 @@ def _config_file_candidates() -> list[Path]:
 
 
 def _install_root_candidates() -> list[Path]:
+    """Windows only: off Windows the spool does not live under the install."""
     out: list[Path] = []
     env_dir = os.environ.get(INSTALL_DIR_ENV, "").strip()
     if env_dir:
@@ -236,29 +242,20 @@ def _install_root_candidates() -> list[Path]:
     env_exe = os.environ.get(INSTALL_EXE_ENV, "").strip()
     if env_exe:
         out.append(Path(env_exe).expanduser().parent)
-    if sys.platform == "win32":
-        local = os.environ.get("LOCALAPPDATA", "").strip()
-        if local:
-            out.append(Path(local) / "Programs" / "ArmorPaint")
-        for var in ("PROGRAMFILES", "PROGRAMFILES(X86)"):
-            base = os.environ.get(var, "").strip()
-            if base:
-                out.append(Path(base) / "ArmorPaint")
-        out.append(Path("C:/ArmorPaint"))
-        out.append(Path.home() / "ArmorPaint")
-        out.append(Path.home() / "Documents" / "ArmorPaint")
-    elif sys.platform == "darwin":
-        out.append(Path("/Applications/ArmorPaint.app/Contents/Resources"))
-        out.append(Path.home() / "Applications" / "ArmorPaint.app" / "Contents" / "Resources")
-        out.append(Path.home() / "armorpaint")
-    else:
-        out.append(Path("/opt/armorpaint"))
-        out.append(Path("/usr/share/armorpaint"))
-        out.append(Path.home() / "armorpaint")
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    if local:
+        out.append(Path(local) / "Programs" / "ArmorPaint")
+    for var in ("PROGRAMFILES", "PROGRAMFILES(X86)"):
+        base = os.environ.get(var, "").strip()
+        if base:
+            out.append(Path(base) / "ArmorPaint")
+    out.append(Path("C:/ArmorPaint"))
+    out.append(Path.home() / "ArmorPaint")
+    out.append(Path.home() / "Documents" / "ArmorPaint")
     return out
 
 
-def _last_resort_spool() -> Path:
+def _per_user_spool() -> Path:
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA", "").strip()
         if base:
@@ -302,11 +299,23 @@ def resolve_spool(explicit: str | os.PathLike[str] | None = None) -> SpoolResolu
             trace.append(f"config {cfg} key 'spool' -> {p}")
             return SpoolResolution(p, f"config file {cfg}", trace)
         root = data.get("armorpaint_dir")
-        if isinstance(root, str) and root.strip():
+        if isinstance(root, str) and root.strip() and sys.platform != "win32":
+            trace.append(
+                f"config {cfg} key 'armorpaint_dir' ignored: off Windows the plugin does not "
+                f"keep its spool under the install directory"
+            )
+        elif isinstance(root, str) and root.strip():
             p = Path(root).expanduser() / "data" / SPOOL_LEAF
             trace.append(f"config {cfg} key 'armorpaint_dir' -> {p}")
             return SpoolResolution(p, f"config file {cfg}", trace)
         trace.append(f"config {cfg}: no 'spool' or 'armorpaint_dir' key")
+
+    if sys.platform != "win32":
+        # Must match main() in plugin/armorpaint_mcp_bridge.c, which derives the
+        # same absolute path from the user's home directory.
+        p = _per_user_spool()
+        trace.append(f"per-user spool (the plugin's default on this platform) -> {p}")
+        return SpoolResolution(p, "per-user default", trace)
 
     for root in _install_root_candidates():
         if (root / "data" / "plugins").is_dir():
@@ -315,7 +324,7 @@ def resolve_spool(explicit: str | os.PathLike[str] | None = None) -> SpoolResolu
             return SpoolResolution(p, f"ArmorPaint install at {root}", trace)
         trace.append(f"install root {root}: no data/plugins")
 
-    p = _last_resort_spool()
+    p = _per_user_spool()
     trace.append(f"last-resort per-user default -> {p}")
     return SpoolResolution(p, "last-resort default", trace, is_fallback=True)
 
@@ -337,6 +346,12 @@ def spool_dir(refresh: bool = False) -> Path:
 
 
 def _hint_where_to_point() -> str:
+    if sys.platform != "win32":
+        return (
+            f"The plugin logs 'armorpaint-mcp bridge ... listening on <path>' to the ArmorPaint "
+            f"console at start. If that path differs from {_per_user_spool()}, set ${SPOOL_ENV} "
+            f"to it."
+        )
     return (
         f"Set ${SPOOL_ENV} to the spool directory the plugin created (it prints the path to the "
         f"ArmorPaint console at start), or write {{\"armorpaint_dir\": \"<install root>\"}} into "
@@ -900,6 +915,8 @@ def send_to_armorpaint(
             )
         else:
             tail = f" (Spool resolved from {res.source}.)"
+            if sys.platform != "win32":
+                tail += " " + _hint_where_to_point()
         raise BridgeNotRunning(
             f"No {HEARTBEAT_FILE} in {spool}, so nothing is reading that mailbox. Start "
             f"ArmorPaint and enable the MCP bridge plugin (Plugins tab)." + tail,

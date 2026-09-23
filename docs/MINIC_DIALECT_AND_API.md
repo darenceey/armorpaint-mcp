@@ -1322,7 +1322,7 @@ Every tool below is backed by named bindings or registered struct fields. `ctx` 
 | 8 | `ap_project_save` | `project_filepath_get` guard (`""` ⇒ `no_project`) → `project_save(false)` |
 | 9 | `ap_project_save_as` | `project_filepath_set(path)` → `project_save(false)` (`dev/test.c:238`) |
 | 10 | `ap_project_get_info` | `project_filepath_get`, `project_basepath_get`, `prj->version`, `is_bgra`, `envmap*`, `camera_fov` |
-| 11 | `ap_project_list_texture_assets` | `prj->assets` (`string_array_t`) — **live** |
+| 11 | `ap_project_list_texture_assets` | `prj->assets` (`string_array_t`) — save/load snapshot, **not** live (the runtime list is `prj->_->assets`, unregistered) |
 | 12 | `ap_project_list_scripts` | `prj->script_datas` — snapshot, flag as such |
 | 13 | `ap_quit` | `script_quit` |
 

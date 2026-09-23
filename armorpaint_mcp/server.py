@@ -267,6 +267,14 @@ def _norm_path(args: dict[str, Any], key: str, required: bool = True) -> str | N
     path = raw.strip().replace("\\", "/")
     while "//" in path[2:]:
         path = path[:2] + path[2:].replace("//", "/")
+    if "$" in path or "`" in path:
+        # The plugin hands some paths to a shell (mkdir/rm via system()); on Linux and
+        # macOS sh expands $(...) and `...` even inside the double quotes it adds.
+        raise BadArgs(
+            f"'{key}' must not contain '$' or '`' (got {raw!r}): ArmorPaint passes paths "
+            f"through a shell, where they would be expanded.",
+            arg=key,
+        )
     if not _ABS_PATH_RE.match(path):
         raise BadArgs(
             f"'{key}' must be an absolute path (got {raw!r}). A relative path resolves "
@@ -588,9 +596,10 @@ TOOLS: list[types.Tool] = [
     ),
     _tool(
         "ap_project_list_texture_assets",
-        "List the names of texture assets imported into the project. This one is LIVE (it "
-        "reads project_t.assets), unlike the material/mesh lists which are save-time "
-        "snapshots.",
+        "List the names of texture assets imported into the project. DEGRADED: "
+        "project_t.assets is a snapshot written at save/load, so it is empty before the first "
+        "save and does not show textures imported since the last save (the reply says "
+        "live=false).",
     ),
     _tool(
         "ap_project_list_scripts",

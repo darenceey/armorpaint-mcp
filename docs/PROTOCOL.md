@@ -33,7 +33,9 @@ pathological case of a truncated write that still returned.
 ## Layout
 
 ```
-<spool>/                     default: <ArmorPaint data dir>/mcp_spool
+<spool>/                     default: Windows <ArmorPaint data dir>/mcp_spool;
+                             Linux ~/.local/share/armorpaint-mcp/spool;
+                             macOS ~/Library/Application Support/armorpaint-mcp/spool
   req/<id>.json              server → plugin   (written via os.replace)
   res/<id>.json              plugin → server   (body)
   res/<id>.done              plugin → server   (commit marker; see below)
