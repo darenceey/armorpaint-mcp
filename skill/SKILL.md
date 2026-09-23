@@ -48,9 +48,11 @@ Six facts shape every decision. All are verified against `paint/sources/minic_ap
    works, but you cannot drive it, and you cannot count on it after a fill.
 4. **You are blind by default.** On a stock build there is no plugin path from the GPU to an image
    file for the viewport. Your only real eyes are the PNGs that `export_texture_run` writes to disk.
-   On a **patched** build `ap_capture_viewport` gives you the shaded 3D view as an image, which
-   changes the workflow substantially — check `ap_get_app_info` → `viewport_patch` once at the start
-   and say which mode you are in, rather than assuming either way.
+   On **Linux**, `ap_capture_window` screenshots ArmorPaint's window from the server side on any
+   build and hands it back as an image (covered windows are fine, minimised ones are not). On a
+   **patched** build `ap_capture_viewport` gives you the shaded 3D view as a file. Either changes the
+   workflow substantially — try `ap_capture_window` once at the start, check `ap_get_app_info` →
+   `viewport_patch`, and say which mode you are in, rather than assuming.
 5. **You are a guest on the render thread.** Every handler runs inline in `on_update`, at most one
    request per frame, and the bridge holds the app awake at full frame rate to stay reachable. A slow
    op is a visible hitch in someone's brush stroke.
@@ -129,8 +131,10 @@ There is no `screenshot` tool on a stock build. `viewport_save_texture` PNG-enco
 build evidence in layers, cheapest first:
 
 **Level 1 — state readback (free, proves nothing about looks).**
-`ap_get_context` for tool/brush/viewport mode; `ap_node_list` for node ids, types and every socket's
-`default_value`; `ap_material_get_active` for the material name and channel flags. Use this to catch
+`ap_get_context` for tool/brush/viewport mode; `ap_node_list` for node ids, types and links;
+`ap_node_get` for one node's sockets and buttons with index, name, type and `default_value`
+(`4:Scale:VALUE=5;`) — use it instead of guessing socket indices; `ap_material_get_active` for the
+material name and channel flags. Use this to catch
 silent no-ops: a value you set that reads back unchanged means the write was rejected.
 
 **Level 2 — filesystem truth (cheap, proves an op ran).**
@@ -159,7 +163,10 @@ channel for them (`ap_set_display_channel mode=lit` / `base_color` / `roughness`
 `normal_map` — a name, not an index) and ask a specific question: "does the wear read as edge wear
 or as noise?" Do not ask "does it look good".
 
-**Level 0 — check which of these you actually need.** `ap_get_app_info` reports `viewport_patch`.
+**Level 0 — check which of these you actually need.** On Linux, `ap_capture_window` returns the
+whole ArmorPaint window (viewport plus UI) on any build; capture once, read off the viewport
+rectangle and pass it as `crop` from then on. That also collapses Levels 3–5 into "look at the
+render". Elsewhere: `ap_get_app_info` reports `viewport_patch`.
 When it is `true` (`docs/UPSTREAM_CHANGES.md`, source builds only) `ap_capture_viewport` writes a
 real PNG of the shaded viewport and hands it straight back as an image, and Levels 3–5 collapse into
 "look at the render": measured 11–15 ms in-app, ~140 ms round trip at 800×600. Set the display

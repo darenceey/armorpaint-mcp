@@ -54,9 +54,11 @@ try:  # normal package import
         OpFailed,
         RequestTimeout,
         bridge_diagnostics,
+        read_heartbeat,
         send_to_armorpaint,
         spool_resolution,
     )
+    from .window_capture import MAX_DOWNSCALE, CaptureError, capture_window
 except ImportError:  # running server.py as a loose script
     __version__ = "1.0.0"
     from transport import (  # type: ignore[no-redef]
@@ -65,8 +67,14 @@ except ImportError:  # running server.py as a loose script
         OpFailed,
         RequestTimeout,
         bridge_diagnostics,
+        read_heartbeat,
         send_to_armorpaint,
         spool_resolution,
+    )
+    from window_capture import (  # type: ignore[no-redef]
+        MAX_DOWNSCALE,
+        CaptureError,
+        capture_window,
     )
 
 # ---------------------------------------------------------------------------
@@ -140,7 +148,7 @@ OP_TIMEOUTS: dict[str, float] = {
 }
 
 # Tools answered entirely by this process — they work even when ArmorPaint is closed.
-LOCAL_TOOLS = frozenset({"ap_bridge_status", "ap_read_image_file"})
+LOCAL_TOOLS = frozenset({"ap_bridge_status", "ap_read_image_file", "ap_capture_window"})
 
 # Bulk data travels by path; only these tools ever inline bytes into an MCP response.
 MAX_IMAGE_BYTES = 6_000_000
@@ -900,6 +908,15 @@ TOOLS: list[types.Tool] = [
         ["id"],
     ),
     _tool(
+        "ap_node_get",
+        "Describe one node of the active material: every input socket, output socket and "
+        "button as 'index:name:type=default_values;' (e.g. '4:Scale:VALUE=5;'). Use it "
+        "before ap_node_set_value / ap_node_connect instead of guessing socket indices. "
+        "ap_node_add returns the same tables for the node it creates.",
+        {"id": _i("Node id (from ap_node_list or ap_node_add).")},
+        ["id"],
+    ),
+    _tool(
         "ap_node_connect",
         "Link one node's output socket to another node's input socket. Socket numbers are "
         "0-based positions, as reported by ap_node_list; the output node's material socket "
@@ -1017,7 +1034,11 @@ TOOLS: list[types.Tool] = [
         "Fill the selected layer with the active material and push an undo step. THIS IS THE "
         "STEP THAT MAKES A NODE-GRAPH EDIT VISIBLE — ap_material_update only recompiles the "
         "material; nothing appears in the viewport until you fill or paint. The working loop "
-        "is: ap_node_* edits -> ap_material_update -> ap_fill_layer -> ap_capture_viewport. "
+        "is: ap_node_* edits -> ap_material_update -> ap_fill_layer -> ap_capture_window. "
+        "The first fill after ap_material_update is repeated automatically on the next "
+        "frame (reply: refill_next_frame=true): on its own it leaves the viewport showing "
+        "the PREVIOUS material about half the time, and ArmorPaint's own node editor also "
+        "re-fills after recompiling. That costs one extra undo step. "
         "Fails with 'no_project'/'bad_args' if no layer is selected. This is also the ONLY "
         "layer operation in ArmorPaint's plugin API — there is no create/delete/rename/mask/"
         "opacity/blend binding, so layer management has to be done by hand in the UI.",
@@ -1034,8 +1055,8 @@ TOOLS: list[types.Tool] = [
         "Capture the 3D viewport into the project as a packed texture asset. Works on a "
         "stock ArmorPaint, but the pixels land INSIDE the project (persisted only when the "
         ".arm is saved) — nothing outside ArmorPaint can read them, so you cannot look at "
-        "the result. To actually see the viewport, use ap_capture_viewport (needs the "
-        "optional viewport patch). NOTE: the bridge handler runs inline in one frame and "
+        "the result. To actually see the viewport, use ap_capture_window (Linux) or "
+        "ap_capture_viewport (needs a build with viewport_save_texture_to_file). NOTE: the bridge handler runs inline in one frame and "
         "cannot wait for a re-render, so the capture is of the frame ALREADY drawn and may "
         "include the UI overlay; ArmorPaint's own two-frame settle is not reproducible from "
         "a plugin.",
@@ -1048,10 +1069,10 @@ TOOLS: list[types.Tool] = [
         "ap_capture_viewport",
         "Capture the shaded 3D viewport to a PNG file and return the image so you can look "
         "at your own work. REQUIRES the optional viewport patch (docs/UPSTREAM_CHANGES.md) "
-        "which adds the viewport_save_texture_to_file binding — on a stock build this "
-        "returns code 'unsupported', and the fallbacks are ap_capture_to_project (in-project "
-        "only) or ap_export_textures (writes real files, but flat textures rather than the "
-        "shaded view).",
+        "which adds the viewport_save_texture_to_file binding (upstream since 2026-09-09, so "
+        "newer builds have it too; set HAVE_VIEWPORT_PATCH in the plugin) — on older builds "
+        "this returns code 'unsupported'. On Linux, ap_capture_window works on any build "
+        "and is the usual way to look at the result.",
         {
             "path": _s(f"Destination .png file. {_PATH_NOTE}"),
             "width": _i("Capture width in pixels.", default=1024),
@@ -1063,6 +1084,41 @@ TOOLS: list[types.Tool] = [
             ),
         },
         ["path"],
+    ),
+    _tool(
+        "ap_capture_window",
+        "Screenshot ArmorPaint's window and return it as an image — the rendered, shaded "
+        "result plus the UI around it (layers, materials, node editor). Works on a STOCK "
+        "build: the server reads the window's pixels from the X server itself (ArmorPaint "
+        "is an X11/XWayland client on Linux), so it works while the window is covered by "
+        "others and never steals focus; only a minimised window fails. Linux only. By "
+        "default it first round-trips a ping through the bridge so the frame showing your "
+        "last edit has been drawn. The 3D viewport's position is not exposed to plugins, so "
+        "to isolate it: capture once uncropped, read off the viewport rectangle, then pass "
+        "it as 'crop'. Answered locally; works even if the bridge is off.",
+        {
+            "crop": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 4,
+                "maxItems": 4,
+                "description": "[x, y, width, height] in window pixels; clamped to the window.",
+            },
+            "downscale": _i(
+                f"Keep every Nth pixel (1..{MAX_DOWNSCALE}) to shrink the response.",
+                default=1,
+            ),
+            "path": _s(f"Also save the PNG here (optional). {_PATH_NOTE}"),
+            "settle": _b(
+                "Ping the bridge first so the latest edit has rendered. Skipped automatically "
+                "if the bridge is not running.",
+                default=True,
+            ),
+            "include_image": _b(
+                "Return the PNG inline. Set false (with 'path') to keep the response small.",
+                default=True,
+            ),
+        },
     ),
     _tool(
         "ap_read_image_file",
@@ -1284,7 +1340,7 @@ def _build_wire_args(name: str, a: dict[str, Any]) -> dict[str, Any]:
             "y": _opt_float(a, "y") or 0.0,
         }
 
-    if name == "ap_node_remove":
+    if name in ("ap_node_remove", "ap_node_get"):
         return {"id": _req_int(a, "id", 0)}
 
     if name == "ap_node_connect":
@@ -1452,6 +1508,71 @@ def _image_content(path: Path, max_bytes: int) -> types.ImageContent:
 # MCP server definition
 # ---------------------------------------------------------------------------
 
+async def _capture_window_tool(
+    args: dict[str, Any],
+) -> list[types.TextContent | types.ImageContent]:
+    crop_raw = args.get("crop")
+    crop: tuple[int, int, int, int] | None = None
+    if crop_raw is not None:
+        if (
+            not isinstance(crop_raw, list)
+            or len(crop_raw) != 4
+            or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in crop_raw)
+        ):
+            raise BadArgs("'crop' must be [x, y, width, height] as four numbers.", arg="crop")
+        crop = (int(crop_raw[0]), int(crop_raw[1]), int(crop_raw[2]), int(crop_raw[3]))
+    downscale = _opt_int(args, "downscale", 1, MAX_DOWNSCALE) or 1
+    save_to = _norm_path(args, "path", required=False)
+    if save_to is not None and not save_to.lower().endswith(".png"):
+        raise BadArgs("'path' must end in .png.", arg="path")
+
+    loop = asyncio.get_running_loop()
+    report: dict[str, Any] = {"ok": True}
+
+    # Settle: a ping is answered in the frame AFTER any earlier request, and that earlier
+    # frame has been rendered by then. The heartbeat's title picks the right window if
+    # more than one ArmorPaint is open.
+    hb = read_heartbeat()
+    title = hb.get("app_title") if isinstance(hb, dict) else None
+    if _opt_bool(args, "settle") is not False and hb is not None:
+        try:
+            await loop.run_in_executor(None, partial(send_to_armorpaint, "ping", {}, 5.0))
+            await asyncio.sleep(0.05)  # let the compositor pick up the presented frame
+            report["settled"] = True
+        except BridgeError as exc:
+            report["settled"] = False
+            report["settle_error"] = exc.message
+    else:
+        report["settled"] = False
+
+    try:
+        cap = await loop.run_in_executor(
+            None, partial(capture_window, title or None, crop, downscale)
+        )
+    except CaptureError as exc:
+        return _text(
+            {"ok": False, "code": exc.code, "error": exc.message, "tool": "ap_capture_window"}
+        )
+
+    report.update(cap.describe())
+    if save_to is not None:
+        Path(save_to).write_bytes(cap.png)
+        report["path"] = save_to
+    if len(cap.png) > MAX_IMAGE_BYTES:
+        report["image_error"] = (
+            f"PNG is {len(cap.png)} bytes, over the {MAX_IMAGE_BYTES}-byte inline limit; "
+            f"use 'crop' or 'downscale'."
+        )
+        return _text(report)
+    text = types.TextContent(type="text", text=json.dumps(report, indent=2))
+    if _opt_bool(args, "include_image") is False:
+        return [text]
+    image = types.ImageContent(
+        type="image", data=base64.b64encode(cap.png).decode("ascii"), mimeType="image/png"
+    )
+    return [image, text]
+
+
 SERVER_INSTRUCTIONS = (
     "Drives a running ArmorPaint 1.0 (a 3D PBR texture painter) over a file mailbox. "
     "If any tool returns a transport error, call ap_bridge_status first — it diagnoses the "
@@ -1463,7 +1584,8 @@ SERVER_INSTRUCTIONS = (
     "GRAPH is fully scriptable (ap_node_list / ap_node_add / ap_node_connect / "
     "ap_node_set_value + ap_material_update), which is where an agent has real leverage. "
     "Bulk data moves by path: ap_export_textures writes real PNGs, then ap_read_image_file "
-    "shows you one."
+    "shows you one. To SEE the rendered viewport, use ap_capture_window (Linux) after "
+    "ap_fill_layer or a paint stroke."
 )
 
 server = Server(SERVER_NAME, version=__version__, instructions=SERVER_INSTRUCTIONS)
@@ -1490,6 +1612,9 @@ async def call_tool(
                 None, partial(bridge_diagnostics, probe=probe is not False)
             )
             return _text(report)
+
+        if name == "ap_capture_window":
+            return await _capture_window_tool(args)
 
         if name == "ap_read_image_file":
             path_text = _norm_path(args, "path")
@@ -1572,6 +1697,11 @@ async def call_tool(
         payload["tool"] = name
         if isinstance(exc, OpFailed):
             payload["from"] = "armorpaint bridge"
+            if name == "ap_capture_viewport" and payload.get("code") == "unsupported":
+                payload["try_instead"] = (
+                    "ap_capture_window: screenshots ArmorPaint's window from outside the app "
+                    "on a stock build (Linux)."
+                )
         elif not isinstance(exc, BadArgs):
             payload.setdefault(
                 "next_step", "Call ap_bridge_status for a full connection diagnosis."

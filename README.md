@@ -10,7 +10,7 @@ and export textures — against a **stock, unmodified ArmorPaint**, including th
 > This is an independent third-party tool. Please do not file ArmorPaint bugs for it, and do not
 > file its bugs upstream.
 
-> **Status: works, lightly travelled.** All 58 tools are implemented and were exercised against a
+> **Status: works, lightly travelled.** The original 58 tools are implemented and were exercised against a
 > live ArmorPaint 1.0: a 66-call sweep covering 42 tools returned **60 OK, 6 structured errors (all
 > deliberate bad-input probes), 0 crashes or timeouts**, at 15–513 ms per call. That includes the
 > destructive surface — `project_new`, `project_open`, `project_save_as`, `material_delete`,
@@ -109,6 +109,11 @@ Short version; the careful one is [docs/INSTALL.md](docs/INSTALL.md).
    }
    ```
 
+   `command` must be a Python that has this package installed. For Claude Code working *in* this
+   repo on Linux/macOS, a venv is simplest: `python -m venv .venv && .venv/bin/pip install -e .`,
+   then set `"command": ".venv/bin/python"` (relative paths resolve against the repo root).
+   `.mcp.json` is gitignored here, so that file stays local to your checkout.
+
    Usually that is all: the server finds the spool by locating your ArmorPaint install (it only
    accepts a candidate directory that really contains `data\plugins`). If your install is somewhere
    unusual — the itch.io app, for instance — add `"env": {"ARMORPAINT_DIR": "C:\\ArmorPaint"}`.
@@ -140,7 +145,8 @@ a second — but a bake or a large export takes as long as ArmorPaint takes.
 
 ## Tool index
 
-58 tools. Each is backed by a named minic binding or a registered struct field; the implementation
+60 tools. Each is backed by a named minic binding or a registered struct field (except
+`ap_capture_window`, which the server answers itself from the display server); the implementation
 of each is tabulated in [docs/MINIC_DIALECT_AND_API.md](docs/MINIC_DIALECT_AND_API.md) §2.13, and
 what was deliberately **left out, with the reason**, is §2.14 — read that before assuming a missing
 capability is an oversight.
@@ -212,15 +218,16 @@ find its inputs and confirm its outputs, without a second tool server.
 | `ap_material_set_channels` | Toggle the per-material paint channels |
 | `ap_material_list` ⚠ | **Degraded.** Reads a save/load snapshot: empty before the first save, and blind to materials created this session. Use `ap_material_get_active` for ground truth. |
 
-**Material nodes** (6) — `ap_node_list` (nodes *and* link topology), `ap_node_add`,
-`ap_node_remove`, `ap_node_connect`, `ap_node_disconnect`, `ap_node_set_value` (float / color /
-vector / button).
+**Material nodes** (7) — `ap_node_list` (nodes *and* link topology), `ap_node_get` (every
+socket and button with its index, name, type and default, e.g. `4:Scale:VALUE=5`), `ap_node_add`
+(returns the same socket tables), `ap_node_remove`, `ap_node_connect`, `ap_node_disconnect`,
+`ap_node_set_value` (float / color / vector / button).
 
 Node types are Blender-style uppercase identifiers — `TEX_NOISE`, `TEX_BRICK`, `RGB`, `MIX_RGB` —
 and `ap_node_add` validates against the 76 legal names rather than passing an unknown string into
 the app. The list is in `docs/MINIC_DIALECT_AND_API.md` §2.6.
 
-**Painting & viewport** (7)
+**Painting & viewport** (8)
 
 | Tool | Does |
 |---|---|
@@ -228,13 +235,15 @@ the app. The list is in `docs/MINIC_DIALECT_AND_API.md` §2.6.
 | `ap_set_brush` | Radius, opacity, hardness, scale, angle, blending |
 | `ap_paint_stroke` | A stroke in screen space, as a point list |
 | `ap_paint_stroke_world` | A stroke in world space |
-| `ap_fill_layer` | Fill the active layer |
+| `ap_fill_layer` | Fill the active layer. The first fill after `ap_material_update` is repeated on the next frame, because on its own it left the viewport showing the previous material in about half of measured edits |
 | `ap_set_display_channel` | Switch the viewport display channel (one of 16) |
 | `ap_capture_to_project` | Capture the viewport **into the project as a texture asset** — see Limitations; this does *not* produce a file you can read |
+| `ap_capture_window` | **Screenshot ArmorPaint's window and return it as an image** — the shaded viewport plus the UI. Stock binary, Linux (X11/XWayland): the server reads the window's pixels from the X server, so it works while the window is covered and never steals focus. Optional `crop` and `downscale`. ~130 ms for 1720×960 |
 
-**Optional, patched builds only** (1) — `ap_capture_viewport` writes the 3D viewport to a
-real PNG *and returns it as an image*, which is what closes the see → adjust → see loop. It
-requires the opt-in native patch in `patch/` and therefore a self-built ArmorPaint; see
+**Optional, patched or newer builds only** (1) — `ap_capture_viewport` writes the 3D viewport to a
+real PNG *and returns it as an image*. It needs the `viewport_save_texture_to_file` binding: the
+opt-in native patch in `patch/`, or an upstream build from after 2026-09-09 (commit `1e14e27e`),
+plus `HAVE_VIEWPORT_PATCH = 1` in the plugin; see
 [docs/UPSTREAM_CHANGES.md](docs/UPSTREAM_CHANGES.md). On a stock binary the tool reports
 `unsupported` and says why. Measured on a patched 1.0 build: 11–15 ms in-app, ~140 ms round trip
 for an 800×600 PNG.
@@ -248,7 +257,7 @@ still shows you nothing:
 ap_node_add / ap_node_set_value / ap_node_connect   edit the graph
 ap_material_update                                  recompile it
 ap_fill_layer   (or ap_paint_stroke / _world)       APPLY it   <-- the step people miss
-ap_capture_viewport                                 look at it
+ap_capture_window   (or ap_capture_viewport)        look at it
 ```
 
 **`ap_material_update` does not render.** ArmorPaint's viewport shows the *layer stack*; the node
@@ -268,7 +277,8 @@ temporary gaps, and no amount of work on this repo removes them.
   `gpu_get_texture_pixels` are not exposed to plugins. **What an agent can actually see is its work
   product:** `ap_export_textures` writes real PNGs, which the server reads and returns as images.
   For the shaded viewport itself, the optional patch (12 added lines, one new binding) closes the
-  gap on a self-built ArmorPaint.
+  gap on a self-built ArmorPaint, and on Linux `ap_capture_window` sidesteps the plugin API
+  entirely by screenshotting the window from the server.
 - **ArmorPaint renders at full rate while the bridge is enabled.** The app normally sleeps after
   ~120 idle frames, and a sleeping app does not dispatch plugin callbacks — so a polling bridge must
   keep it awake, and pays for it in GPU and power. `ap_bridge_set_enabled` (and a toggle in the
