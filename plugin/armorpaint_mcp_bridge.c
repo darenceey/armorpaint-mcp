@@ -77,7 +77,7 @@
 // ---------------------------------------------------------------------------
 // DIALECT CONSTRAINTS OBSERVED HERE (see docs/MINIC_DIALECT_AND_API.md)
 //   * main() is the LAST function; anything after it is never registered.
-//   * 28 functions + main, against a silent hard cap of 32. Every operation is
+//   * 29 functions + main, against a silent hard cap of 32. Every operation is
 //     an else-if ARM inside dispatch(), never its own function.
 //   * no switch, no ternary, no casts, no i++ inside an expression, no #define,
 //     no fixed-size local arrays (they leak from a shared 512-slot pool).
@@ -160,6 +160,18 @@ int r_ok = 1;
 // committed; otherwise the server sees a frozen heartbeat and blames a modal
 // dialog instead of reporting that ArmorPaint is not running.
 int quitting = 0;
+
+// Set by material_update, consumed by fill_layer. MEASURED on 1.0/Linux: the
+// first script_fill_layer() after script_material_update() leaves the viewport
+// showing the PREVIOUS material about half the time (4/8 value edits). Waiting
+// does not fix it (3 frames or 250 ms first: still 2/10 stale) and neither does
+// a second fill in the SAME frame (4/12), but a second fill on the NEXT frame
+// was never stale (0/10). ArmorPaint's own node editor likewise re-runs the fill
+// layers after its final recompile (util_nodes.c ui_nodes_recompile_mat_final).
+// So fill_layer schedules refill_pending and on_update performs it next frame,
+// before any queued request -- a settle ping is therefore answered after it.
+int fill_after_update = 0;
+int refill_pending    = 0;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -703,6 +715,54 @@ char *sa_names(any_array_t *a, int max) {
 				acc = jesc(s);
 			}
 		}
+	}
+	return acc;
+}
+
+// Describe a node's sockets (or buttons) as "index:name:type=v0,v1,...;" so an
+// agent can address them by index without guessing. ArmorPaint's node catalogue
+// uses no ':' ';' or '=' in socket or button names. default_value is 1 float for
+// VALUE, 3 for VECTOR, 4 for RGBA; it is what the parser uses when the socket is
+// unlinked. ui_node_socket_t and ui_node_button_t lay their fields out
+// differently, so each gets its own typed pointer.
+char *socket_table(any_array_t *a, int is_button) {
+	if (a == NULL) {
+		return "";
+	}
+	char             *acc  = "";
+	char             *vals = "";
+	char             *nm   = "";
+	char             *ty   = "";
+	f32_array_t      *dv   = NULL;
+	ui_node_socket_t *so;
+	ui_node_button_t *bt;
+	int               n = a->length;
+	if (n > MAX_LIST_ITEMS) {
+		n = MAX_LIST_ITEMS;
+	}
+	for (int k = 0; k < n; ++k) {
+		if (is_button) {
+			bt = a->buffer[k];
+			nm = bt->name;
+			ty = bt->type;
+			dv = bt->default_value;
+		}
+		else {
+			so = a->buffer[k];
+			nm = so->name;
+			ty = so->type;
+			dv = so->default_value;
+		}
+		vals = "";
+		if (dv != NULL) {
+			for (int q = 0; q < dv->length; ++q) {
+				if (q > 0) {
+					vals = string("%s,", vals);
+				}
+				vals = string("%s%s", vals, f32_to_string(dv->buffer[q]));
+			}
+		}
+		acc = string("%s%d:%s:%s=%s;", acc, k, jesc(nm), jesc(ty), vals);
 	}
 	return acc;
 }
@@ -1952,6 +2012,7 @@ char *dispatch(void *m) {
 	}
 	else if (string_equals(op, "material_update")) {
 		script_material_update();
+		fill_after_update = 1;
 		return ok_empty();
 	}
 
@@ -2041,6 +2102,31 @@ char *dispatch(void *m) {
 		if (nd->outputs != NULL) {
 			json_encode_i32("outputs", nd->outputs->length);
 		}
+		json_encode_string("input_sockets", socket_table(nd->inputs, 0));
+		json_encode_string("output_sockets", socket_table(nd->outputs, 0));
+		json_encode_string("buttons", socket_table(nd->buttons, 1));
+		json_encode_string("socket_format", "index:name:type=default_values;");
+		return json_encode_end();
+	}
+	else if (string_equals(op, "node_get")) {
+		i1 = arg_i(m, "id", -1);
+		if (i1 < 0) {
+			return fail("bad_args", "missing or negative 'id'");
+		}
+		nd = script_material_get_node_id(i1);
+		if (nd == NULL) {
+			return fail("not_found", string("no node with id %d", i1));
+		}
+		json_encode_begin();
+		json_encode_i32("id", nd->id);
+		json_encode_string("type", jesc(nd->type));
+		json_encode_string("name", jesc(nd->name));
+		json_encode_f32("x", nd->x);
+		json_encode_f32("y", nd->y);
+		json_encode_string("input_sockets", socket_table(nd->inputs, 0));
+		json_encode_string("output_sockets", socket_table(nd->outputs, 0));
+		json_encode_string("buttons", socket_table(nd->buttons, 1));
+		json_encode_string("socket_format", "index:name:type=default_values;");
 		return json_encode_end();
 	}
 	else if (string_equals(op, "node_remove")) {
@@ -2316,7 +2402,11 @@ char *dispatch(void *m) {
 			return fail("no_project", "no active material");
 		}
 		script_fill_layer(); // fills the selected layer with the active material
-		return ok_empty();
+		refill_pending    = fill_after_update; // see fill_after_update
+		fill_after_update = 0;
+		json_encode_begin();
+		json_encode_bool("refill_next_frame", refill_pending);
+		return json_encode_end();
 	}
 	else if (string_equals(op, "capture_to_project")) {
 		if (pr == NULL) {
@@ -2539,6 +2629,21 @@ void on_update() {
 	// consecutive missed frames, so putting the poll throttle above this would
 	// let the app sleep and the bridge would go permanently deaf.
 	iron_delay_idle_sleep();
+
+	// The deferred second pass of a fill after material_update (see
+	// fill_after_update). Checked before the poll throttle so it lands on the very
+	// next frame. The layer may have been deselected since; re-check.
+	if (refill_pending) {
+		refill_pending = 0;
+		context_t *rc = script_get_context();
+		if (rc != NULL) {
+			if (rc->layer != NULL) {
+				if (rc->material != NULL) {
+					script_fill_layer();
+				}
+			}
+		}
+	}
 
 	float dt = sys_real_delta();
 

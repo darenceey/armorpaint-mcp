@@ -16,7 +16,8 @@ graph and applied with one fill.
 | Tool | Binding | Behaviour |
 |---|---|---|
 | `ap_node_add` | `script_material_create_node_at(type, x, y)` | returns the new node (id assigned by the app) |
-| `ap_node_list` | walks `ctx.material.canvas.nodes` and `.links` | ids, types, positions, socket values, topology |
+| `ap_node_list` | walks `ctx.material.canvas.nodes` and `.links` | ids, types, names, positions, topology |
+| `ap_node_get` | one node's `inputs` / `outputs` / `buttons` | every socket and button: index, name, type, default value |
 | `ap_node_remove` | `script_material_remove_node` | refuses to remove `OUTPUT_MATERIAL_PBR` |
 | `ap_node_connect` | `script_material_connect(from, from_socket, to, to_socket)` | **removes any existing link into that input first** — idempotent per input |
 | `ap_node_disconnect` | `script_material_disconnect(to, to_socket)` | by target input |
@@ -110,6 +111,11 @@ in  0 Vector | 1 Color 1 | 2 Color 2 | 3 Mortar | 4 Scale 5.0 | 5 Mortar Size 0.
     | 12 Squash 1.0 | 13 Frequency 2.0
 out 0 Color RGBA | 1 Factor VALUE
 ```
+With input 0 unlinked, the pattern does not follow the UVs: measured on the default cube, it shows
+as thin stripes on some faces and flat mortar on others. Wire `TEX_COORD` output 2 (UV) into input 0
+for real bricks, optionally through `MAPPING` (input 3 is Scale) to change proportions. The default
+cube's UV islands are rotated per face, so the bricks run sideways on some faces. Check the exported
+base-colour texture, where they are laid out flat.
 
 **BAKE_CURVATURE** — the one bake an agent can actually trigger
 ```
