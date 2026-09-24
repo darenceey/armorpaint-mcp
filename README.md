@@ -16,8 +16,12 @@ and export textures — against a **stock, unmodified ArmorPaint**, including th
 > destructive surface — `project_new`, `project_open`, `project_save_as`, `material_delete`,
 > `export_*` and the paint ops — run against a scratch project.
 >
-> What that does **not** cover: **Windows is the only platform tested.** The Linux and macOS paths
-> are written but unexercised. Long painting sessions, huge meshes and 4K exports are untested, and
+> **Linux** was then tested separately (Arch/CachyOS, ArmorPaint 1.0 system package, Vulkan/RADV):
+> an MCP stdio sweep over all 58 tools returned **77 OK and 5 structured errors (all deliberate
+> probes), 0 crashes or timeouts**. Getting there needed Linux-specific plugin fixes; see
+> [Linux notes](#linux-notes).
+>
+> What that does **not** cover: **macOS is untested.** Long painting sessions, huge meshes and 4K exports are untested, and
 > the optional viewport patch has only been built against the pinned commit named in
 > `docs/UPSTREAM_CHANGES.md`. Expect rough edges outside the tested path, and please report them.
 
@@ -75,7 +79,7 @@ The byte-level contract is [docs/PROTOCOL.md](docs/PROTOCOL.md).
 | | |
 |---|---|
 | ArmorPaint | **1.0** (the current C/minic generation). The plugin system in the pre-2025 Haxe/Kha builds is a different thing entirely and is not supported. |
-| OS | Windows 10/11 verified. Linux/macOS should work — the protocol is plain files — but are untested. |
+| OS | Windows 10/11 and Linux verified. macOS paths are written but untested. |
 | Python | 3.11+ |
 | MCP client | Anything that can launch a stdio MCP server (Claude Code, Claude Desktop, …) |
 | Compiler | **None.** Not for the core toolkit. Only the optional viewport patch needs a self-built ArmorPaint. |
@@ -161,7 +165,7 @@ capability is an oversight.
 | `ap_project_save` | Save in place; errors with `no_project` if never saved. **Deferred** — see below |
 | `ap_project_save_as` | Set the filepath, then save. **Deferred** — ArmorPaint queues the write for the next frame (`sys_notify_on_next_frame`), so a success reply means *queued*, not *written*. Confirm with `ap_fs_stat` if it matters |
 | `ap_project_get_info` | Filepath, basepath, version, envmap, camera FOV, BGRA flag |
-| `ap_project_list_texture_assets` | Imported texture assets — live |
+| `ap_project_list_texture_assets` | Imported texture assets (a save/load snapshot; labelled as such) |
 | `ap_project_list_scripts` | Project scripts (a save/load snapshot; labelled as such) |
 | `ap_quit` | Quit ArmorPaint |
 
@@ -280,8 +284,30 @@ temporary gaps, and no amount of work on this repo removes them.
 - **No undo/redo, no bake-parameter control, no export format/bit-depth control, no tone
   mapping or LUT, no shelf/resource search, no project metadata, no UI automation.** Each of these
   is a missing binding, itemised with its evidence in `docs/MINIC_DIALECT_AND_API.md` §2.14.
-- **Windows is the tested platform.** The protocol is plain files and should port, but nothing else
-  has been measured.
+- **macOS is untested.** Windows and Linux have been measured; macOS shares the Linux code path
+  but nothing there has been run.
+
+## Linux notes
+
+- **The spool is per-user, not under the install.** On Linux (and macOS) the plugin uses
+  `~/.local/share/armorpaint-mcp/spool` (macOS: `~/Library/Application Support/armorpaint-mcp/spool`),
+  and the server defaults to the same path, so no configuration is needed. A relative spool cannot
+  work there: ArmorPaint resolves relative *reads* against the executable's directory but relative
+  *writes*, `mkdir` and `rm` against the working directory, so requests would land in one
+  directory and be looked for in another. `getenv` is not bound, so the plugin finds the home
+  directory by probing `/root`, `/home/*`, `/var/home/*` and `/Users/*` for the one it can write to.
+  The path it chose is in the ArmorPaint console (`armorpaint-mcp bridge ... listening on ...`); if
+  your home lives elsewhere, set `ARMORPAINT_SPOOL` to that path.
+- **Distro packages put the plugins directory under root.** For example, Arch's `armorpaint`
+  package installs to `/usr/lib/armorpaint`, so `data/plugins` is root-owned and neither a copy nor
+  the in-app **Import** button works without privileges. Symlink the bridge in once, and later
+  updates to the repo take effect when you reload the plugin:
+
+  ```sh
+  sudo ln -s "$PWD/plugin/armorpaint_mcp_bridge.c" /usr/lib/armorpaint/data/plugins/armorpaint_mcp_bridge.c
+  ```
+- **The window does not need focus.** The bridge kept answering throughout testing while
+  ArmorPaint was an unfocused background window.
 
 ## Troubleshooting
 
