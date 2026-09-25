@@ -24,12 +24,14 @@ call is a file round-trip through the spool directory — see ``docs/PROTOCOL.md
 wire contract and ``transport.py`` for how the spool path is discovered. Start with
 ``ap_bridge_status``: it diagnoses the connection without needing the bridge to answer.
 
-Scope note, because it shapes the whole tool surface: ArmorPaint's plugin API is 529
-bindings, and **layers are almost absent from it** — ``script_fill_layer`` is the only layer
-operation in the entire table, and ``slot_layer_t`` is not a registered struct, so layers
-cannot be created, listed, renamed, reordered, masked or blended from a plugin. There are
-also no bake-run, undo/redo, camera-pose or UI-automation bindings. Those tools are not
-missing here by oversight; they are impossible. See ``docs/MINIC_DIALECT_AND_API.md`` §2.14.
+Scope note, because it shapes the whole tool surface: ArmorPaint's stock plugin API is 529
+bindings, and it has no binding at all for layer management, undo/redo, export format,
+bake runs, render settings or camera views. Those tools are served by the optional native
+extension (``patch/apply_ext_patch.py``: one added binding, ``mcp_ext_call``), which the
+bridge detects at run time; on a stock build they answer ``unsupported`` and say so. Undo
+and redo also fall back to the app's own keyboard shortcuts, sent as synthetic input, and
+UI automation, window capture, resource search and project metadata are answered by this
+server itself, so they work on any build.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ import asyncio
 import base64
 import json
 import re
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -59,8 +62,10 @@ try:  # normal package import
         spool_resolution,
     )
     from .window_capture import MAX_DOWNSCALE, CaptureError, capture_window
+    from . import desktop_input, local_tools
+    from .transport import send_batch
 except ImportError:  # running server.py as a loose script
-    __version__ = "1.0.0"
+    __version__ = "1.1.0"
     from transport import (  # type: ignore[no-redef]
         BadArgs,
         BridgeError,
@@ -76,6 +81,9 @@ except ImportError:  # running server.py as a loose script
         CaptureError,
         capture_window,
     )
+    import desktop_input  # type: ignore[no-redef]
+    import local_tools  # type: ignore[no-redef]
+    from transport import send_batch  # type: ignore[no-redef]
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -145,10 +153,68 @@ OP_TIMEOUTS: dict[str, float] = {
     "set_display_channel": 30,
     "capture_to_project": 180,
     "capture_viewport": 180,
+    "bridge_set_idle": 10,
+    # native extension (patch/apply_ext_patch.py)
+    "layer_list": 15,
+    "layer_select": 30,
+    "layer_new": 60,
+    "layer_delete": 60,
+    "layer_duplicate": 60,
+    "layer_set": 30,
+    "layer_move": 30,
+    "layer_action": 120,
+    "undo": 60,
+    "redo": 60,
+    "history": 15,
+    "export_presets": 15,
+    "export_textures_ex": 900,
+    "bake": 120,
+    "bake_status": 15,
+    "bake_settings": 15,
+    "render_settings": 30,
+    "texture_resolution": 300,
+    "project_lists": 15,
+    "camera": 15,
+    "console_read": 10,
 }
 
+# Answered by the optional native extension; on a stock build the bridge says "unsupported".
+EXT_TOOLS = frozenset(
+    {
+        "ap_layer_list", "ap_layer_select", "ap_layer_new", "ap_layer_delete",
+        "ap_layer_duplicate", "ap_layer_set", "ap_layer_move", "ap_layer_action",
+        "ap_history", "ap_export_presets", "ap_bake", "ap_bake_status", "ap_bake_settings",
+        "ap_render_settings", "ap_texture_resolution", "ap_project_lists", "ap_camera",
+        "ap_console_read",
+    }
+)
+EXT_HINT = (
+    "This needs the optional native extension: run patch/apply_ext_patch.py against an "
+    "ArmorPaint source checkout and rebuild (docs/UPSTREAM_CHANGES.md). The bridge plugin "
+    "detects it automatically; nothing else changes."
+)
+
+LAYER_KINDS = ("paint", "fill", "decal", "group", "black_mask", "white_mask", "fill_mask")
+LAYER_ACTIONS = ("clear", "merge_down", "merge_group", "to_fill", "to_paint", "apply_mask", "invert_mask")
+BLEND_MODES = (
+    "mix", "darken", "multiply", "burn", "lighten", "screen", "dodge", "add", "overlay",
+    "soft_light", "linear_light", "difference", "subtract", "divide", "hue", "saturation",
+    "color", "value",
+)
+BAKE_TYPES = (
+    "curvature", "normal", "normal_object", "height", "derivative", "position", "texcoord",
+    "material_id", "object_id", "vertex_color", "occlusion", "lightmap", "bent_normal",
+    "thickness",
+)
+EXPORT_LAYER_MODES = ("visible", "selected", "per_object", "per_udim_tile")
+CAMERA_VIEWS = ("front", "back", "left", "right", "top", "bottom", "reset")
+UI_TOOLS = frozenset({"ap_ui_click", "ap_ui_key", "ap_ui_drag", "ap_ui_scroll"})
+
 # Tools answered entirely by this process — they work even when ArmorPaint is closed.
-LOCAL_TOOLS = frozenset({"ap_bridge_status", "ap_read_image_file", "ap_capture_window"})
+LOCAL_TOOLS = frozenset(
+    {"ap_bridge_status", "ap_read_image_file", "ap_capture_window", "ap_resource_search"}
+    | UI_TOOLS
+)
 
 # Bulk data travels by path; only these tools ever inline bytes into an MCP response.
 MAX_IMAGE_BYTES = 6_000_000
@@ -536,20 +602,29 @@ TOOLS: list[types.Tool] = [
     ),
     _tool(
         "ap_bridge_set_enabled",
-        "Turn the bridge's per-frame polling on or off. This has a real cost: while enabled "
-        "the plugin calls iron_delay_idle_sleep() every frame, which keeps ArmorPaint "
-        "rendering at full rate even when unfocused (that is also what makes remote control "
-        "of a background window possible). Disable it when no agent is working. WARNING: "
-        "disabling it stops the bridge from reading requests, so this is the last tool that "
-        "will work until someone re-enables it from the Plugins tab.",
+        "Turn the bridge on or off. Disabled, it never holds ArmorPaint awake and refuses "
+        "every op except this one and ap_ping; the server still wakes the app to deliver "
+        "requests, so it can be re-enabled from here. You rarely need this: an enabled bridge "
+        "already lets ArmorPaint sleep between requests (see ap_bridge_set_idle).",
         {"enabled": _b("True to poll every frame; false to let the app idle.")},
         ["enabled"],
     ),
     _tool(
+        "ap_bridge_set_idle",
+        "Control how long the bridge keeps ArmorPaint awake after a request. ArmorPaint only "
+        "runs plugin code while awake, and awake means rendering at full frame rate; the "
+        "bridge therefore holds it awake for 'linger' seconds after the last request and then "
+        "lets it sleep. The next request wakes it (this server sends the window a synthetic "
+        "1-pixel pointer move), which costs one frame. -1 keeps it awake permanently (the old "
+        "behaviour). Defaults: 10 s on Windows/Linux, -1 on macOS where waking is untested. "
+        "Persisted in the spool across restarts.",
+        {"linger": _n("Seconds to stay awake after a request; -1 = never sleep.", minimum=-1, maximum=3600)},
+        ["linger"],
+    ),
+    _tool(
         "ap_console_write",
-        "Write a line to ArmorPaint's own console. Write-only: no binding can read the "
-        "console back, so this is for leaving a trail for the human, not for logging you "
-        "intend to read.",
+        "Write a line to ArmorPaint's own console. ap_console_read reads the console back on "
+        "a build with the native extension.",
         {
             "text": _s("Message text."),
             "level": _s("Console channel.", enum=["log", "info", "error"], default="log"),
@@ -648,22 +723,31 @@ TOOLS: list[types.Tool] = [
     ),
     _tool(
         "ap_export_textures",
-        "Export the project's texture channels to real image files on disk — the only "
-        "binding in ArmorPaint's plugin API that writes images to disk. Returns the files "
-        "found in the target directory afterwards; feed one to ap_read_image_file to look at "
-        "it. IMPORTANT LIMITS, none of which are settable from a plugin: 'directory' is a "
-        "DIRECTORY, not a filename; the base filename comes from the last name used in "
-        "ArmorPaint's own export dialog, falling back to 'untitled'; the channel suffixes "
-        "come from the active export preset ('generic' is auto-selected on first use); and "
-        "the format/bit depth is whatever the UI is set to (8-bit PNG by default).",
-        {"directory": _s(f"Output directory. {_PATH_NOTE}")},
+        "Export the project's texture channels to real image files on disk, and return the "
+        "files found in the directory afterwards; feed one to ap_read_image_file to look at "
+        "it. 'directory' is a DIRECTORY, not a filename. With no other arguments this works "
+        "on any build and uses ArmorPaint's current settings (8-bit PNG, 'generic' preset, "
+        "base name from the last export dialog or 'untitled'). The format / bits / quality / "
+        "preset / layers / filename options need the native extension (see "
+        "ap_export_presets). NOTE: ArmorPaint exports at the layers' own bit depth, so asking "
+        "for 16/32-bit EXR converts the project's layers to that depth first, exactly as the "
+        "export dialog's Color setting does.",
+        {
+            "directory": _s(f"Output directory. {_PATH_NOTE}"),
+            "format": _s("Image format.", enum=["png", "jpg", "exr"]),
+            "bits": _i("Bit depth: 8 for png/jpg, 16 or 32 for exr.", enum=[8, 16, 32]),
+            "quality": _n("JPEG quality 0..100.", minimum=0, maximum=100),
+            "preset": _s("Export preset name, e.g. generic, unreal, unity (see ap_export_presets)."),
+            "layers": _s("Which layers to export.", enum=list(EXPORT_LAYER_MODES)),
+            "filename": _s("Base filename; channel suffixes come from the preset."),
+        },
         ["directory"],
     ),
     _tool(
         "ap_export_material_bake",
         "Bake the ACTIVE MATERIAL onto a plane and export the result as images "
-        "(export_texture_run with bake_material=1). This is not mesh map baking — there is "
-        "no bake-run binding for normal/AO/curvature maps.",
+        "(export_texture_run with bake_material=1). For mesh map baking (normal, AO, "
+        "curvature, ...) see ap_bake.",
         {"directory": _s(f"Output directory. {_PATH_NOTE}")},
         ["directory"],
     ),
@@ -708,22 +792,23 @@ TOOLS: list[types.Tool] = [
         "The workhorse read: the live painting context — active tool, brush "
         "radius/opacity/hardness/scale/angle/blending, viewport display mode, x-ray flag, "
         "whether a layer and a material are selected, and the active material's name. Note "
-        "that only whether a layer is selected can be reported: the layer object itself is "
-        "an opaque pointer with no readable fields.",
+        "that only whether a layer is selected can be reported here; ap_layer_list describes "
+        "the layers themselves (native extension).",
     ),
     _tool(
         "ap_get_config",
         "Application preferences that are readable from a plugin: window size/scale, "
         "supersampling, keymap, theme, undo steps, camera FOV, default layer resolution, "
         "live-brush/live-material/node-preview toggles, workspace and workflow, plus the "
-        "recent-project and plugin lists. Post-processing settings (SSAO, bloom, LUT, "
-        "gamma...) are not exposed by the API.",
+        "recent-project and plugin lists. Tone and post-processing (SSAO, bloom, gamma, "
+        "contrast, vignette, grain, LUT) are in ap_render_settings.",
     ),
     _tool(
         "ap_set_config",
         "Change application preferences. Only the listed fields are writable; anything else "
         "in ArmorPaint's preferences is not exposed to plugins. layer_res is the DEFAULT "
-        "resolution for new layers — changing it does not resize existing ones.",
+        "resolution index for new layers — changing it does not resize existing ones "
+        "(ap_texture_resolution does).",
         {
             "window_w": _i("Window width in pixels."),
             "window_h": _i("Window height in pixels."),
@@ -733,7 +818,11 @@ TOOLS: list[types.Tool] = [
             "theme": _s("Theme name."),
             "undo_steps": _i("Undo history depth."),
             "camera_fov": _n("Camera field of view in radians."),
-            "layer_res": _i("Default layer resolution for NEW layers (e.g. 2048)."),
+            "layer_res": _i(
+                "Default resolution for NEW layers, as ArmorPaint's index: 0=2048, 1=4096, "
+                "2=8192, 3=16384. To resize the project's texture set use "
+                "ap_texture_resolution."
+            ),
             "brush_live": _b("Live brush preview."),
             "node_previews": _b("Node thumbnails in the node editor."),
             "material_live": _b("Live material preview."),
@@ -845,9 +934,7 @@ TOOLS: list[types.Tool] = [
     ),
     _tool(
         "ap_material_delete",
-        "Delete a material slot by name. Irreversible from here — ArmorPaint's plugin API "
-        "has no undo/redo binding, so this cannot be taken back except by the user pressing "
-        "Ctrl+Z in the app.",
+        "Delete a material slot by name. It pushes an undo step, so ap_undo takes it back.",
         {"name": _s("Material name.")},
         ["name"],
     ),
@@ -867,11 +954,10 @@ TOOLS: list[types.Tool] = [
     ),
     _tool(
         "ap_material_list",
-        "List material names. DEGRADED — read the caveat before trusting it: this reads "
-        "project_t.material_nodes, which is a SNAPSHOT written only at save and load. It is "
-        "null in a project that has never been saved, and it misses materials created during "
-        "this session. There is no live material enumeration binding. For the material you "
-        "are actually working on, use ap_material_get_active.",
+        "List material names. With the native extension the list is LIVE (every material "
+        "in the project right now, and which is active). On a stock build it falls back to "
+        "project_t.material_nodes, a snapshot written only at save/load: empty before the "
+        "first save and blind to materials created since; the reply says live=true/false.",
     ),
     _tool(
         "ap_material_update",
@@ -1039,9 +1125,9 @@ TOOLS: list[types.Tool] = [
         "frame (reply: refill_next_frame=true): on its own it leaves the viewport showing "
         "the PREVIOUS material about half the time, and ArmorPaint's own node editor also "
         "re-fills after recompiling. That costs one extra undo step. "
-        "Fails with 'no_project'/'bad_args' if no layer is selected. This is also the ONLY "
-        "layer operation in ArmorPaint's plugin API — there is no create/delete/rename/mask/"
-        "opacity/blend binding, so layer management has to be done by hand in the UI.",
+        "Fails with 'no_project'/'bad_args' if no layer is selected. Fills whichever layer is "
+        "selected: pick one with ap_layer_select, or make a dedicated fill layer with "
+        "ap_layer_new(kind='fill').",
     ),
     _tool(
         "ap_set_display_channel",
@@ -1052,11 +1138,10 @@ TOOLS: list[types.Tool] = [
     ),
     _tool(
         "ap_capture_to_project",
-        "Capture the 3D viewport into the project as a packed texture asset. Works on a "
-        "stock ArmorPaint, but the pixels land INSIDE the project (persisted only when the "
-        ".arm is saved) — nothing outside ArmorPaint can read them, so you cannot look at "
-        "the result. To actually see the viewport, use ap_capture_window (Linux) or "
-        "ap_capture_viewport (needs a build with viewport_save_texture_to_file). NOTE: the bridge handler runs inline in one frame and "
+        "Capture the 3D viewport into the project as a packed texture asset. The pixels land "
+        "INSIDE the project (persisted only when the .arm is saved), so you cannot look at "
+        "the result — to see the viewport use ap_capture_window (any build) or "
+        "ap_capture_viewport. NOTE: the bridge handler runs inline in one frame and "
         "cannot wait for a re-render, so the capture is of the frame ALREADY drawn and may "
         "include the UI overlay; ArmorPaint's own two-frame settle is not reproducible from "
         "a plugin.",
@@ -1067,12 +1152,11 @@ TOOLS: list[types.Tool] = [
     ),
     _tool(
         "ap_capture_viewport",
-        "Capture the shaded 3D viewport to a PNG file and return the image so you can look "
-        "at your own work. REQUIRES the optional viewport patch (docs/UPSTREAM_CHANGES.md) "
-        "which adds the viewport_save_texture_to_file binding (upstream since 2026-09-09, so "
-        "newer builds have it too; set HAVE_VIEWPORT_PATCH in the plugin) — on older builds "
-        "this returns code 'unsupported'. On Linux, ap_capture_window works on any build "
-        "and is the usual way to look at the result.",
+        "Capture ONLY the shaded 3D viewport (no UI) to a PNG file and return the image. "
+        "Works on builds that export viewport_save_texture_to_file (upstream since "
+        "2026-09-09) or carry the native extension — the bridge detects either on first use. "
+        "On an older stock build this answers 'unsupported'; ap_capture_window works on any "
+        "build.",
         {
             "path": _s(f"Destination .png file. {_PATH_NOTE}"),
             "width": _i("Capture width in pixels.", default=1024),
@@ -1089,9 +1173,11 @@ TOOLS: list[types.Tool] = [
         "ap_capture_window",
         "Screenshot ArmorPaint's window and return it as an image — the rendered, shaded "
         "result plus the UI around it (layers, materials, node editor). Works on a STOCK "
-        "build: the server reads the window's pixels from the X server itself (ArmorPaint "
-        "is an X11/XWayland client on Linux), so it works while the window is covered by "
-        "others and never steals focus; only a minimised window fails. Linux only. By "
+        "build: the server reads the window's own pixels from outside the app (Linux: X11 "
+        "XGetImage; Windows: PrintWindow; macOS: screencapture, which needs the Screen "
+        "Recording permission), so it works while the window is covered by others and never "
+        "steals focus; only a minimised window fails. Coordinates in the image are the ones "
+        "ap_ui_click / ap_ui_drag take (before any downscale). By "
         "default it first round-trips a ping through the bridge so the frame showing your "
         "last edit has been drawn. The 3D viewport's position is not exposed to plugins, so "
         "to isolate it: capture once uncropped, read off the viewport rectangle, then pass "
@@ -1134,6 +1220,333 @@ TOOLS: list[types.Tool] = [
             ),
         },
         ["path"],
+    ),
+]
+
+_LAYER_TARGET = {
+    "index": _i("Target layer by stack index (0 = bottom; see ap_layer_list)."),
+    "name": _s("Target layer by name (first match)."),
+    "layer_id": _i("Target layer by its id."),
+}
+_TARGET_NOTE = " Target by index, name or layer_id; with none, the selected layer."
+_POINT_LIST = {
+    "type": "array",
+    "items": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+    "minItems": 2,
+    "maxItems": 64,
+    "description": "Path as [[x, y], ...] in window pixels.",
+}
+_MODIFIERS = {
+    "type": "array",
+    "items": {"type": "string", "enum": ["ctrl", "shift", "alt"]},
+    "description": "Modifier keys held during the action.",
+}
+
+TOOLS += [
+    # ---- batching -----------------------------------------------------------
+    _tool(
+        "ap_batch",
+        "Run several bridge tools as ONE request, in order, and get every result back "
+        "together. ArmorPaint runs plugin code inside its render loop, so one request costs "
+        "at least one frame; a batch runs several light steps per frame (bounded by the "
+        "plugin's per-frame budget), and GPU-heavy steps (fills, strokes, layer changes) one "
+        "per frame. Heavy steps (exports, saves, opens, imports, bakes) additionally wait "
+        "until no mouse button is held in the app. A failing step does not stop the batch "
+        "unless stop_on_error is set. Any bridge tool can be a step except ap_batch and "
+        "ap_quit; tools answered by this server (capture_window, ui_*, read_image_file, "
+        "resource_search, bridge_status, project_metadata) cannot.",
+        {
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 64,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string", "description": "Tool name, e.g. ap_node_add."},
+                        "args": {"type": "object", "description": "That tool's arguments."},
+                    },
+                    "required": ["tool"],
+                },
+                "description": "Steps to run in order.",
+            },
+            "stop_on_error": _b("Skip the remaining steps after the first failure.", default=False),
+        },
+        ["steps"],
+    ),
+    # ---- layers (native extension) -------------------------------------------
+    _tool(
+        "ap_layer_list",
+        "List the layer stack: index (0 = BOTTOM; the Layers panel shows the highest index "
+        "at the top), id, name, kind (layer/mask/group/filter), selected, visible, opacity, "
+        "blending, parent index, whether it is a fill layer and with which material, object "
+        "mask, scale, angle, UV type. Needs the native extension.",
+    ),
+    _tool(
+        "ap_layer_select",
+        "Make a layer the selected one — the layer that ap_fill_layer and ap_paint_stroke "
+        "act on." + _TARGET_NOTE,
+        dict(_LAYER_TARGET),
+    ),
+    _tool(
+        "ap_layer_new",
+        "Create a layer exactly as the Layers panel's New menu does, with its undo step: "
+        "paint, fill (filled with the active material), decal, group (wraps the selected "
+        "layer), or a black/white/fill mask on the selected layer. The new layer becomes the "
+        "selection.",
+        {
+            "kind": _s("Layer kind.", enum=list(LAYER_KINDS), default="paint"),
+            "name": _s("Optional name for the new layer."),
+        },
+    ),
+    _tool(
+        "ap_layer_delete",
+        "Delete a layer (with its masks, as the panel does). ArmorPaint refuses to delete "
+        "the last paint layer; the reply says so." + _TARGET_NOTE,
+        dict(_LAYER_TARGET),
+    ),
+    _tool(
+        "ap_layer_duplicate",
+        "Duplicate a layer; the copy becomes the selection." + _TARGET_NOTE,
+        dict(_LAYER_TARGET),
+    ),
+    _tool(
+        "ap_layer_set",
+        "Change a layer's properties; each change pushes the same undo step the panel "
+        "would. Omitted properties are left alone." + _TARGET_NOTE,
+        {
+            **_LAYER_TARGET,
+            "new_name": _s("Rename the layer."),
+            "opacity": _n("Opacity 0..1.", minimum=0, maximum=1),
+            "blending": _s("Blend mode.", enum=list(BLEND_MODES)),
+            "visible": _b("Show or hide the layer."),
+            "object_mask": _i("Restrict to one paint object (1-based index; 0 = all objects)."),
+            "scale": _n("Fill/decal texture scale."),
+            "angle": _n("Fill/decal texture angle."),
+        },
+    ),
+    _tool(
+        "ap_layer_move",
+        "Move a layer to another stack position (0 = bottom), with ArmorPaint's own rules: "
+        "groups do not nest, masks and filters must sit above a layer, a layer's masks move "
+        "with it." + _TARGET_NOTE,
+        {**_LAYER_TARGET, "to_index": _i("Destination stack index.")},
+        ["to_index"],
+    ),
+    _tool(
+        "ap_layer_action",
+        "Layer context-menu actions: clear (paint layers/masks), merge_down, merge_group, "
+        "to_fill, to_paint, apply_mask, invert_mask." + _TARGET_NOTE,
+        {**_LAYER_TARGET, "action": _s("What to do.", enum=list(LAYER_ACTIONS))},
+        ["action"],
+    ),
+    # ---- history ---------------------------------------------------------------
+    _tool(
+        "ap_undo",
+        "Undo the last step(s) — anything ArmorPaint records: paint, fills, node edits, "
+        "layer and material changes. Uses the native extension (exact, and reports the "
+        "history); on a stock build it presses the app's own undo shortcut (ctrl+z) through "
+        "synthetic input instead, which cannot report what was undone.",
+        {"steps": _i("How many steps.", minimum=1, maximum=64, default=1)},
+    ),
+    _tool(
+        "ap_redo",
+        "Redo undone step(s). Native extension, or the ctrl+shift+z shortcut on a stock "
+        "build (see ap_undo).",
+        {"steps": _i("How many steps.", minimum=1, maximum=64, default=1)},
+    ),
+    _tool(
+        "ap_history",
+        "The undo history: the last 32 step names, which are undone, and how many "
+        "undos/redos are available. Needs the native extension.",
+    ),
+    # ---- export / bake / render ------------------------------------------------
+    _tool(
+        "ap_export_presets",
+        "List ArmorPaint's texture export presets (generic, unreal, unity, ...) and the "
+        "active one. Needs the native extension.",
+    ),
+    _tool(
+        "ap_bake",
+        "Bake a mesh map into a Bake Texture node (add one first: ap_node_add type "
+        "TEX_BAKE), exactly as the node's Bake button does: curvature, normal, normal_object, "
+        "height, derivative, position, texcoord, material_id, object_id, vertex_color, and — "
+        "with hardware ray tracing — occlusion, lightmap, bent_normal, thickness. Parameters "
+        "given here are applied first. Baking runs over the following frames: poll "
+        "ap_bake_status until baking=false. Needs the native extension.",
+        {
+            "node_id": _i("Id of a TEX_BAKE node in the active material."),
+            "type": _s("What to bake.", enum=list(BAKE_TYPES)),
+            "samples": _i("Ray-traced bake samples (occlusion/lightmap/bent_normal/thickness).", minimum=1, maximum=4096),
+            "axis": _i("Bake axis index."),
+            "up_axis": _i("Up axis index (object normal / position / bent normal)."),
+            "ao_strength": _n("Occlusion strength."),
+            "ao_radius": _n("Occlusion radius."),
+            "ao_offset": _n("Occlusion offset."),
+            "curv_strength": _n("Curvature strength."),
+            "curv_radius": _n("Curvature radius."),
+            "curv_offset": _n("Curvature offset."),
+            "curv_smooth": _i("Curvature smoothing passes."),
+            "high_poly": _i("High-poly source object index for normal/height baking."),
+        },
+        ["node_id", "type"],
+    ),
+    _tool(
+        "ap_bake_status",
+        "Whether a bake is still running, its progress, and the current bake parameters. "
+        "Needs the native extension.",
+    ),
+    _tool(
+        "ap_bake_settings",
+        "Read, and optionally change, the bake parameters without starting a bake. Needs "
+        "the native extension.",
+        {
+            **{
+                "samples": _i("Ray-traced bake samples.", minimum=1, maximum=4096),
+                "axis": _i("Bake axis index."),
+                "up_axis": _i("Up axis index."),
+                "ao_strength": _n("Occlusion strength."),
+                "ao_radius": _n("Occlusion radius."),
+                "ao_offset": _n("Occlusion offset."),
+                "curv_strength": _n("Curvature strength."),
+                "curv_radius": _n("Curvature radius."),
+                "curv_offset": _n("Curvature offset."),
+                "curv_smooth": _i("Curvature smoothing passes."),
+                "high_poly": _i("High-poly source object index."),
+            }
+        },
+    ),
+    _tool(
+        "ap_render_settings",
+        "Read, and optionally change, the viewport's tone and post-processing: SSAO, bloom, "
+        "contrast, gamma, vignette, grain, supersampling, a .cube colour LUT, texture "
+        "filtering and the camera clip range — the Preferences > Viewport settings. Saved to "
+        "ArmorPaint's config like the UI does. Needs the native extension.",
+        {
+            "ssao": _n("0..1", minimum=0, maximum=1),
+            "bloom": _n("0..1", minimum=0, maximum=1),
+            "contrast": _n("0..2", minimum=0, maximum=2),
+            "gamma": _n("0..2", minimum=0, maximum=2),
+            "vignette": _n("0..1", minimum=0, maximum=1),
+            "grain": _n("0..1", minimum=0, maximum=1),
+            "supersample": _n("Render scale: 0.25, 0.5, 1, 1.5, 2 or 4."),
+            "lut_path": _s(f"A .cube LUT file, or '' to clear it. {_PATH_NOTE}"),
+            "texture_filter": _b("Linear texture filtering."),
+            "clip_start": _n("Camera near clip."),
+            "clip_end": _n("Camera far clip."),
+            "render_mode": _i("0 = deferred, 1 = forward."),
+        },
+    ),
+    _tool(
+        "ap_texture_resolution",
+        "Read, and optionally change, the texture-set resolution (every layer is resized, "
+        "as the Resolution setting in the Layers panel does). Needs the native extension.",
+        {"size": _i("New resolution.", enum=[2048, 4096, 8192, 16384])},
+    ),
+    _tool(
+        "ap_project_lists",
+        "LIVE lists of everything in the project right now: materials (and which is active), "
+        "imported textures, brushes, fonts and paint objects. Unlike the save/load snapshots "
+        "a stock plugin can read, these include this session's changes. Needs the native "
+        "extension.",
+    ),
+    _tool(
+        "ap_camera",
+        "Move the viewport camera: a preset view (front, back, left, right, top, bottom, "
+        "reset), an orbit, a zoom, or a new field of view. Returns the camera pose. Pair it "
+        "with ap_capture_window / ap_capture_viewport to inspect the model from every side. "
+        "Needs the native extension.",
+        {
+            "view": _s("Preset view.", enum=list(CAMERA_VIEWS)),
+            "orbit_x": _n("Orbit around the vertical axis, radians."),
+            "orbit_y": _n("Orbit up/down, radians."),
+            "zoom": _n("Zoom step (positive = in)."),
+            "fov": _n("Field of view, radians."),
+        },
+    ),
+    _tool(
+        "ap_console_read",
+        "Read back ArmorPaint's console (its last 100 lines): plugin compile/run errors, "
+        "import warnings, and whatever ap_console_write left. Needs the native extension.",
+        {"max_lines": _i("How many of the latest lines.", minimum=1, maximum=100, default=50)},
+    ),
+    # ---- UI automation (answered by this server) -------------------------------
+    _tool(
+        "ap_ui_click",
+        "Click in ArmorPaint's window, as a person would — for the parts of the app no "
+        "binding reaches (menus, dialogs, panel buttons). Coordinates are window pixels as "
+        "in ap_capture_window's image (multiply by its downscale). Delivered to the window "
+        "itself: the real pointer does not move and focus is not stolen. Always look first "
+        "(ap_capture_window), then click, then look again. Linux (X11/XWayland) verified; "
+        "Windows implemented; macOS implemented, untested, and may need Accessibility "
+        "permission.",
+        {
+            "x": _i("Window x."),
+            "y": _i("Window y."),
+            "button": _s("Mouse button.", enum=["left", "right", "middle"], default="left"),
+            "double": _b("Double-click.", default=False),
+            "modifiers": _MODIFIERS,
+        },
+        ["x", "y"],
+    ),
+    _tool(
+        "ap_ui_key",
+        "Press a key or shortcut in ArmorPaint (e.g. key 'z' with modifiers ['ctrl']). Keys: "
+        "a-z, 0-9, f1-f12, enter, escape, tab, space, backspace, delete, arrows, home, end, "
+        "pageup, pagedown. Delivered to the window without focusing it. See ap_ui_click for "
+        "platform notes.",
+        {"key": _s("Key name."), "modifiers": _MODIFIERS},
+        ["key"],
+    ),
+    _tool(
+        "ap_ui_drag",
+        "Drag with a mouse button held along a path in window pixels: sliders, node wires, "
+        "panel splitters, or painting by hand. See ap_ui_click for coordinates and platform "
+        "notes.",
+        {
+            "points": _POINT_LIST,
+            "button": _s("Mouse button.", enum=["left", "right", "middle"], default="left"),
+            "modifiers": _MODIFIERS,
+        },
+        ["points"],
+    ),
+    _tool(
+        "ap_ui_scroll",
+        "Scroll the mouse wheel at a window position (zooms the viewport, scrolls panels). "
+        "Positive clicks scroll down / zoom out.",
+        {"x": _i("Window x."), "y": _i("Window y."), "clicks": _i("Wheel clicks, -50..50.")},
+        ["x", "y", "clicks"],
+    ),
+    # ---- resources & metadata (answered by this server) ------------------------
+    _tool(
+        "ap_resource_search",
+        "Search for resources to use in ArmorPaint — textures, envmaps, meshes, .arm "
+        "materials, fonts, LUTs, export presets — by name, across ArmorPaint's own data "
+        "folder, the open project's folder, the folders in $ARMORPAINT_LIBRARY and any "
+        "'roots' you pass. Returns paths plus the tool that imports each kind. Answered "
+        "locally from this server's filesystem.",
+        {
+            "query": _s("Words that must all appear in the file's path, e.g. 'rust metal'. Empty lists everything."),
+            "kinds": {
+                "type": "array",
+                "items": {"type": "string", "enum": sorted(local_tools.KINDS)},
+                "description": "Limit to these kinds.",
+            },
+            "roots": {"type": "array", "items": {"type": "string"}, "description": "Extra folders to search."},
+            "max_results": _i("Cap on returned matches.", minimum=1, maximum=500, default=50),
+        },
+    ),
+    _tool(
+        "ap_project_metadata",
+        "Read and edit metadata kept WITH a project — notes, a material brief, texture "
+        "budgets, anything worth remembering between sessions — as a JSON sidecar next to "
+        "the .arm (<project>.arm.mcp.json); the .arm itself is never modified. With no "
+        "'set'/'remove' it just reads. The project must have been saved (it needs a path).",
+        {
+            "set": {"type": "object", "description": "Keys to add or overwrite (any JSON values)."},
+            "remove": {"type": "array", "items": {"type": "string"}, "description": "Keys to delete."},
+            "project_path": _s(f"Use this .arm instead of the open project. {_PATH_NOTE}"),
+        },
     ),
 ]
 
@@ -1200,8 +1613,44 @@ def _build_wire_args(name: str, a: dict[str, Any]) -> dict[str, Any]:
     if name in ("ap_fs_list", "ap_fs_stat", "ap_fs_mkdir"):
         return {"path": _norm_path(a, "path")}
 
-    if name in ("ap_export_textures", "ap_export_material_bake"):
+    if name == "ap_export_material_bake":
         return {"directory": _norm_path(a, "directory")}
+
+    if name == "ap_export_textures":
+        out = {"directory": _norm_path(a, "directory")}
+        fmt = _opt_str(a, "format")
+        if fmt is not None:
+            fmt = fmt.strip().lower()
+            if fmt not in ("png", "jpg", "exr"):
+                raise BadArgs("'format' must be png, jpg or exr.", arg="format")
+        bits = _opt_int(a, "bits")
+        if bits is not None and bits not in (8, 16, 32):
+            raise BadArgs("'bits' must be 8, 16 or 32.", arg="bits")
+        if bits in (16, 32) and fmt not in (None, "exr"):
+            raise BadArgs("16- and 32-bit export is EXR only; png and jpg are 8-bit.", arg="bits")
+        if bits in (16, 32) and fmt is None:
+            fmt = "exr"
+        if fmt == "exr" and bits == 8:
+            raise BadArgs("EXR export is 16 or 32 bits.", arg="bits")
+        layers = _opt_str(a, "layers")
+        if layers is not None and layers not in EXPORT_LAYER_MODES:
+            raise BadArgs(f"'layers' must be one of {', '.join(EXPORT_LAYER_MODES)}.", arg="layers")
+        filename = _opt_str(a, "filename")
+        if filename is not None and ("/" in filename or "\\" in filename or not filename.strip()):
+            raise BadArgs("'filename' is a base name, not a path.", arg="filename")
+        out.update(
+            _drop_none(
+                {
+                    "format": fmt,
+                    "bits": bits,
+                    "quality": _opt_float(a, "quality", 0.0, 100.0),
+                    "preset": _opt_str(a, "preset"),
+                    "layers": layers,
+                    "filename": filename,
+                }
+            )
+        )
+        return out
 
     if name == "ap_quit":
         if _opt_bool(a, "confirm") is not True:
@@ -1460,7 +1909,141 @@ def _build_wire_args(name: str, a: dict[str, Any]) -> dict[str, Any]:
             "height": _opt_int(a, "height", MIN_CAPTURE_DIM, MAX_CAPTURE_DIM) or 1024,
         }
 
+    # ---- native-extension tools ---------------------------------------------
+    if name in ("ap_bridge_set_idle",):
+        linger = _opt_float(a, "linger", -1.0, 3600.0)
+        if linger is None:
+            raise BadArgs("'linger' is required (seconds; -1 = never sleep).", arg="linger")
+        return {"linger": linger}
+
+    if name in ("ap_layer_list", "ap_history", "ap_export_presets", "ap_bake_status", "ap_project_lists"):
+        return {}
+
+    if name in ("ap_layer_select", "ap_layer_delete", "ap_layer_duplicate", "ap_layer_set", "ap_layer_move", "ap_layer_action"):
+        out = _drop_none(
+            {
+                "index": _opt_int(a, "index", 0, 4096),
+                "name": _opt_str(a, "name"),
+                "layer_id": _opt_int(a, "layer_id", 0),
+            }
+        )
+        if len(out) > 1:
+            raise BadArgs("Give at most one of index, name, layer_id.")
+        if name == "ap_layer_set":
+            blending = _opt_str(a, "blending")
+            if blending is not None and blending not in BLEND_MODES:
+                raise BadArgs(f"'blending' must be one of {', '.join(BLEND_MODES)}.", arg="blending")
+            changes = _drop_none(
+                {
+                    "new_name": _opt_str(a, "new_name"),
+                    "opacity": _opt_float(a, "opacity", 0.0, 1.0),
+                    "blending": blending,
+                    "visible": _opt_bool(a, "visible"),
+                    "object_mask": _opt_int(a, "object_mask", 0, 1024),
+                    "scale": _opt_float(a, "scale", 0.0, 1000.0),
+                    "angle": _opt_float(a, "angle", -3600.0, 3600.0),
+                }
+            )
+            if not changes:
+                raise BadArgs("Give at least one property to change.")
+            out.update(changes)
+        elif name == "ap_layer_move":
+            out["to_index"] = _req_int(a, "to_index", 0, 4096)
+        elif name == "ap_layer_action":
+            action = _req_str(a, "action")
+            if action not in LAYER_ACTIONS:
+                raise BadArgs(f"'action' must be one of {', '.join(LAYER_ACTIONS)}.", arg="action")
+            out["action"] = action
+        return out
+
+    if name == "ap_layer_new":
+        kind = (_opt_str(a, "kind") or "paint").strip()
+        if kind not in LAYER_KINDS:
+            raise BadArgs(f"'kind' must be one of {', '.join(LAYER_KINDS)}.", arg="kind")
+        return _drop_none({"kind": kind, "new_name": _opt_str(a, "name")})
+
+    if name in ("ap_undo", "ap_redo"):
+        return {"steps": _opt_int(a, "steps", 1, 64) or 1}
+
+    bake_params = {
+        "samples": (int, 1, 4096), "axis": (int, 0, 16), "up_axis": (int, 0, 16),
+        "ao_strength": (float, 0.0, 100.0), "ao_radius": (float, 0.0, 100.0),
+        "ao_offset": (float, 0.0, 100.0), "curv_strength": (float, 0.0, 100.0),
+        "curv_radius": (float, 0.0, 100.0), "curv_offset": (float, -100.0, 100.0),
+        "curv_smooth": (int, 0, 64), "high_poly": (int, 0, 1024),
+    }
+    if name in ("ap_bake", "ap_bake_settings"):
+        out = {}
+        for key, (typ, lo, hi) in bake_params.items():
+            value = _opt_int(a, key, lo, hi) if typ is int else _opt_float(a, key, lo, hi)
+            if value is not None:
+                out[key] = value
+        if name == "ap_bake":
+            bake_type = _req_str(a, "type")
+            if bake_type not in BAKE_TYPES:
+                raise BadArgs(f"'type' must be one of {', '.join(BAKE_TYPES)}.", arg="type")
+            out.update({"node_id": _req_int(a, "node_id", 0), "type": bake_type})
+        return out
+
+    if name == "ap_render_settings":
+        out = _drop_none(
+            {
+                "ssao": _opt_float(a, "ssao", 0.0, 1.0),
+                "bloom": _opt_float(a, "bloom", 0.0, 1.0),
+                "contrast": _opt_float(a, "contrast", 0.0, 2.0),
+                "gamma": _opt_float(a, "gamma", 0.0, 2.0),
+                "vignette": _opt_float(a, "vignette", 0.0, 1.0),
+                "grain": _opt_float(a, "grain", 0.0, 1.0),
+                "supersample": _opt_float(a, "supersample", 0.25, 4.0),
+                "texture_filter": _opt_bool(a, "texture_filter"),
+                "clip_start": _opt_float(a, "clip_start", 0.0001, 10.0),
+                "clip_end": _opt_float(a, "clip_end", 1.0, 100000.0),
+                "render_mode": _opt_int(a, "render_mode", 0, 1),
+            }
+        )
+        if a.get("lut_path") is not None:
+            lut = a.get("lut_path")
+            if lut == "":
+                out["lut_path"] = ""
+            else:
+                lut_path = _norm_path(a, "lut_path")
+                assert lut_path is not None
+                if not lut_path.lower().endswith(".cube"):
+                    raise BadArgs("'lut_path' must be a .cube file.", arg="lut_path")
+                out["lut_path"] = lut_path
+        return out
+
+    if name == "ap_texture_resolution":
+        size = _opt_int(a, "size")
+        if size is not None and size not in (2048, 4096, 8192, 16384):
+            raise BadArgs("'size' must be 2048, 4096, 8192 or 16384.", arg="size")
+        return _drop_none({"size": size})
+
+    if name == "ap_camera":
+        view = _opt_str(a, "view")
+        if view is not None and view not in CAMERA_VIEWS:
+            raise BadArgs(f"'view' must be one of {', '.join(CAMERA_VIEWS)}.", arg="view")
+        return _drop_none(
+            {
+                "view": view,
+                "orbit_x": _opt_float(a, "orbit_x", -100.0, 100.0),
+                "orbit_y": _opt_float(a, "orbit_y", -100.0, 100.0),
+                "zoom": _opt_float(a, "zoom", -100.0, 100.0),
+                "fov": _opt_float(a, "fov", 0.05, 3.0),
+            }
+        )
+
+    if name == "ap_console_read":
+        return {"max_lines": _opt_int(a, "max_lines", 1, 100) or 50}
+
     raise BadArgs(f"Tool '{name}' has no argument mapping.")
+
+
+def _wire_op(name: str, wire: dict[str, Any]) -> str:
+    """The bridge op a tool call becomes (usually the tool name minus 'ap_')."""
+    if name == "ap_export_textures" and set(wire) - {"directory"}:
+        return "export_textures_ex"  # the options need the native extension
+    return name[len(TOOL_PREFIX) :] if name.startswith(TOOL_PREFIX) else name
 
 
 # ---------------------------------------------------------------------------
@@ -1573,19 +2156,205 @@ async def _capture_window_tool(
     return [image, text]
 
 
+def _frame_fence() -> desktop_input.Fence:
+    """A bridge ping as a frame fence for synthetic input, when the bridge is reachable."""
+    hb = read_heartbeat()
+    if not isinstance(hb, dict) or hb.get("enabled") is False:
+        return None
+    return lambda: send_to_armorpaint("ping", {}, 10.0)
+
+
+def _ui_tool(name: str, a: dict[str, Any]) -> dict[str, Any]:
+    """Synthetic input to ArmorPaint's window (desktop_input)."""
+    hb = read_heartbeat()
+    title = hb.get("app_title") if isinstance(hb, dict) else None
+    title = title or None
+    fence = _frame_fence()
+    try:
+        if name == "ap_ui_click":
+            res = desktop_input.click(
+                _req_int(a, "x"), _req_int(a, "y"), (_opt_str(a, "button") or "left"),
+                bool(_opt_bool(a, "double")), _opt_list_str(a, "modifiers"), title, fence,
+            )
+        elif name == "ap_ui_key":
+            res = desktop_input.key(_req_str(a, "key"), _opt_list_str(a, "modifiers"), title, fence)
+        elif name == "ap_ui_drag":
+            raw = a.get("points")
+            if not isinstance(raw, list) or len(raw) < 2 or len(raw) > 64:
+                raise BadArgs("'points' must be 2..64 [x, y] pairs.", arg="points")
+            pts: list[tuple[int, int]] = []
+            for p in raw:
+                if not isinstance(p, (list, tuple)) or len(p) != 2:
+                    raise BadArgs("each point must be [x, y].", arg="points")
+                pts.append((int(_num(p[0], "points")), int(_num(p[1], "points"))))
+            res = desktop_input.drag(pts, (_opt_str(a, "button") or "left"), _opt_list_str(a, "modifiers"), title_hint=title)
+        else:
+            res = desktop_input.scroll(_req_int(a, "x"), _req_int(a, "y"), _req_int(a, "clicks", -50, 50), title)
+    except desktop_input.InputError as exc:
+        return {"ok": False, "code": exc.code, "error": exc.message, "tool": name}
+    res = dict(res)
+    res["ok"] = True
+    res["next_step"] = "Call ap_capture_window to see the result."
+    return res
+
+
+def _opt_list_str(a: dict[str, Any], key: str) -> list[str] | None:
+    value = a.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise BadArgs(f"'{key}' must be an array of strings.", arg=key)
+    return value
+
+
+def _open_project_path() -> str | None:
+    hb = read_heartbeat()
+    path = hb.get("project") if isinstance(hb, dict) else None
+    return path if isinstance(path, str) and path else None
+
+
+def _resource_search_tool(a: dict[str, Any]) -> dict[str, Any]:
+    kinds = _opt_list_str(a, "kinds")
+    roots = _opt_list_str(a, "roots")
+    try:
+        out = local_tools.search_resources(
+            _opt_str(a, "query") or "",
+            kinds,
+            roots,
+            _open_project_path(),
+            _opt_int(a, "max_results", 1, 500) or 50,
+        )
+    except ValueError as exc:
+        raise BadArgs(str(exc)) from exc
+    out["ok"] = True
+    return out
+
+
+def _project_metadata_tool(a: dict[str, Any]) -> dict[str, Any]:
+    path = _norm_path(a, "project_path", required=False) or _open_project_path()
+    set_values = a.get("set")
+    if set_values is not None and not isinstance(set_values, dict):
+        raise BadArgs("'set' must be an object.", arg="set")
+    try:
+        out = local_tools.project_metadata(path or "", set_values, _opt_list_str(a, "remove"))
+    except ValueError as exc:
+        raise BadArgs(str(exc)) from exc
+    out["ok"] = True
+    return out
+
+
+def _material_list_tool() -> dict[str, Any]:
+    """Live list from the native extension; the save/load snapshot otherwise."""
+    try:
+        lists = send_to_armorpaint("project_lists", {}, OP_TIMEOUTS["project_lists"])
+        mats = lists.get("materials") or []
+        return {
+            "ok": True,
+            "op": "project_lists",
+            "result": {
+                "live": True,
+                "count": len(mats),
+                "materials": mats,
+                "names": "|".join(str(m.get("name")) for m in mats),
+                "delimiter": "|",
+            },
+        }
+    except OpFailed as exc:
+        if exc.code != "unsupported":
+            raise
+    result = send_to_armorpaint("material_list", {}, OP_TIMEOUTS["material_list"])
+    return {"ok": True, "op": "material_list", "result": result, "hint": EXT_HINT}
+
+
+def _undo_tool(op: str, wire: dict[str, Any]) -> dict[str, Any]:
+    """Exact undo/redo through the native extension, else the app's own shortcut."""
+    try:
+        result = send_to_armorpaint(op, wire, OP_TIMEOUTS[op])
+        return {"ok": True, "op": op, "method": "native extension (history_undo/redo)", "result": result}
+    except OpFailed as exc:
+        if exc.code != "unsupported":
+            raise
+    # Stock build: press ArmorPaint's own shortcut (keymap edit_undo / edit_redo).
+    mods = ["ctrl"] if op == "undo" else ["ctrl", "shift"]
+    steps = int(wire.get("steps", 1))
+    hb = read_heartbeat()
+    title = (hb.get("app_title") if isinstance(hb, dict) else None) or None
+    fence = _frame_fence()
+    try:
+        for _ in range(steps):
+            desktop_input.key("z", mods, title, fence)
+    except desktop_input.InputError as exc:
+        return {
+            "ok": False,
+            "code": "unsupported",
+            "error": f"{op} needs the native extension, or synthetic keyboard input to "
+            f"ArmorPaint's window, and the latter failed: {exc.message}",
+            "hint": EXT_HINT,
+        }
+    return {
+        "ok": True,
+        "op": op,
+        "method": f"keyboard shortcut {'+'.join(mods)}+z sent {steps}x (stock build)",
+        "note": "Sent as ArmorPaint's default keymap shortcut; if the keymap was changed, or a "
+        "text field has focus, it may not act. The history cannot be read back without the "
+        "native extension -- verify with ap_capture_window.",
+    }
+
+
+# Tools that cannot be batch steps: answered locally, or would end the session.
+_UNBATCHABLE = LOCAL_TOOLS | {"ap_batch", "ap_quit", "ap_project_metadata", "ap_material_list", "ap_undo", "ap_redo"}
+
+
+def _batch_tool(a: dict[str, Any]) -> dict[str, Any]:
+    steps = a.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise BadArgs("'steps' must be a non-empty array of {tool, args}.", arg="steps")
+    items: list[tuple[str, dict[str, Any]]] = []
+    names: list[str] = []
+    timeout = 0.0
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict) or not isinstance(step.get("tool"), str):
+            raise BadArgs(f"steps[{i}] must be an object with a 'tool' name.", arg="steps")
+        tool = step["tool"].strip()
+        if not tool.startswith(TOOL_PREFIX):
+            tool = TOOL_PREFIX + tool
+        if tool not in TOOL_NAMES:
+            raise BadArgs(f"steps[{i}]: unknown tool {tool!r}.", arg="steps")
+        if tool in _UNBATCHABLE:
+            raise BadArgs(f"steps[{i}]: {tool} cannot run inside a batch.", arg="steps")
+        step_args = step.get("args") or {}
+        if not isinstance(step_args, dict):
+            raise BadArgs(f"steps[{i}].args must be an object.", arg="steps")
+        try:
+            wire = _build_wire_args(tool, step_args)
+        except BadArgs as exc:
+            raise BadArgs(f"steps[{i}] ({tool}): {exc.message}", arg="steps") from exc
+        op = _wire_op(tool, wire)
+        items.append((op, wire))
+        names.append(tool)
+        timeout += OP_TIMEOUTS.get(op, DEFAULT_TIMEOUT_S)
+    result = send_batch(items, min(timeout, 900.0), bool(_opt_bool(a, "stop_on_error")))
+    for r in result.get("results") or []:
+        i = r.get("i")
+        if isinstance(i, int) and 0 <= i < len(names):
+            r["tool"] = names[i]
+    return {"ok": True, "op": "batch", "result": result}
+
+
 SERVER_INSTRUCTIONS = (
     "Drives a running ArmorPaint 1.0 (a 3D PBR texture painter) over a file mailbox. "
     "If any tool returns a transport error, call ap_bridge_status first — it diagnoses the "
     "connection without needing ArmorPaint to answer. "
-    "Two things about this app are worth knowing before planning work: (1) LAYERS are "
-    "essentially absent from ArmorPaint's plugin API — ap_fill_layer is the only layer "
-    "operation that exists, and layers cannot be listed, created, renamed, masked or "
-    "blended from here, so ask the user to do layer setup in the UI; (2) the MATERIAL NODE "
-    "GRAPH is fully scriptable (ap_node_list / ap_node_add / ap_node_connect / "
-    "ap_node_set_value + ap_material_update), which is where an agent has real leverage. "
-    "Bulk data moves by path: ap_export_textures writes real PNGs, then ap_read_image_file "
-    "shows you one. To SEE the rendered viewport, use ap_capture_window (Linux) after "
-    "ap_fill_layer or a paint stroke."
+    "The MATERIAL NODE GRAPH is fully scriptable (ap_node_list / ap_node_add / "
+    "ap_node_connect / ap_node_set_value + ap_material_update); a graph edit only shows "
+    "once you ap_fill_layer or paint. Layers (ap_layer_*), undo history, export format, "
+    "bakes, render settings and camera views need the optional native extension — call "
+    "ap_get_app_info: ext_state 1 means it is there; on a stock build those tools answer "
+    "'unsupported', ap_undo/ap_redo fall back to keyboard shortcuts, and ap_ui_click / "
+    "ap_ui_key / ap_ui_drag can drive the UI directly. To SEE results use ap_capture_window "
+    "(any build) or ap_capture_viewport; ap_export_textures + ap_read_image_file show the "
+    "texture files. Group many small edits into one ap_batch call: it runs several steps "
+    "per ArmorPaint frame."
 )
 
 server = Server(SERVER_NAME, version=__version__, instructions=SERVER_INSTRUCTIONS)
@@ -1648,12 +2417,31 @@ async def call_tool(
                 }
             )
 
+        loop = asyncio.get_running_loop()
+
+        if name in UI_TOOLS:
+            return _text(await loop.run_in_executor(None, partial(_ui_tool, name, args)))
+
+        if name == "ap_resource_search":
+            return _text(await loop.run_in_executor(None, partial(_resource_search_tool, args)))
+
+        if name == "ap_project_metadata":
+            return _text(await loop.run_in_executor(None, partial(_project_metadata_tool, args)))
+
+        if name == "ap_batch":
+            return _text(await loop.run_in_executor(None, partial(_batch_tool, args)))
+
         # --- bridge round trip --------------------------------------------
-        op = name[len(TOOL_PREFIX) :] if name.startswith(TOOL_PREFIX) else name
         wire = _build_wire_args(name, args)
+        op = _wire_op(name, wire)
         timeout = OP_TIMEOUTS.get(op, DEFAULT_TIMEOUT_S)
 
-        loop = asyncio.get_running_loop()
+        if name == "ap_material_list":
+            return _text(await loop.run_in_executor(None, _material_list_tool))
+
+        if name in ("ap_undo", "ap_redo"):
+            return _text(await loop.run_in_executor(None, partial(_undo_tool, op, wire)))
+
         try:
             result = await loop.run_in_executor(
                 None, partial(send_to_armorpaint, op, wire, timeout)
@@ -1697,10 +2485,18 @@ async def call_tool(
         payload["tool"] = name
         if isinstance(exc, OpFailed):
             payload["from"] = "armorpaint bridge"
+            if payload.get("code") == "unsupported" and (
+                name in EXT_TOOLS
+                or (
+                    name == "ap_export_textures"
+                    and any(k in args for k in ("format", "bits", "quality", "preset", "layers", "filename"))
+                )
+            ):
+                payload["hint"] = EXT_HINT
             if name == "ap_capture_viewport" and payload.get("code") == "unsupported":
                 payload["try_instead"] = (
                     "ap_capture_window: screenshots ArmorPaint's window from outside the app "
-                    "on a stock build (Linux)."
+                    "on any build."
                 )
         elif not isinstance(exc, BadArgs):
             payload.setdefault(

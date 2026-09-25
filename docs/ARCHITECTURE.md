@@ -48,6 +48,13 @@ File I/O, by contrast, is unrestricted: read, write, delete, `mkdir`, directory 
 paths. So the transport is files. This is not a fallback that happens to work; it is the only
 bidirectional channel that exists.
 
+One catch surfaced only on a real Linux desktop: on POSIX, every directory listing inside
+ArmorPaint leaks a file descriptor (`close_dir` in Iron's `kong/dir.c` is empty). A bridge that
+polls by listing its request directory exhausts a desktop launch's 1024 descriptors in about half
+a minute and hangs the app. So the server also writes each request's id into a fixed-name
+`doorbell` file, and the bridge polls that with `iron_file_exists`, which opens and closes cleanly
+([PROTOCOL.md](PROTOCOL.md#the-doorbell)).
+
 The cost is honest and small: latency is a poll interval rather than a wakeup, and the spool
 directory is visible state on disk. The benefit beyond mere availability is that the whole
 conversation is inspectable — when something misbehaves, the failing request is a file you can open.
@@ -178,30 +185,43 @@ settled by tracing the counter rather than by testing, and the trace is in
 [MINIC_DIALECT_AND_API.md](MINIC_DIALECT_AND_API.md) §0.3. The tolerance is exact: at most **3
 consecutive missed frames**, so the reset must precede any early return in `on_update`.
 
-**The cost is real and unavoidable.** While the bridge is enabled, ArmorPaint never sleeps: full-rate
-rendering, GPU load, and battery, whether or not an agent is doing anything. That is why the bridge
-ships with an enable/disable flag exposed three ways — a toggle in the Plugins tab, the
-`ap_bridge_set_enabled` tool, and a persisted file the plugin reads at start. The toggle alone would
-not be enough, because `on_ui` runs *only while the Plugins tab is being drawn*
-(`paint/sources/ui/tab_plugins.c:27`), so a user on any other tab could not reach it.
+**The cost was real** — an app held awake renders at full rate, GPU load and battery included,
+whether or not an agent is doing anything — **but it is not unavoidable.** The same `iron.h` shows
+the way out: every input callback (`_mouse_move`, `_key_down`, ...) also zeroes `paused_frames`.
+So the bridge now holds the app awake only for `linger` seconds after a request and then lets it
+sleep, announcing `"dozing": true` in its heartbeat; the **server** wakes it before the next request
+by sending the window a synthetic 1-pixel pointer move (X11 `XSendEvent`, Win32 `PostMessageW`,
+macOS `CGEventPostToPid`). Measured on Linux: asleep at frame 120, wiggle, frames resume; a ping to
+a dozing bridge answered in ~40 ms. Details in [PROTOCOL.md](PROTOCOL.md) *Dozing and waking*.
 
-### 5. No threads → one request per frame
+The enable/disable flag is still exposed — the Plugins tab toggle and `ap_bridge_set_enabled` — but
+a disabled bridge is now just one that never holds the app awake and refuses ops, so the server can
+wake it and re-enable it. (The toggle alone would never have been enough: `on_ui` runs *only while
+the Plugins tab is being drawn*, `paint/sources/ui/tab_plugins.c:27`.)
+
+### 5. No threads → requests are budgeted per frame
 
 minic exposes no threading primitive. Every handler therefore runs **inline on the render thread**,
 inside `on_update`. Two consequences are designed around rather than worked around:
 
-- **A slow handler is a visible hitch** in the user's painting. Long operations (bake, large export)
-  return a pending token immediately and are polled through a status file, rather than blocking a
-  frame for seconds.
-- **At most one request is handled per frame.** This is a latency decision *and* a memory-safety
-  one. minic allocates from an 8 MB arena with **no bounds check** (`minic.c:287`), rewound only at
-  the outermost host→script boundary — i.e. once per `on_update`. Each script function call costs
-  ~29 KB of it, giving roughly **280 calls per frame before the arena overflows into heap
-  corruption**. Draining a backlog of requests in one frame would be a genuine crash risk, not just
-  a stutter.
+- **A slow handler is a visible hitch** in the user's painting, because the work is GPU work that
+  belongs to the render thread; no plugin can move it elsewhere. What the bridge can choose is
+  *when*: heavy ops (exports, saves, opens, imports, bakes) wait until no mouse button is held in
+  the app, so they land between strokes, never inside one. (An earlier version of this document
+  described a pending-token scheme; it was never implemented, and would not have removed the stall.)
+- **Work per frame is budgeted.** minic allocates from an 8 MB arena with **no bounds check**
+  (`minic.c:287`), rewound only at the outermost host→script boundary — i.e. once per `on_update`.
+  Each script function call costs ~29 KB of it, giving roughly **280 calls per frame before the
+  arena overflows into heap corruption**. So the bridge opens one request per frame, and a *batch*
+  request runs its items several per frame only while a per-frame call counter stays under budget
+  (measured: a plain request peaks at ~0.7 MB, a batch frame at ~1.5 MB); strokes and GPU-heavy
+  items get a frame of their own. (Two ways to get a fresh arena per item were examined and
+  rejected: `script_timer` callbacks each rewind the arena, but Iron's tween loop fires only every
+  other due timer per frame; and there is no second host→script entry per frame.)
 
-Throughput is thus bounded by frame rate: an *n*-step plan takes *n* frames. At 60 fps that is fast
-enough to feel instant for interactive work, and it is the honest ceiling.
+Throughput is thus no longer one op per frame: an *n*-step plan sent as `ap_batch` takes about
+*n*/3 frames for light steps, and between the requests of a conversation the bridge polls every
+frame instead of every 50 ms.
 
 ### And one more: the JSON parser cannot handle nested objects or arrays
 

@@ -21,9 +21,30 @@ and export textures — against a **stock, unmodified ArmorPaint**, including th
 > probes), 0 crashes or timeouts**. Getting there needed Linux-specific plugin fixes; see
 > [Linux notes](#linux-notes).
 >
-> What that does **not** cover: **macOS is untested.** Long painting sessions, huge meshes and 4K exports are untested, and
-> the optional viewport patch has only been built against the pinned commit named in
-> `docs/UPSTREAM_CHANGES.md`. Expect rough edges outside the tested path, and please report them.
+> **The known-limitation fixes** were first verified on Linux against ArmorPaint 1.0 built from the
+> pinned commit, under Xvfb with a software Vulkan driver, through the same `call_tool` entry point
+> an MCP client uses (`tests/test_live.py`), on both the **stock** build and a build carrying the
+> **native extension**. That covers an end-to-end sweep of the original tools, doze → automatic
+> wake, batching, a heavy op held while a mouse button is down, window capture, synthetic UI input,
+> keyboard undo/redo, and every extension tool.
+>
+> **On a real desktop** (ArmorPaint 1.0 Arch package, stock, KDE Plasma 6 on Wayland with ArmorPaint
+> under XWayland, RADV on a Vega iGPU, launched from the desktop menu) that testing found two bugs
+> Xvfb had hidden, both now fixed in **bridge 2.0**: polling leaked a file descriptor per poll and
+> hung ArmorPaint after ~30 s (see [Linux notes](#linux-notes)), and keyboard undo worked only 6
+> times in 10. After the fixes: 13 of the 14 live tests pass (the 14th needs the extension and is
+> skipped), keyboard undo and redo 20/20 each, 150 s of continuous requests with a flat descriptor
+> count, wakes from 15–90 s dozes in 19–37 ms, and a real MCP stdio session lists all 88 tools. 22
+> offline tests cover the rest (`tests/test_offline.py`). The extension build has not been re-run
+> since the fixes.
+>
+> What that does **not** cover: **macOS is untested** end to end, and so are the new **Windows**
+> code paths (window capture via `PrintWindow`, wake and UI input via `PostMessage`), which were
+> written against `windows_system.c` and the Win32 documentation but have not run on Windows
+> hardware yet. Long painting sessions, huge meshes and 4K exports are untested. The native
+> extension builds against the pinned 1.0 commit named in `docs/UPSTREAM_CHANGES.md`; upstream
+> `main` has since changed its UI-handle API, which neither the extension nor the plugin supports
+> yet. Expect rough edges outside the tested path, and please report them.
 
 ---
 
@@ -38,16 +59,19 @@ One diagram, and it explains most of the design:
    │  Claude, …)   │                                 └──────────┬───────────┘
    └───────────────┘                                            │
                                      write  req/<id>.json  (via os.replace — atomic)
+                                     ring   doorbell       (the id, also via os.replace)
                                      poll   res/<id>.done  (5 ms → 25 ms → 100 ms)
                                                                 │
                                                      ┌──────────▼────────────┐
                                                      │     file mailbox      │
                                                      │  <spool>/req/  res/   │
+                                                     │  doorbell             │
                                                      │  heartbeat.json       │
                                                      │  bridge.lock          │
                                                      └──────────┬────────────┘
                                                                 │
-                                     read request, delete it, run it, write
+                                     read the doorbell, open that request,
+                                     delete it, run it, write
                                      res/<id>.json then res/<id>.done
                                      — at most ONE per frame, inside on_update
                                                                 │
@@ -59,8 +83,13 @@ One diagram, and it explains most of the design:
  │          ▼                                                                           │
  │   529 minic bindings ─► project · assets · objects · materials · nodes ·             │
  │                         brush & paint · viewport · export · filesystem               │
+ │   + mcp_ext_call       ─► layers · undo · export format · bake · render settings ·   │
+ │     (optional patch)      live lists · camera · console        (detected at run time)│
  └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+The server also talks to ArmorPaint's **window** directly — screenshots, a synthetic pointer
+wiggle that wakes a sleeping app, and clicks/keys for UI automation — so those work on any build.
 
 Two things about this shape are worth knowing up front, because they are consequences of what
 ArmorPaint's plugin API actually offers, not preferences:
@@ -79,10 +108,10 @@ The byte-level contract is [docs/PROTOCOL.md](docs/PROTOCOL.md).
 | | |
 |---|---|
 | ArmorPaint | **1.0** (the current C/minic generation). The plugin system in the pre-2025 Haxe/Kha builds is a different thing entirely and is not supported. |
-| OS | Windows 10/11 and Linux verified. macOS paths are written but untested. |
+| OS | Linux verified, including the new window-level features. Windows 10/11 verified for the original tool set; its new capture, wake and input paths are untested. macOS paths are written but untested. |
 | Python | 3.11+ |
 | MCP client | Anything that can launch a stdio MCP server (Claude Code, Claude Desktop, …) |
-| Compiler | **None.** Not for the core toolkit. Only the optional viewport patch needs a self-built ArmorPaint. |
+| Compiler | **None** for the core toolkit. Only the optional native extension (layers, undo history, export format, bakes, render settings, camera) needs a self-built ArmorPaint. |
 
 ## Install
 
@@ -121,6 +150,20 @@ Short version; the careful one is [docs/INSTALL.md](docs/INSTALL.md).
 5. **Check the handshake.** Ask the agent to call `ap_ping`. A healthy answer names the app version
    and the open project. If it reports the bridge as absent, see
    [Troubleshooting](#troubleshooting).
+6. **Optional: the native extension.** For layer management, exact undo/redo, export format / bit
+   depth / preset, bakes, render settings, live project lists, camera views and console read-back,
+   build ArmorPaint from source with one added binding:
+
+   ```sh
+   git clone https://github.com/armory3d/armorpaint && cd armorpaint
+   git checkout 906418acc600132fa927876d208eb452dc5a0967        # ArmorPaint 1.0
+   python /path/to/armorpaint-mcp/patch/apply_ext_patch.py .
+   cd paint && ../base/make --compile                           # Linux; see UPSTREAM_CHANGES.md for Windows/macOS
+   ```
+
+   Use that binary with the same plugin file — the bridge detects the extension by itself
+   (`ap_get_app_info` → `ext_state: 1`). Details and the exact diff:
+   [docs/UPSTREAM_CHANGES.md](docs/UPSTREAM_CHANGES.md).
 
 ## Quickstart
 
@@ -140,25 +183,32 @@ Do not drop the `ap_fill_layer`. Without it every call still returns success and
 viewport and the export are all unchanged — the graph is the paint source, not the render. See
 [The loop that actually works](#the-loop-that-actually-works).
 
-Because the bridge answers at most one request per frame, a chain like this completes in well under
-a second — but a bake or a large export takes as long as ArmorPaint takes.
+A chain like this completes in well under a second: the bridge polls every frame while a
+conversation is active. Wrap many small edits in one `ap_batch` call and several of them run per
+frame. A bake or a large export still takes as long as ArmorPaint takes.
 
 ## Tool index
 
-60 tools. Each is backed by a named minic binding or a registered struct field (except
-`ap_capture_window`, which the server answers itself from the display server); the implementation
-of each is tabulated in [docs/MINIC_DIALECT_AND_API.md](docs/MINIC_DIALECT_AND_API.md) §2.13, and
-what was deliberately **left out, with the reason**, is §2.14 — read that before assuming a missing
-capability is an oversight.
+88 tools, in three groups by what answers them:
 
-**Bridge & session** (6)
+- **Stock bridge** — a named minic binding or a registered struct field, on any ArmorPaint 1.0.
+  Tabulated in [docs/MINIC_DIALECT_AND_API.md](docs/MINIC_DIALECT_AND_API.md) §2.13.
+- **Native extension** (marked ◆) — the one `mcp_ext_call` binding added by
+  `patch/apply_ext_patch.py`. On a stock build these answer `unsupported` with a hint.
+  §2.14 of the same document lists what the stock API lacks and which remedy covers each gap.
+- **This server** (marked ▣) — the window (screenshots, synthetic input) and the filesystem; no
+  bridge round trip, any build.
+
+**Bridge & session** (8)
 
 | Tool | Does |
 |---|---|
 | `ap_bridge_status` | **Call this first when anything fails.** Diagnoses the connection with no round trip: resolved spool path, heartbeat presence and whether its clock is advancing, plus a plain-language diagnosis and next step |
 | `ap_ping` | Liveness: app version, uptime, open project, busy flag |
 | `ap_get_app_info` | Window geometry, data path, project format version |
-| `ap_bridge_set_enabled` | Turn the bridge off (and let the app idle again) or back on |
+| `ap_bridge_set_enabled` | Turn the bridge off (it then refuses everything but this and `ap_ping`) or back on — both work from the agent |
+| `ap_bridge_set_idle` | How long the bridge keeps ArmorPaint awake after a request before letting it sleep (default 10 s; `-1` = never). Persisted |
+| `ap_batch` | Run up to 64 bridge tools as **one** request, in order, several light steps per frame; per-step results, optional `stop_on_error` |
 | `ap_console_write` | Write to ArmorPaint's console at info/error/log level |
 | `ap_show_message` | Transient status message, or a modal box |
 
@@ -182,7 +232,8 @@ capability is an oversight.
 | `ap_import_asset` | Import a texture, mesh or `.arm` by path |
 | `ap_import_envmap` | Import an environment map |
 | `ap_set_envmap_params` | Envmap strength and angle |
-| `ap_export_textures` | Export the texture set to a directory, and report the filenames. 8-bit PNG; the format is not settable, and the base name comes from ArmorPaint's own state (the last export dialog, else `untitled`) — so read the returned filenames rather than predicting them |
+| `ap_export_textures` | Export the texture set to a directory, and report the filenames. Plain: ArmorPaint's current settings (8-bit PNG, `generic`, base name from the last export dialog). ◆ With `format` (png/jpg/exr), `bits` (8/16/32), `quality`, `preset`, `layers` (visible/selected/per_object/per_udim_tile) and `filename` |
+| `ap_export_presets` ◆ | The export presets (generic, unreal, unity, …) and the active one |
 | `ap_export_material_bake` | Bake the material to a plane and export it |
 | `ap_export_mesh` | Export the mesh as `.obj` |
 | `ap_export_material` | Export the material as `.arm` |
@@ -216,7 +267,8 @@ find its inputs and confirm its outputs, without a second tool server.
 | `ap_material_delete` | Delete a material, by name |
 | `ap_material_assign` | Assign a material to an object |
 | `ap_material_set_channels` | Toggle the per-material paint channels |
-| `ap_material_list` ⚠ | **Degraded.** Reads a save/load snapshot: empty before the first save, and blind to materials created this session. Use `ap_material_get_active` for ground truth. |
+| `ap_material_list` | ◆ **Live** list with the extension; on a stock build a save/load snapshot, labelled `live: false` |
+| `ap_project_lists` ◆ | Live materials, textures, brushes, fonts and paint objects |
 
 **Material nodes** (7) — `ap_node_list` (nodes *and* link topology), `ap_node_get` (every
 socket and button with its index, name, type and default, e.g. `4:Scale:VALUE=5`), `ap_node_add`
@@ -237,16 +289,44 @@ the app. The list is in `docs/MINIC_DIALECT_AND_API.md` §2.6.
 | `ap_paint_stroke_world` | A stroke in world space |
 | `ap_fill_layer` | Fill the active layer. The first fill after `ap_material_update` is repeated on the next frame, because on its own it left the viewport showing the previous material in about half of measured edits |
 | `ap_set_display_channel` | Switch the viewport display channel (one of 16) |
-| `ap_capture_to_project` | Capture the viewport **into the project as a texture asset** — see Limitations; this does *not* produce a file you can read |
-| `ap_capture_window` | **Screenshot ArmorPaint's window and return it as an image** — the shaded viewport plus the UI. Stock binary, Linux (X11/XWayland): the server reads the window's pixels from the X server, so it works while the window is covered and never steals focus. Optional `crop` and `downscale`. ~130 ms for 1720×960 |
+| `ap_capture_to_project` | Capture the viewport **into the project as a texture asset** (not a file you can read) |
+| `ap_capture_window` ▣ | **Screenshot ArmorPaint's window and return it as an image** — the shaded viewport plus the UI. Reads the window's own pixels from outside the app, so it works while the window is covered and never steals focus: Linux X11/XWayland `XGetImage` (verified, ~130 ms for 1720×960), Windows `PrintWindow(PW_RENDERFULLCONTENT)`, macOS `screencapture -l` (needs Screen Recording permission). Optional `crop` and `downscale` |
+| `ap_capture_viewport` | The 3D viewport alone to a real PNG, returned as an image. Works when the build exports `viewport_save_texture_to_file` (upstream since 2026-09-09, commit `1e14e27e`, or `patch/apply_viewport_patch.py`) **or** carries the native extension; the bridge detects either on first use — no flag to set. Otherwise `unsupported` |
+| `ap_camera` ◆ | Preset views (front/back/left/right/top/bottom/reset), orbit, zoom, FOV |
 
-**Optional, patched or newer builds only** (1) — `ap_capture_viewport` writes the 3D viewport to a
-real PNG *and returns it as an image*. It needs the `viewport_save_texture_to_file` binding: the
-opt-in native patch in `patch/`, or an upstream build from after 2026-09-09 (commit `1e14e27e`),
-plus `HAVE_VIEWPORT_PATCH = 1` in the plugin; see
-[docs/UPSTREAM_CHANGES.md](docs/UPSTREAM_CHANGES.md). On a stock binary the tool reports
-`unsupported` and says why. Measured on a patched 1.0 build: 11–15 ms in-app, ~140 ms round trip
-for an 800×600 PNG.
+**Layers** ◆ (8) — the Layers panel, with the same undo steps it pushes.
+
+| Tool | Does |
+|---|---|
+| `ap_layer_list` | Every layer: index (0 = bottom), id, name, kind (layer/mask/group/filter), selected, visible, opacity, blending, parent, fill material, object mask, scale, angle |
+| `ap_layer_select` | Choose the layer `ap_fill_layer` and the paint ops act on |
+| `ap_layer_new` | paint, fill, decal, group, black/white/fill mask |
+| `ap_layer_delete` / `ap_layer_duplicate` | As the context menu |
+| `ap_layer_set` | Rename, opacity, blending (18 modes), visibility, object mask, scale, angle |
+| `ap_layer_move` | Reorder, with ArmorPaint's own nesting rules |
+| `ap_layer_action` | clear, merge_down, merge_group, to_fill, to_paint, apply_mask, invert_mask |
+
+**History** (3) — `ap_undo` and `ap_redo` (◆ exact, reporting the history; on a stock build they
+press ArmorPaint's own `ctrl+z` / `ctrl+shift+z` through synthetic input), `ap_history` ◆.
+
+**Bake & render** ◆ (5) — `ap_bake` (curvature, normal, object normal, height, derivative,
+position, texcoord, material/object id, vertex colour, and — with hardware ray tracing — occlusion,
+lightmap, bent normal, thickness, into a `TEX_BAKE` node, with every bake parameter),
+`ap_bake_status`, `ap_bake_settings`, `ap_render_settings` (SSAO, bloom, contrast, gamma,
+vignette, grain, supersampling, `.cube` LUT, texture filtering, clip range),
+`ap_texture_resolution` (resize the texture set). Plus `ap_console_read` ◆: the app's last 100
+console lines.
+
+**UI automation** ▣ (4) — `ap_ui_click`, `ap_ui_key` (shortcuts with ctrl/shift/alt),
+`ap_ui_drag`, `ap_ui_scroll`, in the pixel coordinates of `ap_capture_window`'s image. Delivered
+to ArmorPaint's window, not the desktop: the real pointer does not move and focus is not stolen.
+Look, act, look again.
+
+**Resources & metadata** ▣ (2) — `ap_resource_search` finds textures, envmaps, meshes, `.arm`
+materials, fonts, LUTs and export presets by name across ArmorPaint's data folder, the project's
+folder, `$ARMORPAINT_LIBRARY` and folders you pass, and says which tool imports each.
+`ap_project_metadata` keeps notes and settings with a project in a `<project>.arm.mcp.json`
+sidecar (the `.arm` is never touched).
 
 ### The loop that actually works
 
@@ -263,39 +343,43 @@ ap_capture_window   (or ap_capture_viewport)        look at it
 **`ap_material_update` does not render.** ArmorPaint's viewport shows the *layer stack*; the node
 graph is only the paint *source*. Measured: viewport captures taken before and after a colour
 change plus `ap_material_update` are **byte-identical** — the pixels change only once you fill or
-paint. There is no scriptable layer CRUD (see Limitations), so `ap_fill_layer` applies to whichever
-layer the user has selected.
+paint. `ap_fill_layer` applies to the selected layer: choose it with `ap_layer_select`, or give
+the material its own layer with `ap_layer_new(kind="fill")` (native extension).
 
-## Limitations
+## Limitations, and how each is handled
 
-These are properties of ArmorPaint's plugin API, verified by reading its source. They are not
-temporary gaps, and no amount of work on this repo removes them.
+Earlier versions listed the limitations below as properties of ArmorPaint's plugin API that
+"no amount of work on this repo removes". Each was a real constraint of the **stock plugin API**,
+read out of its source. They are now handled from outside it: by the server acting on the window
+and the filesystem, by the bridge scheduling its work differently, and, for the functions that
+exist inside ArmorPaint but have no binding, by the optional **native extension** — one added
+binding, `mcp_ext_call`, that the bridge detects at run time.
 
-- **No 3D viewport capture on a stock binary.** A plugin *can* capture the viewport to a GPU
-  texture, but the only save path (`viewport_save_texture`) encodes it into the project's in-memory
-  asset list — persisted inside the `.arm`, unreachable from another process. `iron_encode_png` and
-  `gpu_get_texture_pixels` are not exposed to plugins. **What an agent can actually see is its work
-  product:** `ap_export_textures` writes real PNGs, which the server reads and returns as images.
-  For the shaded viewport itself, the optional patch (12 added lines, one new binding) closes the
-  gap on a self-built ArmorPaint, and on Linux `ap_capture_window` sidesteps the plugin API
-  entirely by screenshotting the window from the server.
-- **ArmorPaint renders at full rate while the bridge is enabled.** The app normally sleeps after
-  ~120 idle frames, and a sleeping app does not dispatch plugin callbacks — so a polling bridge must
-  keep it awake, and pays for it in GPU and power. `ap_bridge_set_enabled` (and a toggle in the
-  Plugins tab) turns it off when no agent is working. This is a real cost, not a rounding error.
-- **One request per frame.** minic has no threads, so every handler runs inline on the render
-  thread. Batching a backlog into one frame is not just slow, it risks the interpreter's 8 MB
-  per-frame arena. Throughput is therefore bounded by frame rate; a hundred-op plan is a hundred
-  frames.
-- **A slow handler is a visible hitch** in the user's painting, for the same reason. Long
-  operations (bake, large export) return immediately with a pending token and are polled.
-- **No layer control.** Not a single layer binding exists beyond "fill the active layer" — no add,
-  delete, reorder, rename, opacity, blend mode, or mask. Layer state is not readable either.
-- **No undo/redo, no bake-parameter control, no export format/bit-depth control, no tone
-  mapping or LUT, no shelf/resource search, no project metadata, no UI automation.** Each of these
-  is a missing binding, itemised with its evidence in `docs/MINIC_DIALECT_AND_API.md` §2.14.
-- **macOS is untested.** Windows and Linux have been measured; macOS shares the Linux code path
-  but nothing there has been run.
+| Limitation (stock plugin API) | Remedy | Works on |
+|---|---|---|
+| **No 3D viewport capture on a stock binary** — `viewport_save_texture` only writes into the project | `ap_capture_window` screenshots the window from outside the app; `ap_capture_viewport` detects `viewport_save_texture_to_file` or the extension by itself (the `HAVE_VIEWPORT_PATCH` flag is gone) | Window capture: any build — Linux verified; Windows and macOS implemented, not yet run on hardware. Viewport-only: builds from after 2026-09-09, or with a patch |
+| **ArmorPaint renders at full rate while the bridge is enabled** | The bridge holds the app awake only for `linger` seconds (default 10) after a request, then lets it sleep. The server wakes it before the next request with a synthetic 1-pixel pointer move (Iron resets its idle counter on any input event): measured 120 frames asleep → wiggle → frames resume, ping answered in 38 ms. `ap_bridge_set_idle` tunes or disables it | Linux verified; Windows implemented; macOS defaults to never sleeping because its wake path (`CGEventPostToPid`) is untested |
+| **One request per frame** | `ap_batch` sends up to 64 steps as one request; the plugin runs several light steps per frame while its per-frame script-call budget allows (each script call costs ~29 KB of minic's 8 MB arena, measured peak 1.5 MB for a batch frame) and gives GPU-heavy steps a frame each. Between requests of a conversation it polls every frame instead of every 50 ms. Measured: 9 steps in 3 frames | Any build |
+| **A slow handler is a visible hitch** | Heavy ops (exports, saves, opens, imports, bakes) wait until no mouse button is held in the app, so they never land mid-stroke, and publish `busy` first. (The old README promised a pending-token mechanism that was never implemented; this replaces it.) A handler still runs inline — ArmorPaint's GPU work belongs to the render thread | Any build |
+| **No layer control, layer state unreadable** | `ap_layer_*`: list, select, create (paint/fill/decal/group/masks), delete, duplicate, rename, opacity, blending, visibility, reorder, merge, clear, convert, apply/invert mask — each pushing the same undo step as the Layers panel | Native extension |
+| **No undo/redo** | `ap_undo` / `ap_redo` / `ap_history` through the extension; on a stock build `ap_undo` / `ap_redo` press the app's own shortcuts (measured: a created material disappears and comes back, 20 of 20 each way) | Extension: exact. Stock: keystroke |
+| **No bake-parameter control** | `ap_bake` runs a bake into a `TEX_BAKE` node with every parameter; `ap_bake_status`, `ap_bake_settings` | Native extension |
+| **No export format / bit-depth control** | `ap_export_textures` takes `format`, `bits`, `quality`, `preset`, `layers`, `filename`; `ap_export_presets` | Native extension |
+| **No tone mapping or LUT** | `ap_render_settings`: SSAO, bloom, contrast, gamma, vignette, grain, supersampling, `.cube` LUT, filtering, clip range | Native extension |
+| **No shelf/resource search** | `ap_resource_search` over ArmorPaint's data folder, the project folder and library folders | Any build |
+| **No project metadata** | `ap_project_metadata`: a JSON sidecar next to the `.arm` | Any build |
+| **No UI automation** | `ap_ui_click` / `ap_ui_key` / `ap_ui_drag` / `ap_ui_scroll`, delivered to the window without moving the real pointer or stealing focus | Linux verified; Windows implemented; macOS implemented, may need Accessibility permission |
+| **macOS is untested** | macOS now has its own capture, wake and input backends and defaults to the conservative never-sleep mode — but it still has not been run on a Mac, and nothing here claims otherwise | — |
+
+**What remains**, stated plainly:
+
+- The extension is a patch to a self-built ArmorPaint. The official paid binary gets everything in
+  the "any build" rows, plus keyboard undo/redo and UI automation, but not the ◆ tools.
+- A handler still runs on ArmorPaint's render thread; the remedy moves heavy work out of the
+  user's strokes, it does not make an export free.
+- Windows and macOS code paths for capture, wake and input are unverified on real hardware.
+- Some things remain out of reach even with the extension: arbitrary script evaluation, and
+  anything the extension does not wrap (see `docs/MINIC_DIALECT_AND_API.md` §2.14).
 
 ## Linux notes
 
@@ -316,10 +400,35 @@ temporary gaps, and no amount of work on this repo removes them.
   ```sh
   sudo ln -s "$PWD/plugin/armorpaint_mcp_bridge.c" /usr/lib/armorpaint/data/plugins/armorpaint_mcp_bridge.c
   ```
+- **Use bridge 2.0 or later; 1.x hangs ArmorPaint.** On Linux and macOS every directory listing in
+  ArmorPaint 1.0 leaks a file descriptor (`close_dir` in Iron's `kong/dir.c` is an empty function),
+  and bridge 1.x listed `req/` to poll, up to 60 times a second. Launched from the KDE Plasma menu
+  (a systemd user unit, so systemd's default soft limit of 1024 descriptors) ArmorPaint ran out
+  after about 30 s of activity and froze for good inside a Vulkan present: grey window, no error.
+  Launched from a terminal with a higher limit, the same leak just took longer. macOS runs the same
+  POSIX code, by reading the source, with a default limit of 256; it has not been observed there. Bridge 2.0 learns
+  request ids from a `doorbell` file instead and does not list anything while polling
+  ([PROTOCOL.md](docs/PROTOCOL.md#the-doorbell)). `ap_bridge_status` warns if it finds a 1.x bridge.
+  Exports and `ap_fs_list` still list one directory each, so they still leak one descriptor per
+  call.
 - **The window does not need focus.** The bridge kept answering throughout testing while
-  ArmorPaint was an unfocused background window.
+  ArmorPaint was an unfocused background window, on Xvfb and on KDE Plasma 6 (XWayland). Waking it, window capture and UI input all go to
+  the window through the X server (`XSendEvent`, `XGetImage`), so the server needs `DISPLAY` for
+  ArmorPaint's display; on Wayland desktops ArmorPaint runs under XWayland, which is enough.
 
 ## Troubleshooting
+
+**ArmorPaint freezes — grey window, no error — after a minute or so of agent activity.**
+That is bridge 1.x on Linux or macOS running out of file descriptors (see
+[Linux notes](#linux-notes)). Update `armorpaint_mcp_bridge.c` in the plugins folder and restart
+ArmorPaint; `ap_ping` should report `bridge_version` 2.0.0 or later. To confirm the diagnosis on a
+frozen app: `ls /proc/$(pgrep -x ArmorPaint)/fd | wc -l` near 1024, mostly entries for the spool's
+`req` directory.
+
+**`bridge_version_mismatch`.**
+The server and the plugin are from different releases: a server that predates bridge 2.0 cannot
+drive it, because it never rings the doorbell. Update the server, and restart your MCP client so
+it relaunches it; a long-running client keeps the old server process.
 
 **The agent says the bridge is not detected.**
 Check, in order: (1) `armorpaint_mcp_bridge.c` is in `<ArmorPaint>/data/plugins/` — the directory beside the
@@ -333,15 +442,22 @@ error — read that path and compare it to where the plugin is actually writing.
 back to its per-user default (`%LOCALAPPDATA%\armorpaint-mcp\spool`) it means it could not find an
 ArmorPaint install at all; set `ARMORPAINT_DIR`.
 
-If `heartbeat.json` exists but its `t` value is not advancing between two reads, the plugin loaded
-but is not being ticked — the app is idle, or the bridge is disabled.
+If `heartbeat.json` exists but its `t` value is not advancing between two reads, look at its
+`dozing` field. `"dozing": true` is **normal**: the bridge lets ArmorPaint sleep between requests,
+and the server wakes it with a synthetic pointer move when it has something to send
+(`ap_bridge_status` does this for its probe). If waking fails — reported in the error's `wake`
+field; on Linux the server needs `DISPLAY` pointing at ArmorPaint's display — move the pointer over
+ArmorPaint's window, or call `ap_bridge_set_idle(linger=-1)` so it never sleeps. `"dozing": false`
+with a frozen `t` means the plugin loaded but is not being ticked: a modal dialog, or a hang.
 
 **Does the ArmorPaint window have to be in the foreground?**
 **No.** ArmorPaint has two sleep gates — a Windows-background gate (3 frames) and an idle gate
-(120 frames) — and it turns out both increment the *same* counter, which the bridge resets on every
-frame. Neither ever trips. This was traced in `iron.h` rather than assumed; the trace is in
-`docs/MINIC_DIALECT_AND_API.md` §0.3. The tolerance is narrow (at most 3 consecutive missed frames),
-so if you modify the plugin, keep `iron_delay_idle_sleep()` as the first statement of `on_update`.
+(120 frames) — and both increment the *same* counter, which the bridge resets on every frame while
+it is holding the app awake (traced in `iron.h`; `docs/MINIC_DIALECT_AND_API.md` §0.3). Between
+requests it stops resetting it and the app sleeps; any input event — including the synthetic
+pointer move the server sends — resets the counter, so a background window wakes without being
+focused. The tolerance is narrow (at most 3 missed frames on a backgrounded Windows window), so if
+you modify the plugin, keep `iron_delay_idle_sleep()` ahead of every early return in `on_update`.
 A *minimized* window has not been separately measured.
 
 **The plugin is not listed in Preferences → Plugins.**
@@ -374,7 +490,8 @@ class of problem. Details in [docs/INSTALL.md](docs/INSTALL.md).
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | The wire contract — either half can be reimplemented against it |
 | [docs/MINIC_DIALECT_AND_API.md](docs/MINIC_DIALECT_AND_API.md) | The minic dialect and the whole plugin API, read out of the source. If you are writing a plugin, this is the document. |
 | [docs/API_REFERENCE.md](docs/API_REFERENCE.md) | The generated binding list |
-| [docs/UPSTREAM_CHANGES.md](docs/UPSTREAM_CHANGES.md) | The optional viewport patch, exactly |
+| [docs/UPSTREAM_CHANGES.md](docs/UPSTREAM_CHANGES.md) | The optional native extension and viewport patch, exactly |
+| [tests/](tests/) | `test_offline.py` (no app needed) and `test_live.py` (`ARMORPAINT_LIVE=1`, against a running ArmorPaint) |
 
 Everything in `docs/` was derived by reading ArmorPaint 1.0 at commit
 `906418acc600132fa927876d208eb452dc5a0967`. Public web documentation for ArmorPaint's scripting

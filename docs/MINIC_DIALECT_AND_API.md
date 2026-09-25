@@ -570,9 +570,23 @@ do **not** rewind.
 per-frame budget, not a per-call-depth budget: 300 sequential calls to a one-line helper in a single
 frame is enough. It also caps recursion at roughly the same depth.
 
-Design rule for a bridge: **handle at most one request per frame** (which `PROTOCOL.md` already
-specifies for latency reasons — it is also a memory-safety requirement), and keep per-request helper
-call counts in the low tens.
+Design rule for a bridge: **budget script calls per frame.** The bridge opens at most one request
+per frame and runs further batch items in the same frame only while a counter it bumps in every
+helper stays under a budget (`CALL_BUDGET`); measured with an instrumented build, a plain request
+peaks at ~650–800 KB and a batch frame at ~1.5 MB of the 8 MB. Keep per-request helper call
+counts in the low tens.
+
+**Literals die with the frame.** A string literal inside a function body is lexed into this same
+arena *when the line runs*, so it is rewound with everything else after `on_update` returns. A
+**global** assigned from such a literal (`last_error = "none";` inside a function) points into
+reused arena memory from the next frame on. Assign persistent globals from heap strings
+(`string_copy`, `string()`) or from other globals initialised at file scope, whose literals are
+lexed during registration, below the watermark.
+
+**Timers do not give a fresh arena per item in practice.** Each `script_timer` callback enters
+through `minic_call_in_ctx` and so does rewind, but Iron's `tween_update` decrements its index
+twice after firing a finished timer (`iron_tween.c:95-96`), skipping its neighbour: measured, two
+zero-delay timers scheduled in one frame fired on two consecutive frames.
 
 ### (b) `string()` / `string_alloc` — never freed
 
@@ -635,6 +649,26 @@ These produce **no diagnostic**. This table is the reason this document exists.
 | `data_get_blob` without `data_delete_blob` | second read of the same path returns the first bytes forever |
 | declaring an opaque handle as a struct pointer of the wrong registered type | reads at real offsets of the wrong layout |
 
+### 1.12a Detecting an optional binding at run time
+
+Calling a function the build does not export is a *reported* error — `unknown function 'x'` —
+but its blast radius is smaller than it looks. Every script call runs in a fresh child
+`minic_env_t` (`minic_call`, `minic.c:823`); `minic_error` sets `error`/`returning` on **that**
+env only, so the function containing the bad call stops and its caller receives `0` and carries
+on. Measured on stock 1.0:
+
+```c
+int try_missing(int x) { int r = no_such_binding_xyz(x); return 1; }   // returns 0: binding absent
+...
+int a = try_missing(3);   // a == 0, and execution continues here
+```
+
+So an optional binding is detected by calling it **once, inside a one-line wrapper** that returns
+non-zero when the call really happened (`try_ext`, `try_save_png` in the bridge). The only cost is
+one `unknown function` line in the console on a build without it; the bridge prints an explanation
+just before its start-up probe. Keep the wrapper to the single call: anything after the missing
+call in the same function is skipped too.
+
 Errors that *are* reported go to the console via `console_log` as
 `"<plugin>.c:<line>: error: <msg> (got <token>)"` (`minic.c:378`) and **abort the rest of the script**
 (`e->error` also sets `e->returning`). Watch the ArmorPaint console during development.
@@ -671,6 +705,7 @@ void        *plugin;
 ui_handle_t *h0;
 char        *req_dir;
 char        *res_dir;
+char        *bell_path;
 float        accum   = 0.0;
 int          enabled = 1;
 
@@ -753,12 +788,15 @@ void on_update() {
     if (accum < 0.016) return;
     accum = 0.0;
 
-    any_array_t *files = file_read_directory(req_dir);
-    if (files == NULL) return;
-    if (files->length < 1) return;
-    char *name = files->buffer[0];     // ONE request per frame (arena budget, 1.11a)
-    if (!ends_with(name, ".json")) return;
-    handle_one(name);
+    // NEVER poll by listing req/: on Linux/macOS every listing leaks a file
+    // descriptor (§2.9). The server writes the request id into a doorbell file.
+    if (!iron_file_exists(bell_path)) return;
+    buffer_t *bb = data_get_blob(bell_path);
+    if (bb == NULL) return;
+    char *id = sys_buffer_to_string(bb);
+    data_delete_blob(bell_path);       // the cache is keyed by path, forever
+    iron_delete_file(bell_path);
+    handle_one(string("%s.json", id)); // ONE request per frame (arena budget, 1.11a)
 }
 
 void on_ui() {
@@ -773,8 +811,9 @@ void on_ui() {
 void main() {
     plugin  = plugin_create();
     h0      = ui_handle_create();
-    req_dir = string("%s/mcp_spool/req", project_basepath_get());
-    res_dir = string("%s/mcp_spool/res", project_basepath_get());
+    req_dir   = string("%s/mcp_spool/req", project_basepath_get());
+    res_dir   = string("%s/mcp_spool/res", project_basepath_get());
+    bell_path = string("%s/mcp_spool/doorbell", project_basepath_get());
     iron_create_directory(req_dir);
     iron_create_directory(res_dir);
     plugin_notify_on_ui(plugin, on_ui);
@@ -1170,6 +1209,18 @@ which is the origin of `PROTOCOL.md`'s two-file commit. Confirmed.
 `iron_file_download` / `file_download_to` are HTTPS GET only. **No inbound sockets. No listener.**
 Confirmed.
 
+### ⚠ On Linux and macOS, every directory listing leaks a file descriptor
+
+`iron_read_directory` and `file_read_directory` (which calls it, `iron_file.c:534`) go through
+`open_dir` / `read_next_file` / `close_dir` in `base/sources/kong/dir.c`. On POSIX, `open_dir` is
+`opendir()` and **`close_dir` is an empty function**, so the `DIR *` — a file descriptor plus its
+buffer — is never released. (The Windows branch calls `FindClose`.) Harmless for a file dialog;
+fatal for a plugin that lists a directory every frame. MEASURED with bridge 1.x, which polled
+`req/` that way: under the 1024-descriptor soft limit of a desktop-launched ArmorPaint, 1006 open
+handles on `req/` after ~32 s, and the app hung for good in `gpu_present` when the Vulkan driver
+could not get a sync fd. Poll a known filename with `iron_file_exists` (an `fopen`/`fclose`)
+instead, and list a directory only on demand — see `PROTOCOL.md` "The doorbell".
+
 ### ⚠ `json_parse_to_map` is flat, string-typed, and array-hostile
 
 ```
@@ -1260,8 +1311,9 @@ pose" binding — you would move the camera object's transform and rebuild its m
 :196-216  ui_nodes_* / UI_NODE_* node-editor geometry helpers
 ```
 
-Console output is **write-only** — there is no binding to read the console back, so an agent cannot
-retrieve ArmorPaint's own log messages.
+Console output is **write-only** for a stock plugin — there is no binding to read the console back.
+ArmorPaint does keep the last 100 lines (`console_last_traces`, `console.c:76`); the native
+extension's `console_read` op returns them.
 
 `ui_*` widgets draw **your** panel inside the Plugins tab. They cannot drive ArmorPaint's own UI.
 
@@ -1408,7 +1460,30 @@ Every one is backed by a named binding or a registered struct field — except `
 marked. Each maps to one `else if` arm in the dispatcher, well inside the 32-function budget
 because ops are arms, not functions.
 
-## 2.14 EXCLUDED — and exactly why
+## 2.14 EXCLUDED from the stock API — why, and how each is now covered
+
+The table below is still an accurate account of the **stock** binding table. Since bridge 1.1
+most rows have a remedy from outside it:
+
+| Gap | Remedy |
+|---|---|
+| layers (all rows below) | native extension `layer_list/select/new/delete/duplicate/set/move/action` |
+| `set_texture_set_resolution` | extension `texture_resolution` |
+| `bake_maps` | extension `bake` / `bake_status` / `bake_settings`, into a `TEX_BAKE` node |
+| `undo` / `redo` | extension `undo` / `redo` / `history`; on a stock build the server presses the app's own `ctrl+z` / `ctrl+shift+z` through synthetic input |
+| export format / bit depth / preset | extension `export_textures_ex`, `export_presets` |
+| `screenshot_to_file` | server-side window capture (`ap_capture_window`, any build); `viewport_save_texture_to_file` (upstream since 2026-09-09) or the extension's `capture_viewport`, detected at run time (§1.12a) |
+| `list_meshes` / `list_paint_objects`, live materials/textures | extension `project_lists` |
+| `set_camera` | extension `camera` (the numpad views, orbit, zoom, FOV) |
+| tone mapping, LUT | extension `render_settings` |
+| shelves / resource search | server-side `ap_resource_search` over the filesystem |
+| project metadata | server-side `ap_project_metadata` (a JSON sidecar beside the `.arm`) |
+| `read_console_log` | extension `console_read` |
+| UI automation | server-side synthetic input to the window (`ap_ui_click/key/drag/scroll`) |
+| `list_channels`, `add_channel`, texture sets / UV tiles, arbitrary script eval | not covered |
+
+The native extension is `patch/mcp_ext.c`, added to a self-built ArmorPaint by
+`patch/apply_ext_patch.py`; see `docs/UPSTREAM_CHANGES.md`.
 
 | Would-be tool | Verdict |
 |---|---|

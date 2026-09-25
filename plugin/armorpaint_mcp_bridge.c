@@ -5,8 +5,9 @@
 //
 // Drop this file into ArmorPaint's plugins folder and enable it in the Plugins
 // tab. It watches a spool directory for request files written by the Python MCP
-// server, executes one per frame, and writes replies back with a two-file
-// commit.
+// server, executes them in order (a batch request runs several items per frame
+// inside an arena budget), and writes replies back with a two-file commit.
+// Between requests it lets ArmorPaint sleep; the server wakes it (see linger).
 //
 // WHY A FILE MAILBOX: minic exposes no inbound sockets (the only network
 // bindings are HTTPS GET downloads), so files are the only transport a plugin
@@ -28,6 +29,7 @@
 // minic string literals)
 //
 //   <spool>/req/<id>.json     server -> plugin   (server writes atomically)
+//   <spool>/doorbell          server -> plugin   (the id of the newest request)
 //   <spool>/res/<id>.json     plugin -> server   (body)
 //   <spool>/res/<id>.done     plugin -> server   (commit marker: byte length)
 //   <spool>/heartbeat.json    plugin -> server   (~1 Hz liveness)
@@ -77,8 +79,9 @@
 // ---------------------------------------------------------------------------
 // DIALECT CONSTRAINTS OBSERVED HERE (see docs/MINIC_DIALECT_AND_API.md)
 //   * main() is the LAST function; anything after it is never registered.
-//   * 29 functions + main, against a silent hard cap of 32. Every operation is
-//     an else-if ARM inside dispatch(), never its own function.
+//   * 31 functions + main, against a silent hard cap of 32 -- ONE slot left.
+//     Every operation is an else-if ARM inside dispatch(), never its own
+//     function. Adding a helper means removing one.
 //   * no switch, no ternary, no casts, no i++ inside an expression, no #define,
 //     no fixed-size local arrays (they leak from a shared 512-slot pool).
 //   * && and || do NOT short-circuit, so every null check is its own nested if.
@@ -88,10 +91,13 @@
 //     Never put a side effect in a dispatcher condition.
 //   * ~29 KB of the 8 MB arena per SCRIPT function call, rewound only at the
 //     on_update boundary => ~280 script calls per frame. The list and stroke
-//     caps below exist to keep the worst arm well inside that.
+//     caps below keep the worst single op well inside that, and ncalls /
+//     CALL_BUDGET keep a batch from stacking ops past it.
+//   * a string LITERAL inside a function lives in that arena too, so it dies
+//     with the frame: never park one in a global (see EMPTY_STR).
 // ============================================================================
 
-char *BRIDGE_VERSION = "1.0.0";
+char *BRIDGE_VERSION = "2.0.0";
 int   ENVELOPE_V     = 1;
 
 // Per-frame script-call budget. 48 stroke points cost 48*3 to_float calls; 64
@@ -100,16 +106,42 @@ int   ENVELOPE_V     = 1;
 int MAX_STROKE_POINTS = 48;
 int MAX_LIST_ITEMS    = 64;
 
-// viewport_save_texture_to_file() does NOT exist on a stock ArmorPaint. It is
-// added by patch/apply_viewport_patch.py. Calling an unregistered function is a
-// minic runtime error that aborts the whole handler (minic.c:939), so this has
-// to be a flag rather than a try: set it to 1 only after applying the patch and
-// rebuilding.
-int HAVE_VIEWPORT_PATCH = 0;
+// OPTIONAL BINDINGS ARE DETECTED, NOT CONFIGURED.
+//
+// Calling a function the build does not export is a minic runtime error -- but
+// it aborts only the SCRIPT FUNCTION it happens in: every call runs in a fresh
+// child env (minic.c:823) whose error flag never reaches the caller, which just
+// receives 0. MEASURED on stock 1.0: a helper whose body calls an unknown
+// binding returns 0 and its caller carries on. So each optional binding is
+// reached only through a one-line try_* wrapper that returns non-zero when the
+// call really happened. States: -1 not probed yet, 0 absent, 1 present.
+//
+//   ext_state     mcp_ext_call -- the native extension from patch/apply_ext_patch.py
+//                 (layers, undo/redo, export format, bake, render settings, ...)
+//   png_state     viewport_save_texture_to_file -- upstream since 2026-09-09
+//                 (commit 1e14e27e), or patch/apply_viewport_patch.py
+//
+// The one cost: the first probe on a build without the binding prints ONE
+// "unknown function" error line to the ArmorPaint console. main() says so first.
+int   ext_state   = -1;
+int   png_state   = -1;
+char *ext_ops     = "";
+int   ext_version = 0;
+
+// Script calls made in the current frame (every helper bumps it). minic charges
+// ~29 KB of its 8 MB per-context arena per script call and only rewinds at the
+// host->script boundary, i.e. once per on_update. A batch keeps running items
+// in one frame only while this stays under CALL_BUDGET, so the worst item that
+// can follow (a 48-point stroke, ~150 calls) still fits. See step_job().
+int ncalls      = 0;
+int CALL_BUDGET = 90;
+// ...and only while the frame has spent less than this in the bridge.
+float FRAME_BUDGET_S = 0.008;
 
 // 1 on Windows, set first thing in main(). No binding reports the platform, but
 // data_path() is "." PATH_SEP "data" PATH_SEP (engine.c), so its separator does.
 int is_windows = 0;
+int is_macos   = 0;
 
 void        *plugin;
 ui_handle_t *h_panel;
@@ -121,6 +153,25 @@ char *dir_res;
 char *path_heartbeat;
 char *path_lock;
 
+// THE DOORBELL. req/ is never listed while polling, because on Linux and macOS
+// every directory listing LEAKS a file descriptor: Iron's POSIX close_dir() is an
+// empty function (kong/dir.c), so the DIR* from opendir() is never closed. At a
+// listing per poll that is 20-60 fds a second; under the 1024-fd soft limit a
+// desktop launch gets (systemd units), ArmorPaint ran out in ~32 s and hung
+// forever inside gpu_present -- the Vulkan driver could not get a sync fd.
+// MEASURED on ArmorPaint 1.0 / KDE Plasma 6 / RADV: 1006 of 1022 open fds were
+// handles on req/.
+//
+// Instead the server writes the request's id into <spool>/doorbell after the
+// request itself. A poll is one iron_file_exists() (fopen + fclose, no leak);
+// when it rings, the bridge reads the id, deletes the doorbell and opens
+// req/<id>.json directly. Two servers ringing at once lose one ring (last write
+// wins), so a waiting server re-rings while its request is still unclaimed.
+//
+// A server that predates the doorbell never rings, so this is bridge MAJOR 2:
+// such a server refuses it by version instead of timing out silently.
+char *path_bell;
+
 int   enabled       = 1;
 int   busy          = 0;
 float poll_interval = 0.05;
@@ -131,6 +182,51 @@ int   err_count     = 0;
 char *last_op       = "-";
 char *last_id       = "-";
 char *last_error    = "-";
+
+// DOZE. While the bridge holds ArmorPaint awake (iron_delay_idle_sleep every
+// frame) the app renders at full rate. Instead it holds it awake only for
+// `linger` seconds after the last request, then lets it sleep. A sleeping app
+// runs no on_update, so the SERVER wakes it before writing a request: Iron
+// resets its idle counter on any input event (iron.h _mouse_move etc.), and the
+// server posts a synthetic 1-pixel pointer move to the window (X11 XSendEvent,
+// Win32 PostMessage; see armorpaint_mcp/desktop_input.py). heartbeat.json says
+// "dozing":true so the server knows to do that. linger < 0 = never doze.
+// Defaults: 10 s; never on macOS, where the wake path is untested. Persisted in
+// <spool>/bridge_settings.json by bridge_set_idle.
+float linger        = 10.0;
+float last_activity = 0.0;
+int   dozing        = 0;
+char *path_settings;
+
+// THE CURRENT JOB: one request, or one ordered batch of sub-requests, possibly
+// spanning several frames. Requests are strictly sequential: nothing new is
+// read from req/ while a job is open.
+void *job_map    = NULL;
+char *job_id     = "";
+int   job_n      = 0;  // items (1 for a plain request)
+int   job_i      = 0;  // next item to run
+int   job_batch  = 0;  // 1 = batch: keys are b<i>_op / b<i>_a_<name>
+int   job_stop   = 0;  // batch: stop at the first failed item
+int   job_errs   = 0;
+int   job_frames = 0;
+int   job_held   = 0;  // a heavy item is waiting for the mouse to be released
+char *job_acc    = "";
+char *job_inner  = "{}";
+int   job_ok     = 1;
+float job_t0     = 0.0;
+
+// Argument-key prefix of the item being dispatched ("" or "b<i>_").
+char *arg_prefix = "";
+
+// ARENA LITERALS DO NOT OUTLIVE THEIR FRAME. A string literal inside a function
+// body is lexed into the context arena when that line runs, and the arena is
+// rewound after every on_update -- so a GLOBAL assigned from such a literal
+// dangles from the next frame on. Globals that must persist are assigned from
+// these (initialised in pass 2, below the watermark) or from heap strings.
+char *EMPTY_STR = "";
+char *EMPTY_OBJ = "{}";
+char *HANDLER_ABORTED = "internal: handler aborted";
+char *NO_ERROR = "-";
 
 // capture_viewport's render target, kept between calls.
 //
@@ -183,6 +279,7 @@ int refill_pending    = 0;
 // JSON forbids raw. Never returns NULL -- json_encode_string(NULL) would strlen
 // a null pointer inside the host.
 char *jesc(char *s) {
+	ncalls = ncalls + 1;
 	if (s == NULL) {
 		return "";
 	}
@@ -218,6 +315,7 @@ char *jesc(char *s) {
 // is an ordinary filename character there, so converting made every delete
 // fail -- and an undeleted request replays forever (see del_file).
 char *win_path(char *p) {
+	ncalls = ncalls + 1;
 	if (p == NULL) {
 		return NULL;
 	}
@@ -234,6 +332,7 @@ char *win_path(char *p) {
 // request #2. Observed before the fix: 1625 replays of the first request while
 // four later ones sat unread in req/ and timed out.
 void del_file(char *p) {
+	ncalls = ncalls + 1;
 	if (p == NULL) {
 		return;
 	}
@@ -243,6 +342,7 @@ void del_file(char *p) {
 // Does a file exist? ALWAYS use this rather than iron_file_exists() -- see win_path().
 // A false negative here makes an agent believe its own export never happened.
 int file_here(char *p) {
+	ncalls = ncalls + 1;
 	if (p == NULL) {
 		return 0;
 	}
@@ -252,6 +352,7 @@ int file_here(char *p) {
 // Can this process create a file directly inside directory d? Probes with a
 // real write, because no binding reports permissions or ownership.
 int writable_dir(char *d) {
+	ncalls = ncalls + 1;
 	if (!iron_is_directory(d)) {
 		return 0;
 	}
@@ -277,6 +378,7 @@ int writable_dir(char *d) {
 // Other users' homes refuse the probe write. macOS's /Users/Shared is
 // world-writable, so it is skipped by name.
 char *find_home(char *root) {
+	ncalls = ncalls + 1;
 	if (!iron_is_directory(root)) {
 		return NULL;
 	}
@@ -317,6 +419,7 @@ char *find_home(char *root) {
 // There is no atoi binding anywhere in the table, so integers arrive as text and
 // are converted here. Unparseable input yields 0, never an error.
 int to_int(char *s) {
+	ncalls = ncalls + 1;
 	if (s == NULL) {
 		return 0;
 	}
@@ -355,6 +458,7 @@ int to_int(char *s) {
 // Same story for floats. Plain decimal only: sign, digits, optional fraction.
 // Exponent notation is not accepted -- server.py's _fmt_float never emits it.
 float to_float(char *s) {
+	ncalls = ncalls + 1;
 	if (s == NULL) {
 		return 0.0;
 	}
@@ -409,6 +513,7 @@ float to_float(char *s) {
 // Booleans arrive as the literal text "true"/"false" (server.py encode_value).
 // to_int returns 0 for BOTH of those, so they need their own conversion.
 int to_bool(char *s) {
+	ncalls = ncalls + 1;
 	if (s == NULL) {
 		return 0;
 	}
@@ -425,20 +530,25 @@ int to_bool(char *s) {
 // so a server sending PROTOCOL.md's nested "args" object (which json_parse_to_map
 // flattens into the top level) still works. NEVER use this for envelope keys.
 char *arg(void *m, char *name) {
+	ncalls = ncalls + 1;
 	if (m == NULL) {
 		return NULL;
 	}
 	if (name == NULL) {
 		return NULL;
 	}
-	char *v = any_map_get(m, string("a_%s", name));
+	char *v = any_map_get(m, string("%sa_%s", arg_prefix, name));
 	if (v != NULL) {
 		return v;
+	}
+	if (string_length(arg_prefix) > 0) {
+		return NULL; // a batch item never falls back to the bare, envelope-level name
 	}
 	return any_map_get(m, name);
 }
 
 int arg_i(void *m, char *name, int dflt) {
+	ncalls = ncalls + 1;
 	char *v = arg(m, name);
 	if (v == NULL) {
 		return dflt;
@@ -456,6 +566,7 @@ int arg_i(void *m, char *name, int dflt) {
 }
 
 float arg_f(void *m, char *name, float dflt) {
+	ncalls = ncalls + 1;
 	char *v = arg(m, name);
 	if (v == NULL) {
 		return dflt;
@@ -469,6 +580,7 @@ float arg_f(void *m, char *name, float dflt) {
 // Errors are values, never crashes. Codes are PROTOCOL.md's set:
 // no_project, bad_args, not_found, unsupported, app_busy, internal.
 char *fail(char *code, char *msg) {
+	ncalls = ncalls + 1;
 	r_ok       = 0;
 	err_count  = err_count + 1;
 	last_error = string("%s: %s", code, msg);
@@ -478,14 +590,10 @@ char *fail(char *code, char *msg) {
 	return json_encode_end();
 }
 
-char *ok_empty() {
-	json_encode_begin();
-	return json_encode_end(); // "{}"
-}
-
 // An id becomes a filename, so a hostile one ("../../x") would write outside the
 // spool. Accept only [0-9A-Za-z._-], reject dot-runs and a leading dot.
 int id_ok(char *s) {
+	ncalls = ncalls + 1;
 	if (s == NULL) {
 		return 0;
 	}
@@ -559,6 +667,7 @@ int id_ok(char *s) {
 // The length cap is the same call's other hazard: it copies into a 1024-byte
 // stack buffer with strcpy/strcat and no bounds check.
 int path_ok(char *p) {
+	ncalls = ncalls + 1;
 	if (p == NULL) {
 		return 0;
 	}
@@ -603,6 +712,7 @@ int path_ok(char *p) {
 //
 // Returns 1 = usable, 0 = malformed, -1 = contains an array.
 int json_sane(char *s) {
+	ncalls = ncalls + 1;
 	if (s == NULL) {
 		return 0;
 	}
@@ -610,8 +720,8 @@ int json_sane(char *s) {
 	if (len < 2) {
 		return 0;
 	}
-	if (len > 8192) {
-		return 0; // far larger than any op this bridge defines
+	if (len > 16384) {
+		return 0; // room for a 64-item batch; far larger than any single op
 	}
 	if (char_code_at(s, 0) != 123) { // '{'
 		return 0;
@@ -674,17 +784,6 @@ int json_sane(char *s) {
 	return 1;
 }
 
-int dir_count(char *path) {
-	any_array_t *fa = file_read_directory(path);
-	if (fa == NULL) {
-		return 0;
-	}
-	int n = fa->length;
-	array_free(fa); // frees the backing buffer; the name strings are separate
-	free(fa);
-	return n;
-}
-
 // Join up to `max` entries of a buffer/length array into one pipe-delimited,
 // escaped string. Names go out this way rather than as a JSON array because
 // json_encode_string_array() cannot escape its elements, and one stray quote
@@ -696,6 +795,7 @@ int dir_count(char *path) {
 // (types.h:781, minic_api.c:331) and minic stamps the declared deref type onto
 // the parameter, so the re-typing is exact rather than lucky.
 char *sa_names(any_array_t *a, int max) {
+	ncalls = ncalls + 1;
 	if (a == NULL) {
 		return "";
 	}
@@ -726,6 +826,7 @@ char *sa_names(any_array_t *a, int max) {
 // unlinked. ui_node_socket_t and ui_node_button_t lay their fields out
 // differently, so each gets its own typed pointer.
 char *socket_table(any_array_t *a, int is_button) {
+	ncalls = ncalls + 1;
 	if (a == NULL) {
 		return "";
 	}
@@ -771,6 +872,7 @@ char *socket_table(any_array_t *a, int is_button) {
 // Rotation goes out as the raw quaternion: there is no quat->euler binding, and
 // inventing one here would be a lossy guess the caller could not check.
 void emit_object(object_t *o) {
+	ncalls = ncalls + 1;
 	if (o == NULL) {
 		return;
 	}
@@ -804,6 +906,7 @@ void emit_object(object_t *o) {
 // the user's model, and painting first and erroring afterwards is worse than
 // either. The counting pass is char_code_at only -- host calls, no arena frames.
 int do_stroke(char *pts, int is_world) {
+	ncalls = ncalls + 1;
 	if (pts == NULL) {
 		return 0;
 	}
@@ -872,6 +975,7 @@ int do_stroke(char *pts, int is_world) {
 // reader can catch it torn. That is unavoidable and harmless: a torn heartbeat
 // fails to parse and the server simply reads again a moment later.
 void write_heartbeat() {
+	ncalls = ncalls + 1;
 	project_t *pr   = script_get_project();
 	char      *pver = "";
 	if (pr != NULL) {
@@ -895,6 +999,11 @@ void write_heartbeat() {
 	json_encode_i32("requests", req_count);
 	json_encode_i32("errors", err_count);
 	json_encode_f32("poll_interval", poll_interval);
+	json_encode_bool("dozing", dozing);
+	json_encode_f32("linger", linger);
+	json_encode_bool("job_open", job_map != NULL);
+	json_encode_bool("job_held", job_held);
+	json_encode_i32("ext", ext_state);
 	char *body = json_encode_end();
 	iron_file_save_bytes(path_heartbeat, sys_string_to_buffer(body), 0);
 
@@ -912,6 +1021,7 @@ void write_heartbeat() {
 // marker proves a complete body; the length lets it detect a torn one. Writing
 // the marker first, or in the same call, defeats the entire scheme.
 void reply(char *id, int okflag, char *inner, int ms) {
+	ncalls = ncalls + 1;
 	char *body;
 	if (okflag) {
 		body = string("{\"v\":%d,\"id\":\"%s\",\"ok\":true,\"result\":%s,\"elapsed_ms\":%d}", ENVELOPE_V, jesc(id), inner, ms);
@@ -929,6 +1039,100 @@ void reply(char *id, int okflag, char *inner, int ms) {
 }
 
 // ---------------------------------------------------------------------------
+// Optional bindings -- see ext_state. Each wrapper is ONE call so that a missing
+// binding aborts only the wrapper, which then returns NULL / 0 to its caller.
+// ---------------------------------------------------------------------------
+char *try_ext(char *op, void *m, char *prefix) {
+	ncalls = ncalls + 1;
+	return mcp_ext_call(op, m, prefix);
+}
+
+int try_save_png(void *tex, char *path) {
+	ncalls = ncalls + 1;
+	viewport_save_texture_to_file(tex, path);
+	return 1;
+}
+
+// How an op is scheduled (step_job): 1 = may share a frame with other batch
+// items; 2 = starts a frame of its own (GPU work, or up to ~150 script calls);
+// 3 = heavy -- its own frame AND only once no mouse button is held, because it
+// stalls the render thread for as long as it runs; -1 = refused because the
+// bridge is disabled. Unknown op names cost 1: dispatch() rejects them cheaply.
+int op_cost(char *op) {
+	ncalls = ncalls + 1;
+	if (op == NULL) {
+		return 1;
+	}
+	if (!enabled) {
+		if (string_equals(op, "bridge_set_enabled")) {
+			return 1;
+		}
+		if (string_equals(op, "ping")) {
+			return 1;
+		}
+		return -1;
+	}
+	if (starts_with(op, "export_")) {
+		return 3;
+	}
+	if (starts_with(op, "project_")) {
+		if (string_equals(op, "project_get_info")) {
+			return 1;
+		}
+		if (starts_with(op, "project_list")) {
+			return 1;
+		}
+		return 3; // new, open, save, save_as
+	}
+	if (starts_with(op, "import_")) {
+		return 3;
+	}
+	if (string_equals(op, "append_mesh")) {
+		return 3;
+	}
+	if (string_equals(op, "bake")) {
+		return 3;
+	}
+	if (string_equals(op, "texture_resolution")) {
+		return 3;
+	}
+	if (string_equals(op, "quit")) {
+		return 3;
+	}
+	if (starts_with(op, "paint_stroke")) {
+		return 2;
+	}
+	if (starts_with(op, "capture_")) {
+		return 2;
+	}
+	if (starts_with(op, "layer_")) {
+		if (string_equals(op, "layer_list")) {
+			return 1;
+		}
+		return 2;
+	}
+	if (string_equals(op, "fill_layer")) {
+		return 2;
+	}
+	if (string_equals(op, "material_update")) {
+		return 2;
+	}
+	if (string_equals(op, "undo")) {
+		return 2;
+	}
+	if (string_equals(op, "redo")) {
+		return 2;
+	}
+	if (string_equals(op, "shape_add")) {
+		return 2;
+	}
+	if (string_equals(op, "object_duplicate")) {
+		return 2;
+	}
+	return 1;
+}
+
+// ---------------------------------------------------------------------------
 // THE DISPATCHER — one function, one else-if arm per operation.
 //
 // minic silently DROPS the 33rd function in a script (minic.c:2054, no else
@@ -940,9 +1144,10 @@ void reply(char *id, int okflag, char *inner, int ms) {
 //
 // Op names and argument names are server.py's. See the header comment.
 // ---------------------------------------------------------------------------
-char *dispatch(void *m) {
-	// Envelope key, read DIRECTLY -- not through arg(). See the header comment.
-	char *op = any_map_get(m, "op");
+char *dispatch(void *m, char *op) {
+	ncalls = ncalls + 1;
+	// `op` is the envelope key (or a batch item's b<i>_op), read by step_job
+	// DIRECTLY -- never through arg(). See the header comment.
 	if (op == NULL) {
 		return fail("bad_args", "missing 'op'");
 	}
@@ -985,6 +1190,7 @@ char *dispatch(void *m) {
 		json_encode_bool("enabled", enabled);
 		json_encode_i32("requests", req_count);
 		json_encode_i32("errors", err_count);
+		json_encode_bool("ext", ext_state == 1);
 		return json_encode_end();
 	}
 	else if (string_equals(op, "get_app_info")) {
@@ -1002,7 +1208,23 @@ char *dispatch(void *m) {
 		json_encode_f32("poll_interval", poll_interval);
 		json_encode_i32("max_stroke_points", MAX_STROKE_POINTS);
 		json_encode_i32("max_list_items", MAX_LIST_ITEMS);
-		json_encode_bool("viewport_patch", HAVE_VIEWPORT_PATCH);
+		// -1 = not probed yet, 0 = absent, 1 = present (see ext_state).
+		json_encode_i32("viewport_file_binding", png_state);
+		json_encode_i32("ext_state", ext_state);
+		json_encode_i32("ext_version", ext_version);
+		json_encode_string("ext_ops", ext_ops);
+		json_encode_bool("dozing", dozing);
+		json_encode_f32("linger", linger);
+		json_encode_i32("call_budget", CALL_BUDGET);
+		if (is_windows) {
+			json_encode_string("os", "windows");
+		}
+		else if (is_macos) {
+			json_encode_string("os", "macos");
+		}
+		else {
+			json_encode_string("os", "linux");
+		}
 		json_encode_i32("requests", req_count);
 		json_encode_i32("errors", err_count);
 		json_encode_string("last_op", jesc(last_op));
@@ -1027,10 +1249,31 @@ char *dispatch(void *m) {
 		}
 		json_encode_begin();
 		json_encode_bool("enabled", enabled);
-		// Disabling stops on_update from polling AND from resetting the idle
-		// counter, so the app is allowed to sleep again. Re-enabling from the
-		// server is therefore impossible: use the Plugins tab toggle.
-		json_encode_bool("reenable_needs_ui", 1);
+		// Disabled = never hold the app awake and refuse every op except
+		// bridge_set_enabled and ping. The bridge still reads req/ on whatever
+		// frames run, and the server wakes a sleeping app before writing a
+		// request, so re-enabling from the server works.
+		json_encode_bool("reenable_needs_ui", 0);
+		return json_encode_end();
+	}
+	else if (string_equals(op, "bridge_set_idle")) {
+		s1 = arg(m, "linger");
+		if (s1 == NULL) {
+			return fail("bad_args", "missing 'linger' (seconds to stay awake after a request; -1 = never doze)");
+		}
+		linger = to_float(s1);
+		if (linger < 0.0) {
+			linger = -1.0;
+		}
+		if (linger > 3600.0) {
+			linger = 3600.0;
+		}
+		// Persist, so the choice survives a restart. Flat, compact, all-string:
+		// the same shape json_parse_to_map reads back in main().
+		iron_file_save_bytes(path_settings, sys_string_to_buffer(string("{\"linger\":\"%s\"}", f32_to_string(linger))), 0);
+		json_encode_begin();
+		json_encode_f32("linger", linger);
+		json_encode_bool("never_doze", linger < 0.0);
 		return json_encode_end();
 	}
 	else if (string_equals(op, "bridge_set_poll_ms")) {
@@ -1104,7 +1347,7 @@ char *dispatch(void *m) {
 	// ---- project ----------------------------------------------------------
 	else if (string_equals(op, "project_new")) {
 		script_project_new();
-		return ok_empty();
+		return "{}";
 	}
 	else if (string_equals(op, "project_open")) {
 		s1 = arg(m, "path");
@@ -1333,13 +1576,25 @@ char *dispatch(void *m) {
 		if (!iron_is_directory(s1)) {
 			return fail("bad_args", string("not a directory and could not be created: %s", s1));
 		}
-		i2 = dir_count(s1);
+		i2 = 0;
+		ar = file_read_directory(s1);
+		if (ar != NULL) {
+			i2 = ar->length;
+			array_free(ar); // frees the backing buffer; the name strings are separate
+			free(ar);
+		}
 		// The only binding in the table that writes real image files to disk.
 		// Filenames come from the last export-dialog name (else "untitled") plus
 		// the active preset's per-channel suffixes; format and bit depth live on
 		// unregistered fields and are NOT settable from a plugin (8-bit PNG).
 		export_texture_run(s1, 0);
-		i3 = dir_count(s1);
+		i3 = 0;
+		ar = file_read_directory(s1);
+		if (ar != NULL) {
+			i3 = ar->length;
+			array_free(ar); // frees the backing buffer; the name strings are separate
+			free(ar);
+		}
 		json_encode_begin();
 		json_encode_string("directory", jesc(s1));
 		json_encode_i32("bake_material", 0);
@@ -1368,9 +1623,21 @@ char *dispatch(void *m) {
 		if (!iron_is_directory(s1)) {
 			return fail("bad_args", string("not a directory and could not be created: %s", s1));
 		}
-		i2 = dir_count(s1);
+		i2 = 0;
+		ar = file_read_directory(s1);
+		if (ar != NULL) {
+			i2 = ar->length;
+			array_free(ar); // frees the backing buffer; the name strings are separate
+			free(ar);
+		}
 		export_texture_run(s1, 1); // bake_material
-		i3 = dir_count(s1);
+		i3 = 0;
+		ar = file_read_directory(s1);
+		if (ar != NULL) {
+			i3 = ar->length;
+			array_free(ar); // frees the backing buffer; the name strings are separate
+			free(ar);
+		}
 		json_encode_begin();
 		json_encode_string("directory", jesc(s1));
 		json_encode_i32("bake_material", 1);
@@ -1928,7 +2195,7 @@ char *dispatch(void *m) {
 			return fail("not_found", string("no material named %s", s1));
 		}
 		script_material_delete(mt);
-		return ok_empty();
+		return "{}";
 	}
 	else if (string_equals(op, "material_assign")) {
 		s1 = arg(m, "object");
@@ -1948,7 +2215,7 @@ char *dispatch(void *m) {
 			return fail("not_found", string("no material named %s", s2));
 		}
 		script_object_set_material(ob, mt);
-		return ok_empty();
+		return "{}";
 	}
 	else if (string_equals(op, "material_set_channels")) {
 		if (c == NULL) {
@@ -2013,7 +2280,7 @@ char *dispatch(void *m) {
 	else if (string_equals(op, "material_update")) {
 		script_material_update();
 		fill_after_update = 1;
-		return ok_empty();
+		return "{}";
 	}
 
 	// ---- material nodes ---------------------------------------------------
@@ -2142,7 +2409,7 @@ char *dispatch(void *m) {
 			return fail("unsupported", "the PBR output node cannot be removed");
 		}
 		script_material_remove_node(nd);
-		return ok_empty();
+		return "{}";
 	}
 	else if (string_equals(op, "node_connect")) {
 		i1 = arg_i(m, "from_id", -1);
@@ -2184,7 +2451,7 @@ char *dispatch(void *m) {
 			return fail("bad_args", string("to_socket %d out of range", i4));
 		}
 		script_material_connect(nd, i2, nd2, i4);
-		return ok_empty();
+		return "{}";
 	}
 	else if (string_equals(op, "node_disconnect")) {
 		i1 = arg_i(m, "to_id", -1);
@@ -2200,7 +2467,7 @@ char *dispatch(void *m) {
 			return fail("not_found", string("no node with id %d", i1));
 		}
 		script_material_disconnect(nd, i2);
-		return ok_empty();
+		return "{}";
 	}
 	else if (string_equals(op, "node_set_value")) {
 		// One op, four kinds -- server.py's ap_node_set_value. Four separate ops
@@ -2231,7 +2498,7 @@ char *dispatch(void *m) {
 				return fail("bad_args", string("button %d out of range", i2));
 			}
 			script_material_set_button(nd, i2, arg_f(m, "value", 0.0));
-			return ok_empty();
+			return "{}";
 		}
 		i2 = arg_i(m, "socket", -1);
 		if (i2 < 0) {
@@ -2257,16 +2524,16 @@ char *dispatch(void *m) {
 		}
 		if (string_equals(s1, "float")) {
 			script_material_set_float(nd, i3, i2, arg_f(m, "value", 0.0));
-			return ok_empty();
+			return "{}";
 		}
 		else if (string_equals(s1, "color")) {
 			// 'alpha', not 'a' -- server.py sends the fourth component spelled out.
 			script_material_set_color(nd, i3, i2, arg_f(m, "r", 0.0), arg_f(m, "g", 0.0), arg_f(m, "b", 0.0), arg_f(m, "alpha", 1.0));
-			return ok_empty();
+			return "{}";
 		}
 		else if (string_equals(s1, "vector")) {
 			script_material_set_vector(nd, i3, i2, arg_f(m, "x", 0.0), arg_f(m, "y", 0.0), arg_f(m, "z", 0.0));
-			return ok_empty();
+			return "{}";
 		}
 		return fail("bad_args", string("unknown kind '%s'; expected float, color, vector or button", s1));
 	}
@@ -2388,10 +2655,9 @@ char *dispatch(void *m) {
 		return json_encode_end();
 	}
 	else if (string_equals(op, "fill_layer")) {
-		// The binding table contains exactly ONE layer operation. slot_layer_t is
-		// not a registered struct and project_t.layer_datas is NULL in a live
-		// session, so create/delete/rename/reorder/mask/opacity/blend are all
-		// genuinely unreachable -- which is why there is no tool for them.
+		// The ONLY layer operation in the stock binding table. Everything else
+		// (list, create, delete, rename, reorder, mask, opacity, blending) is in
+		// the native extension: the layer_* ops at the end of dispatch().
 		if (c == NULL) {
 			return fail("internal", "no context");
 		}
@@ -2451,12 +2717,21 @@ char *dispatch(void *m) {
 		return json_encode_end();
 	}
 	else if (string_equals(op, "capture_viewport")) {
-		if (!HAVE_VIEWPORT_PATCH) {
-			// Do NOT attempt the call. An unregistered function is a minic
-			// runtime error (minic.c:939) that aborts the whole handler, so
-			// feature detection has to be a flag rather than a try.
+		if (ext_state == 1) {
+			// The native extension captures and writes the PNG itself, and can
+			// free the render target it reallocates on a size change.
+			s1 = try_ext(op, m, arg_prefix);
+			if (s1 != NULL) {
+				if (!starts_with(s1, "1")) {
+					r_ok      = 0;
+					err_count = err_count + 1;
+				}
+				return substring(s1, 1, string_length(s1));
+			}
+		}
+		if (png_state == 0) {
 			return fail("unsupported",
-			            "viewport_save_texture_to_file is not in this build's binding table. Apply patch/apply_viewport_patch.py to an ArmorPaint checkout, rebuild, set HAVE_VIEWPORT_PATCH = 1 at the top of this plugin, and reload it. Stock fallbacks: capture_to_project (in-project only) or export_textures (real files, but flat textures rather than the shaded view).");
+			            "this build exports neither viewport_save_texture_to_file (upstream since 2026-09-09) nor mcp_ext_call (patch/apply_ext_patch.py). Use ap_capture_window, which screenshots the window from outside on any build.");
 		}
 		if (pr == NULL) {
 			return fail("no_project", "viewport capture needs an open project");
@@ -2495,26 +2770,66 @@ char *dispatch(void *m) {
 			return fail("internal", "gpu_create_render_target returned null");
 		}
 		viewport_capture_screenshot_to(capture_tex, 0.0, 0.0, i1, i2);
-		viewport_save_texture_to_file(capture_tex, s1);
+		// The first call doubles as the probe: try_save_png returns 0 when the
+		// binding is missing, having written nothing.
+		png_state = try_save_png(capture_tex, s1);
 		if (c != NULL) {
 			c->capturing_screenshot = 0;
 			c->ddirty               = 2;
+		}
+		if (png_state == 0) {
+			return fail("unsupported",
+			            "this build exports neither viewport_save_texture_to_file (upstream since 2026-09-09) nor mcp_ext_call (patch/apply_ext_patch.py). Use ap_capture_window, which screenshots the window from outside on any build.");
 		}
 		json_encode_begin();
 		json_encode_string("path", jesc(s1));
 		json_encode_i32("width", i1);
 		json_encode_i32("height", i2);
 		json_encode_bool("exists", file_here(s1));
+		json_encode_string("method", "viewport_save_texture_to_file");
 		return json_encode_end();
 	}
 
-	return fail("unsupported", string("unknown op: %s", op));
+	// ---- everything else: the native extension ------------------------------
+	// Layers, undo/redo, export format, bake, render settings, live lists and
+	// camera views have no minic binding at all. On a build carrying
+	// patch/apply_ext_patch.py they are implemented natively behind the single
+	// mcp_ext_call binding, which also rejects op names it does not know.
+	if (ext_state != 0) {
+		s1 = try_ext(op, m, arg_prefix);
+		if (s1 == NULL) {
+			ext_state = 0;
+		}
+		else {
+			ext_state = 1;
+			if (!starts_with(s1, "1")) {
+				r_ok       = 0;
+				err_count  = err_count + 1;
+				last_error = string("%s: native extension refused", op);
+			}
+			return substring(s1, 1, string_length(s1));
+		}
+	}
+	return fail("unsupported", string("unknown op '%s', or an op that needs the optional native extension (patch/apply_ext_patch.py), which this ArmorPaint build does not carry", op));
 }
 
 // ---------------------------------------------------------------------------
 // Request lifecycle
+//
+// A request becomes a JOB: one op, or an ordered batch of sub-ops. step_job()
+// runs as many items as fit in the current frame and resumes on the next one:
+//
+//   * items run strictly in order, and nothing new is read from req/ until the
+//     job's single reply has been committed;
+//   * a second item starts in the same frame only while the frame has used
+//     fewer than CALL_BUDGET script calls (the arena limit, see ncalls) and
+//     less than FRAME_BUDGET_S of wall time;
+//   * op_cost() >= 2 items always start a frame of their own, and >= 3
+//     ("heavy": exports, saves, opens, imports, bakes) additionally wait until
+//     no mouse button is down, so a long handler never lands mid-stroke.
 // ---------------------------------------------------------------------------
 void handle_one(char *name) {
+	ncalls  = ncalls + 1;
 	int nlen = string_length(name);
 	if (nlen < 6) {
 		return; // ".json" with no id at all; substring below would go negative
@@ -2558,8 +2873,9 @@ void handle_one(char *name) {
 	// start -- re-running a destructive op they never asked for twice.
 	del_file(path);
 
-	req_count = req_count + 1;
-	last_id   = id;
+	req_count     = req_count + 1;
+	last_id       = id;
+	last_activity = sys_time();
 
 	// Screen before parsing: a malformed body would crash the host parser, not
 	// merely fail. See json_sane().
@@ -2569,40 +2885,180 @@ void handle_one(char *name) {
 		return;
 	}
 	if (sane < 1) {
-		reply(id, 0, fail("bad_args", "body is not a well-formed compact JSON object (<= 8192 bytes)"), 0);
+		reply(id, 0, fail("bad_args", "body is not a well-formed compact JSON object (<= 16384 bytes)"), 0);
 		return;
 	}
 
 	// json_parse_to_map flattens nested objects, skips arrays and returns every
 	// value as a char*. See the header comment for what the server must send.
-	void *m = json_parse_to_map(text);
+	// The map is heap-allocated, so it outlives this frame for a multi-frame job.
+	job_map    = json_parse_to_map(text);
+	job_id     = id;
+	job_i      = 0;
+	job_errs   = 0;
+	job_frames = 0;
+	job_held   = 0;
+	job_acc    = EMPTY_STR;
+	job_inner  = EMPTY_OBJ;
+	job_ok     = 1;
+	job_t0     = sys_time();
+	char *op0  = any_map_get(job_map, "op"); // envelope key: read directly, never via arg()
+	if (op0 == NULL) {
+		job_map = NULL;
+		reply(id, 0, fail("bad_args", "missing 'op'"), 0);
+		return;
+	}
+	job_batch = string_equals(op0, "batch");
+	job_n     = 1;
+	job_stop   = 0;
+	if (job_batch) {
+		arg_prefix = EMPTY_STR;
+		job_n      = arg_i(job_map, "count", 0);
+		job_stop   = arg_i(job_map, "stop_on_error", 0);
+		if (job_n < 1) {
+			job_map = NULL;
+			reply(id, 0, fail("bad_args", "batch needs a_count >= 1 and items b0_op, b1_op, ..."), 0);
+			return;
+		}
+		if (job_n > 64) {
+			job_map = NULL;
+			reply(id, 0, fail("bad_args", "a batch holds at most 64 items"), 0);
+			return;
+		}
+	}
+	step_job();
+}
 
-	float t0 = sys_time();
-	busy     = 1;
-	// Publish busy=1 before dispatching. Handlers run inline on the render
-	// thread, so a slow one (export, bake) blocks for its whole duration and
-	// this is the only way the server can tell "working" from "wedged".
-	write_heartbeat();
+// Run what fits of the open job this frame; commit its reply once it is done.
+void step_job() {
+	ncalls = ncalls + 1;
+	if (job_map == NULL) {
+		return;
+	}
+	job_frames  = job_frames + 1;
+	float f0    = sys_time();
+	int   ran   = 0;
+	char *pfx   = "";
+	char *op    = NULL;
+	char *inner = NULL;
+	int   cost  = 1;
+	while (job_i < job_n) {
+		pfx = EMPTY_STR;
+		if (job_batch) {
+			pfx = string("b%d_", job_i);
+		}
+		op   = any_map_get(job_map, string("%sop", pfx));
+		cost = op_cost(op);
+		if (ran > 0) {
+			if (cost > 1) {
+				break;
+			}
+			if (ncalls > CALL_BUDGET) {
+				break;
+			}
+			if (sys_time() - f0 > FRAME_BUDGET_S) {
+				break;
+			}
+		}
+		if (cost > 2) {
+			// Heavy ops run inline on the render thread and stall it for their
+			// whole duration. Never start one while the user is holding a mouse
+			// button (mid-stroke, mid-drag); wait for the release instead.
+			if (mouse_down_any()) {
+				if (!job_held) {
+					job_held = 1;
+					write_heartbeat();
+				}
+				return;
+			}
+			job_held = 0;
+			busy     = 1;
+			write_heartbeat(); // publish busy=1: the server must not mistake the stall for a hang
+		}
 
-	r_ok        = 1;
-	char *inner = dispatch(m);
+		arg_prefix = pfx;
+		r_ok       = 1;
+		if (cost < 0) {
+			// Disabled bridge: op_cost() marks everything but the two ops that
+			// must keep working (bridge_set_enabled, ping) with -1.
+			inner = fail("bridge_disabled", "the bridge is disabled; call bridge_set_enabled(true) or tick it in the Plugins tab");
+		}
+		else {
+			inner = dispatch(job_map, op);
+		}
+		arg_prefix = EMPTY_STR;
+		busy       = 0;
 
-	// A minic runtime error inside dispatch -- a call this build does not export,
-	// a parse error in an arm -- aborts THAT function and returns 0 without
-	// touching this one, because every call gets a fresh env (minic.c:823).
-	// Without this guard the reply body would contain a literal `null` where the
-	// result object belongs and r_ok would still say true. Turn it into an error
-	// the caller can act on; the real message is already in the console.
-	if (inner == NULL) {
-		r_ok       = 0;
-		err_count  = err_count + 1;
-		last_error = "internal: handler aborted";
-		inner      = "{\"code\":\"internal\",\"message\":\"the handler aborted; look in the ArmorPaint console for a '<plugin>.c:<line>: error:' line\"}";
+		// A minic runtime error inside dispatch -- a parse error in an arm, say --
+		// aborts THAT function and returns 0 without touching this one, because
+		// every call gets a fresh env (minic.c:823). Without this guard the reply
+		// would carry a literal `null` result while r_ok still said true.
+		if (inner == NULL) {
+			r_ok       = 0;
+			err_count  = err_count + 1;
+			last_error = HANDLER_ABORTED;
+			inner      = "{\"code\":\"internal\",\"message\":\"the handler aborted; look in the ArmorPaint console for a '<plugin>.c:<line>: error:' line\"}";
+		}
+		if (job_batch) {
+			if (job_i > 0) {
+				job_acc = string("%s,", job_acc);
+			}
+			if (r_ok) {
+				job_acc = string("%s{\"i\":%d,\"op\":\"%s\",\"ok\":true,\"result\":%s}", job_acc, job_i, jesc(op), inner);
+			}
+			else {
+				job_acc  = string("%s{\"i\":%d,\"op\":\"%s\",\"ok\":false,\"error\":%s}", job_acc, job_i, jesc(op), inner);
+				job_errs = job_errs + 1;
+			}
+		}
+		else {
+			job_inner = inner;
+			job_ok    = r_ok;
+		}
+		job_i = job_i + 1;
+		ran   = ran + 1;
+		if (quitting) {
+			break;
+		}
+		if (!r_ok) {
+			if (job_stop) {
+				break;
+			}
+		}
+		// A heavy/expensive item ends the frame, and so does a fill that queued
+		// its next-frame refill: later items must see the settled layer.
+		if (cost > 1) {
+			break;
+		}
+		if (refill_pending) {
+			break;
+		}
+	}
+	if (job_i < job_n) {
+		if (!quitting) {
+			if (r_ok) {
+				return; // more next frame
+			}
+			if (!job_stop) {
+				return;
+			}
+		}
 	}
 
-	busy   = 0;
-	int ms = (sys_time() - t0) * 1000.0;
-	reply(id, r_ok, inner, ms);
+	int ms = (sys_time() - job_t0) * 1000.0;
+	if (job_batch) {
+		pfx = "false";
+		if (job_i < job_n) {
+			pfx = "true";
+		}
+		job_inner = string("{\"count\":%d,\"executed\":%d,\"errors\":%d,\"frames\":%d,\"stopped_early\":%s,\"results\":[%s]}", job_n, job_i, job_errs,
+		                   job_frames, pfx, job_acc);
+		job_ok = 1; // per-item status lives in results[]
+	}
+	job_map       = NULL;
+	job_held      = 0;
+	last_activity = sys_time();
+	reply(job_id, job_ok, job_inner, ms);
 	if (quitting) {
 		del_file(path_heartbeat);
 		del_file(path_lock);
@@ -2612,23 +3068,40 @@ void handle_one(char *name) {
 }
 
 void on_update() {
-	// The enable check is the ONLY statement permitted above the idle-sleep
-	// reset. A disabled bridge deliberately lets ArmorPaint fall asleep again --
-	// that is the whole point of the toggle, since staying awake costs full-rate
-	// rendering forever.
-	if (!enabled) {
-		return;
-	}
+	ncalls    = 0;
+	float now = sys_time();
 
-	// FIRST statement of the live path, and nothing may be inserted above it.
-	// base_update() returns before iron_update() -- which dispatches this
+	// Hold the app awake only while there is a reason to. Dozing lets Iron's own
+	// idle gate put ArmorPaint to sleep (after 120 idle frames), and a sleeping
+	// app dispatches no on_update at all -- the server wakes it with a synthetic
+	// pointer move before it writes a request (see linger).
+	//
+	// When awake, iron_delay_idle_sleep() must be reached on every frame before
+	// any early return: base_update() skips iron_update() -- which dispatches this
 	// callback -- once paused_frames exceeds 3 (Windows background) or 120
-	// (idle). BOTH gates read that same counter and this call zeroes it
-	// (iron.h:1011), so a per-frame reset holds both open and live control of an
-	// unfocused ArmorPaint works. The background gate tolerates only THREE
-	// consecutive missed frames, so putting the poll throttle above this would
-	// let the app sleep and the bridge would go permanently deaf.
-	iron_delay_idle_sleep();
+	// (idle), and BOTH gates read the counter this call zeroes (iron.h:1011).
+	int awake = 0;
+	if (enabled) {
+		if (linger < 0.0) {
+			awake = 1;
+		}
+		if (now - last_activity < linger) {
+			awake = 1;
+		}
+	}
+	if (job_map != NULL) {
+		awake = 1;
+	}
+	if (refill_pending) {
+		awake = 1;
+	}
+	if (awake) {
+		iron_delay_idle_sleep();
+	}
+	if (dozing == awake) {
+		dozing = !awake;
+		write_heartbeat(); // the server reads "dozing" to decide whether to wake the app
+	}
 
 	// The deferred second pass of a fill after material_update (see
 	// fill_after_update). Checked before the poll throttle so it lands on the very
@@ -2653,55 +3126,43 @@ void on_update() {
 		write_heartbeat();
 	}
 
-	poll_accum = poll_accum + dt;
-	if (poll_accum < poll_interval) {
+	// An open job continues before anything new is read.
+	if (job_map != NULL) {
+		step_job();
 		return;
+	}
+
+	// Throttle idle polling, but not a conversation in progress: within a second
+	// of the last request, poll every frame, so a chain of sequential tool calls
+	// costs a frame each rather than a poll interval each.
+	poll_accum = poll_accum + dt;
+	if (now - last_activity > 1.0) {
+		if (poll_accum < poll_interval) {
+			return;
+		}
 	}
 	poll_accum = 0.0;
 
-	// Cheap pre-filter: iron_read_directory fills a shared static buffer and
-	// allocates nothing, so an idle poll costs one directory scan and one strstr.
-	// Only when a .json is actually present do we pay for the array listing,
-	// whose per-entry strings are never freed.
-	char *listing = iron_read_directory(dir_req);
-	if (listing == NULL) {
-		return;
-	}
-	if (string_index_of(listing, ".json") < 0) {
-		return;
-	}
-
-	any_array_t *files = file_read_directory(dir_req);
-	if (files == NULL) {
-		return;
-	}
-	int   fn   = files->length;
-	char *pick = NULL;
-	char *nm;
-	for (int fi = 0; fi < fn; ++fi) {
-		nm = files->buffer[fi];
-		if (nm != NULL) {
-			if (ends_with(nm, ".json")) {
-				pick = nm;
-				break;
-			}
+	// The doorbell (see path_bell): no directory listing on this path.
+	if (file_here(path_bell)) {
+		buffer_t *bb  = data_get_blob(path_bell);
+		char     *rid = NULL;
+		if (bb != NULL) {
+			rid = sys_buffer_to_string(bb); // copy out before the eviction frees bb
+			data_delete_blob(path_bell);    // mandatory: data_get_blob memoises by path
 		}
+		del_file(path_bell);
+		if (rid == NULL) {
+			return;
+		}
+		char *bell_name = string("%s.json", trim_end(rid));
+		if (!file_here(string("%s/%s", dir_req, bell_name))) {
+			return; // already answered, or abandoned by its server
+		}
+		// One REQUEST is opened per frame; a batch request runs several items per
+		// frame inside the call budget (see step_job).
+		handle_one(bell_name);
 	}
-	// pick points at a string_split-allocated name, not into this buffer, so it
-	// stays valid after the array header and buffer are released.
-	array_free(files);
-	free(files);
-
-	if (pick == NULL) {
-		return;
-	}
-
-	// AT MOST ONE request per frame. This is a memory-safety rule, not only a
-	// latency one: every script call burns ~29 KB of the 8 MB context arena and
-	// the arena is rewound only here, at the host->script boundary, giving about
-	// 280 calls per frame. Draining a backlog in one frame would overflow it and
-	// corrupt the heap, because minic_alloc has no bounds check.
-	handle_one(pick);
 }
 
 // Drawn ONLY while the Plugins tab is visible (tab_plugins.c:27), so it can show
@@ -2736,7 +3197,7 @@ void on_ui() {
 			file_start(spool_root);
 		}
 		if (ui_button("Clear error", UI_ALIGN_CENTER, "")) {
-			last_error = "-";
+			last_error = NO_ERROR;
 		}
 	}
 }
@@ -2763,6 +3224,9 @@ void main() {
 	// escape sequences and any unrecognised one truncates the string at that
 	// point, so every path this plugin handles stays forward-slashed.
 	is_windows = string_index_of(data_path(), "\\") >= 0;
+	if (!is_windows) {
+		is_macos = iron_is_directory("/System/Library");
+	}
 	char *base = string_replace_all(data_path(), "\\", "/");
 	spool_root = string("%smcp_spool", base);
 
@@ -2805,6 +3269,29 @@ void main() {
 
 	path_heartbeat = string("%s/heartbeat.json", spool_root);
 	path_lock      = string("%s/bridge.lock", spool_root);
+	path_bell      = string("%s/doorbell", spool_root);
+	path_settings  = string("%s/bridge_settings.json", spool_root);
+
+	// Doze default: on, except on macOS where waking a sleeping app from the
+	// server is implemented but untested. bridge_set_idle overrides and persists.
+	if (is_macos) {
+		linger = -1.0;
+	}
+	if (file_here(path_settings)) {
+		buffer_t *sb = data_get_blob(path_settings);
+		if (sb != NULL) {
+			char *st = sys_buffer_to_string(sb);
+			data_delete_blob(path_settings);
+			if (json_sane(st) == 1) {
+				void *sm = json_parse_to_map(st);
+				char *lv = any_map_get(sm, "linger");
+				if (lv != NULL) {
+					linger = to_float(lv);
+				}
+			}
+		}
+	}
+	last_activity = sys_time();
 	ui_version     = string("bridge %s", BRIDGE_VERSION);
 
 	// Drain anything still sitting in req/ from a previous run.
@@ -2830,6 +3317,7 @@ void main() {
 		array_free(stale);
 		free(stale);
 	}
+	del_file(path_bell); // may name one of the requests just drained
 
 	json_encode_begin();
 	json_encode_i32("v", ENVELOPE_V);
@@ -2837,6 +3325,27 @@ void main() {
 	json_encode_string("spool", jesc(spool_root));
 	json_encode_f32("started_t", sys_time());
 	iron_file_save_bytes(path_lock, sys_string_to_buffer(json_encode_end()), 0);
+
+	// Probe for the optional native extension (patch/apply_ext_patch.py). On a
+	// stock build this prints exactly one "unknown function" error, announced
+	// first so nobody chases it.
+	console_info("armorpaint-mcp: probing for the optional native extension (mcp_ext_call). On a stock ArmorPaint the next line is an 'unknown function' error -- that is expected and harmless.");
+	char *probe = try_ext("ext_info", NULL, "");
+	if (probe == NULL) {
+		ext_state = 0;
+	}
+	else {
+		ext_state = 1;
+		if (starts_with(probe, "1")) {
+			void *pm  = json_parse_to_map(substring(probe, 1, string_length(probe)));
+			char *eo  = any_map_get(pm, "ops");
+			if (eo != NULL) {
+				ext_ops = eo; // a heap substring owned by the map, which is never freed
+			}
+			ext_version = to_int(any_map_get(pm, "ext_version"));
+		}
+		console_info(string("armorpaint-mcp: native extension v%d present", ext_version));
+	}
 
 	write_heartbeat();
 

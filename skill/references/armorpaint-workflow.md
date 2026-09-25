@@ -216,23 +216,30 @@ What to do instead, in order of preference:
 4. **Ask the human**, precisely: "add a layer above `base`, select it, and say go" — one sentence,
    one action, then you continue.
 
-Do not fake it. A tool that promised layer CRUD would have to drive the UI, and no UI-automation
-binding exists.
+With the native extension none of this is needed: `ap_layer_*` manages the stack directly. On a
+stock build a fifth option exists: drive the Layers panel yourself with `ap_ui_click` /
+`ap_ui_drag`, after an `ap_capture_window` shows you where things are — slower and more fragile
+than asking, so prefer asking for anything beyond one or two clicks.
 
-## Other Hard Limits Worth Knowing Early
+## Other Limits Worth Knowing Early
+
+"ext" = needs the native extension (`ap_get_app_info` → `ext_state: 1`).
 
 | Wanted | Reality |
 |---|---|
-| bake AO / thickness / normals to a map | no bake-run binding. `TOOL_TYPE_BAKE` selects the tool; every bake parameter lives on unregistered state |
+| bake AO / thickness / normals to a map | ext: `ap_bake` into a `TEX_BAKE` node (AO, bent normal, thickness and lightmap need hardware ray tracing), poll `ap_bake_status`. Stock: no bake-run binding |
 | bake curvature | **reachable** — put a `BAKE_CURVATURE` node in a material; `script_material_update()` re-bakes its preview automatically (`render/make_material.c:222-266`). Without an update it samples black. Expensive: a full-resolution bake on the render thread |
-| set document resolution | `config_t.layer_res` is a preference for the next new project (0=2048, 1=4096, 2=8192, 3=16384) and does not resize the current document |
-| list layers / channels / texture sets / UV tiles | no bindings |
-| undo / redo | no bindings |
-| read ArmorPaint's console | `console_*` are write-only |
-| set the camera pose | no binding; you would have to find the camera object and drive its transform |
-| tone mapping / LUT / post FX | not among the 16 registered `config_t` fields |
+| set document resolution | ext: `ap_texture_resolution`. Stock: `config_t.layer_res` is a preference for the next new project (0=2048, 1=4096, 2=8192, 3=16384) and does not resize the current document |
+| list layers | ext: `ap_layer_list` |
+| list channels / texture sets / UV tiles | no bindings, even with the extension |
+| undo / redo | ext: `ap_undo` / `ap_redo` exact, `ap_history`. Stock: the same tools press ctrl+z / ctrl+shift+z |
+| read ArmorPaint's console | ext: `ap_console_read` (last 100 lines) |
+| set the camera pose | ext: `ap_camera` (front/back/left/right/top/bottom/reset, orbit, zoom, FOV) |
+| tone mapping / LUT / post FX | ext: `ap_render_settings` |
+| export format / bit depth / preset | ext: `ap_export_textures` options, `ap_export_presets` |
 | arbitrary script eval in-app | no `minic_eval` binding |
-| project metadata | no bindings |
+| project metadata | any build: `ap_project_metadata` (a sidecar JSON next to the `.arm`) |
+| find textures / materials / envmaps on disk | any build: `ap_resource_search` |
 
 Full list with reasons: `docs/MINIC_DIALECT_AND_API.md` §2.14.
 

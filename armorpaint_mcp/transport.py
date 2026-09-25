@@ -21,9 +21,10 @@ Everything in here exists because of one of four facts about the plugin side:
    an ``a_`` prefix so an argument named ``id`` or ``op`` cannot clobber the envelope.
    (See ``docs/MINIC_DIALECT_AND_API.md`` §2.9 and Appendix A, which corrects the nested
    ``"args": {...}`` shown in ``PROTOCOL.md`` §Envelopes.)
-4. **The plugin runs inline on the render thread**, one request per frame, with no threads
-   and no exceptions. So: small payloads, bulk data by path, and every argument validated
-   *here* before it can reach an unchecked binding over there.
+4. **The plugin runs inline on the render thread**, with no threads and no exceptions. It
+   opens one request per frame, and a ``batch`` request runs several of its items per frame
+   inside an arena budget (:func:`send_batch`). So: small payloads, bulk data by path, and
+   every argument validated *here* before it can reach an unchecked binding over there.
 
 Request envelope actually written::
 
@@ -44,8 +45,12 @@ file twice and see ``t`` change. A *decrease* means ArmorPaint restarted (still 
 While waiting for a reply we use a sharper signal than a bare timeout:
 
 * heartbeat file missing            -> the bridge was never started (fail immediately)
-* heartbeat frozen AND our request still on disk -> the plugin is not polling: disabled,
-  or its ``on_update`` is gated (fail immediately, with the reason)
+* heartbeat says ``"dozing": true`` -> the bridge let ArmorPaint sleep between requests (it
+  no longer holds the app awake at full frame rate). A sleeping app runs no plugin code, so
+  this server WAKES it with a synthetic 1-pixel pointer move before writing the request, and
+  again if the request is not picked up (``desktop_input.wake``).
+* heartbeat frozen AND our request still on disk, and not dozing -> the plugin is not
+  polling: a modal dialog, a hang, or a very long frame. Reported after ``STALL_LIMIT_S``.
 * heartbeat frozen BUT our request was consumed -> a long handler is blocking the render
   thread inline, which also freezes the heartbeat. This is expected; keep waiting.
 
@@ -88,7 +93,9 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 ENVELOPE_VERSION = "1"
-SUPPORTED_BRIDGE_MAJOR = 1
+# Bridge 2 polls the doorbell instead of listing req/; bridge 1 lists (and leaks a file
+# descriptor per listing on Linux/macOS) but still works with this server.
+SUPPORTED_BRIDGE_MAJORS = (1, 2)
 ARG_PREFIX = "a_"
 RESERVED_ENVELOPE_KEYS = frozenset({"v", "id", "op", "deadline_ms"})
 
@@ -97,6 +104,10 @@ REQ_DIR = "req"
 RES_DIR = "res"
 HEARTBEAT_FILE = "heartbeat.json"
 LOCK_FILE = "bridge.lock"
+# The id of the newest request (PROTOCOL.md "The doorbell"). The bridge polls this one
+# file instead of listing req/, because on Linux/macOS every directory listing inside
+# ArmorPaint leaks a file descriptor (Iron's POSIX close_dir() is empty).
+DOORBELL_FILE = "doorbell"
 
 # Poll cadence — PROTOCOL.md "Poll cadence": 5 ms for the first 200 ms, then 25 ms,
 # then 100 ms after 2 s.
@@ -114,6 +125,15 @@ MAX_TIMEOUT_S = 900.0
 # Liveness gates while waiting for a reply.
 LIVENESS_FIRST_CHECK_S = 1.0   # don't bother the filesystem before this
 LIVENESS_WINDOW_S = 2.5        # heartbeat is ~1 Hz, so this is >2 rewrites
+# How long a frozen heartbeat with our request still unread is tolerated before it is
+# reported. A single ArmorPaint frame can legitimately take seconds (a normal-map bake on a
+# software GPU measured ~3 s), so one frozen window is not proof of anything.
+STALL_LIMIT_S = 8.0
+WAKE_RETRY_S = 1.0
+# Re-ring the doorbell this often while our request is still unclaimed: two servers
+# ringing at once lose one ring (last write wins).
+RERING_S = 0.25
+WAKE_MAX_TRIES = 5
 HEARTBEAT_PROBE_TIMEOUT_S = 4.0
 HEARTBEAT_PROBE_POLL_S = 0.05
 
@@ -416,13 +436,13 @@ def _check_bridge_version(hb: dict[str, Any], spool: Path) -> None:
         major = int(head)
     except ValueError:
         return
-    if major != SUPPORTED_BRIDGE_MAJOR:
+    if major not in SUPPORTED_BRIDGE_MAJORS:
         raise BridgeVersionMismatch(
-            f"The ArmorPaint bridge reports version {ver}, but this server speaks wire "
-            f"protocol major {SUPPORTED_BRIDGE_MAJOR}. Update whichever half is older; "
-            f"they will not interoperate.",
+            f"The ArmorPaint bridge reports version {ver}, but this server speaks bridge "
+            f"majors {', '.join(map(str, SUPPORTED_BRIDGE_MAJORS))}. Update whichever half is "
+            f"older; they will not interoperate.",
             bridge_version=ver,
-            server_supports_major=SUPPORTED_BRIDGE_MAJOR,
+            server_supports_major=list(SUPPORTED_BRIDGE_MAJORS),
             spool=str(spool),
         )
 
@@ -451,6 +471,10 @@ def probe_liveness(
         )
     _check_bridge_version(first, root)
     t0 = _hb_t(first)
+    woke: dict[str, Any] | None = None
+    if _is_dozing(first):
+        # Asleep between requests by design; t only advances once it is awake again.
+        woke = wake_armorpaint(first)
 
     deadline = time.monotonic() + max(0.1, timeout_s)
     while time.monotonic() < deadline:
@@ -472,18 +496,47 @@ def probe_liveness(
                 "app_version": again.get("app_version"),
                 "project": again.get("project"),
                 "busy": again.get("busy"),
+                "dozing_before_probe": _is_dozing(first),
+                "wake": woke,
                 "spool": str(root),
             }
 
     raise BridgeNotResponding(
         f"{HEARTBEAT_FILE} exists in {root} but its 't' has not advanced in "
-        f"{timeout_s:.1f}s, so the plugin's on_update is not running. Likely causes: the "
-        f"bridge toggle is off (call ap_bridge_set_enabled, or flip it in the Plugins tab), "
-        f"ArmorPaint is showing a modal dialog, or the app is hung. A stale heartbeat also "
-        f"looks like this after a crash.",
+        f"{timeout_s:.1f}s, so the plugin's on_update is not running. Likely causes: "
+        f"ArmorPaint is dozing and could not be woken (see 'wake'; move the pointer over its "
+        f"window, or call ap_bridge_set_idle with linger -1 so it never dozes), a modal "
+        f"dialog is open, or the app is hung. A stale heartbeat also looks like this after "
+        f"a crash.",
         spool=str(root),
         heartbeat=first,
+        wake=woke,
     )
+
+
+def _is_dozing(hb: dict[str, Any] | None) -> bool:
+    """True when the bridge is not holding ArmorPaint awake (so the app may be asleep)."""
+    if not hb:
+        return False
+    return _as_bool(hb.get("dozing")) is True or _as_bool(hb.get("enabled")) is False
+
+
+def wake_armorpaint(hb: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Wake a dozing ArmorPaint. Never raises; the result says what happened."""
+    try:
+        try:
+            from .desktop_input import InputError, wake
+        except ImportError:
+            from desktop_input import InputError, wake  # type: ignore[no-redef]
+    except Exception as exc:  # pragma: no cover - import failure is environmental
+        return {"woke": False, "error": f"no input backend: {exc}"}
+    title = (hb or {}).get("app_title") or None
+    try:
+        return wake(title if isinstance(title, str) else None)
+    except InputError as exc:
+        return {"woke": False, "code": exc.code, "error": exc.message}
+    except Exception as exc:  # never let a wake attempt take a request down
+        return {"woke": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 # ---------------------------------------------------------------------------
@@ -583,10 +636,59 @@ def build_request(op: str, args: dict[str, Any] | None, rid: str, timeout_s: flo
             raise BadArgs(f"Argument {name!r} collides with the envelope.", arg=name)
         body[key] = encode_value(value, name)
 
+    return _serialise(body)
+
+
+# The plugin's json_sane() refuses a body larger than this.
+MAX_REQUEST_BYTES = 16384
+MAX_BATCH_ITEMS = 64
+
+
+def _serialise(body: dict[str, str]) -> bytes:
     # Compact separators are mandatory: the plugin detects a key by testing for ':'
     # immediately after the closing quote (iron_json.c:91).
-    text = json.dumps(body, separators=(",", ":"), ensure_ascii=True)
-    return text.encode("utf-8")
+    data = json.dumps(body, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    if len(data) > MAX_REQUEST_BYTES:
+        raise BadArgs(
+            f"The request is {len(data)} bytes; the bridge refuses bodies over "
+            f"{MAX_REQUEST_BYTES}. Split the batch, or pass bulk data by path."
+        )
+    return data
+
+
+def build_batch_request(
+    items: list[tuple[str, dict[str, Any]]], rid: str, timeout_s: float, stop_on_error: bool
+) -> bytes:
+    """Serialise an ordered batch into ONE flat request.
+
+    JSON arrays cannot cross this wire (they corrupt the plugin's parse), and nested objects
+    are flattened into one namespace, so item ``i`` is spelled out as ``b<i>_op`` plus
+    ``b<i>_a_<name>`` keys. The plugin runs the items in order, several per frame while its
+    per-frame script-call budget allows, and answers once with every item's result.
+    """
+    if not items:
+        raise BadArgs("A batch needs at least one step.")
+    if len(items) > MAX_BATCH_ITEMS:
+        raise BadArgs(f"A batch holds at most {MAX_BATCH_ITEMS} steps (got {len(items)}).")
+    body: dict[str, str] = {
+        "v": ENVELOPE_VERSION,
+        "id": rid,
+        "op": "batch",
+        "deadline_ms": str(int(timeout_s * 1000)),
+        ARG_PREFIX + "count": str(len(items)),
+        ARG_PREFIX + "stop_on_error": "true" if stop_on_error else "false",
+    }
+    for i, (op, args) in enumerate(items):
+        if not isinstance(op, str) or not _OP_RE.match(op) or op == "batch":
+            raise BadArgs(f"Step {i}: illegal op name {op!r}.", step=i)
+        body[f"b{i}_op"] = op
+        for name, value in (args or {}).items():
+            if value is None:
+                continue
+            if not isinstance(name, str) or not _ARG_RE.match(name):
+                raise BadArgs(f"Step {i}: illegal argument name {name!r}.", step=i, arg=name)
+            body[f"b{i}_{ARG_PREFIX}{name}"] = encode_value(value, name)
+    return _serialise(body)
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +706,18 @@ def _ensure_dirs(spool: Path) -> None:
             + _hint_where_to_point(),
             spool=str(spool),
         ) from exc
+
+
+def ring_doorbell(spool: Path, rid: str) -> None:
+    """Tell the bridge which request to open. Best effort: a failed ring is retried."""
+    bell = spool / DOORBELL_FILE
+    tmp = spool / f"{DOORBELL_FILE}.{os.getpid()}.tmp"
+    try:
+        tmp.write_bytes(rid.encode("ascii"))
+        os.replace(tmp, bell)
+    except OSError:
+        # Windows refuses to replace a file ArmorPaint has open at that instant.
+        _unlink(tmp)
 
 
 def _unlink(path: Path) -> None:
@@ -804,8 +918,12 @@ def _await_response(
     deadline = started + timeout_s
 
     hb_snapshot_t: float | None = None
+    frozen_since: float | None = None
     next_liveness_at = started + LIVENESS_FIRST_CHECK_S
     consumed = False
+    wakes: list[dict[str, Any]] = []
+    next_wake_at = started + WAKE_RETRY_S
+    next_ring_at = started + RERING_S
 
     while True:
         envelope = _read_committed_response(res_dir, rid)
@@ -817,6 +935,13 @@ def _await_response(
         now = time.monotonic()
         if now >= deadline:
             break
+
+        if not consumed and now >= next_ring_at:
+            next_ring_at = now + RERING_S
+            if req_path.exists():
+                ring_doorbell(spool, rid)
+            else:
+                consumed = True
 
         if now >= next_liveness_at:
             if not consumed:
@@ -831,24 +956,40 @@ def _await_response(
                     op=op,
                 )
             t = _hb_t(hb)
-            if hb_snapshot_t is None or t is None:
-                hb_snapshot_t = t
-            elif t == hb_snapshot_t and not consumed:
-                # Heartbeat frozen AND the request was never picked up: the plugin is not
-                # polling. Fail now instead of burning the whole timeout.
+            if consumed:
+                frozen_since = None
+            elif hb_snapshot_t is not None and t is not None and t == hb_snapshot_t:
+                frozen_since = frozen_since or now
+            else:
+                frozen_since = None
+            hb_snapshot_t = t
+            if not consumed and _is_dozing(hb) and now >= next_wake_at and len(wakes) < WAKE_MAX_TRIES:
+                # The plugin dozed (possibly between our heartbeat read and the write):
+                # nudge the app awake so it can see the request.
+                wakes.append(wake_armorpaint(hb))
+                next_wake_at = now + WAKE_RETRY_S
+            if frozen_since is not None and now - frozen_since >= STALL_LIMIT_S:
+                # Heartbeat frozen for a long time AND the request was never picked up:
+                # the plugin is not polling. Fail now instead of burning the whole timeout.
                 _unlink(req_path)
+                dozing = _is_dozing(hb)
                 raise BridgeNotResponding(
                     f"'{op}' was never picked up: req/{rid}.json is still on disk and the "
-                    f"heartbeat has not advanced in {LIVENESS_WINDOW_S:.1f}s. The bridge is "
-                    f"enabled but idle, disabled, or ArmorPaint is blocked on a modal "
-                    f"dialog. Try ap_bridge_status, then ap_bridge_set_enabled(true).",
+                    f"heartbeat has not advanced in {now - frozen_since:.1f}s. "
+                    + (
+                        "The bridge was dozing and waking ArmorPaint did not work (see "
+                        "'wake'): move the pointer over its window, or call "
+                        "ap_bridge_set_idle(linger=-1) so it never dozes."
+                        if dozing
+                        else "ArmorPaint is blocked on a modal dialog, hung, or stuck in "
+                        "a very long frame. Try ap_bridge_status."
+                    ),
                     spool=str(spool),
                     op=op,
                     heartbeat=hb,
+                    wake=wakes or None,
                 )
-            else:
-                hb_snapshot_t = t
-            next_liveness_at = now + LIVENESS_WINDOW_S
+            next_liveness_at = now + (WAKE_RETRY_S if (not consumed and _is_dozing(hb)) else LIVENESS_WINDOW_S)
 
         time.sleep(min(_poll_interval(now - started), max(0.0, deadline - now)))
 
@@ -872,8 +1013,10 @@ def _await_response(
         )
     else:
         detail = (
-            "The request was never picked up. The bridge is not polling req/: check that "
-            "the plugin is enabled in the Plugins tab."
+            "The request was never picked up. The bridge is not polling: check that the "
+            "plugin is enabled in the Plugins tab. If ArmorPaint's window has gone grey and "
+            "unresponsive, see ap_bridge_status (an old bridge on Linux/macOS runs out of "
+            "file descriptors)."
         )
     raise RequestTimeout(
         f"'{op}' did not answer within {timeout_s:.1f}s. {detail}",
@@ -897,10 +1040,39 @@ def send_to_armorpaint(
     :class:`BridgeError` subclass on every failure path; ``BridgeError.to_dict()`` is the
     payload an MCP tool should hand back.
     """
-    global _swept
-
     timeout = DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
     timeout = max(MIN_TIMEOUT_S, min(MAX_TIMEOUT_S, timeout))
+    rid = mint_id()
+    payload = build_request(op, args, rid, timeout)
+    result = _send_payload(op, rid, payload, timeout)
+    if follow_pending:
+        result = _follow_pending(result, op, _last_spool or spool_dir(), timeout)
+    return result
+
+
+def send_batch(
+    items: list[tuple[str, dict[str, Any]]],
+    timeout_s: float | None = None,
+    stop_on_error: bool = False,
+) -> dict[str, Any]:
+    """Run an ordered list of ``(op, wire_args)`` as ONE request.
+
+    Returns ``{"count", "executed", "errors", "frames", "stopped_early", "results": [...]}``
+    where each result is ``{"i", "op", "ok", "result"|"error"}``. A failed step does not
+    raise; set ``stop_on_error`` to skip the steps after it.
+    """
+    timeout = DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
+    timeout = max(MIN_TIMEOUT_S, min(MAX_TIMEOUT_S, timeout))
+    rid = mint_id()
+    payload = build_batch_request(items, rid, timeout, stop_on_error)
+    return _send_payload("batch", rid, payload, timeout)
+
+
+_last_spool: Path | None = None
+
+
+def _send_payload(op: str, rid: str, payload: bytes, timeout: float) -> dict[str, Any]:
+    global _swept, _last_spool
 
     res = spool_resolution()
     spool = res.path
@@ -925,15 +1097,17 @@ def send_to_armorpaint(
             resolution_trace=res.trace if res.is_fallback else None,
         )
     _check_bridge_version(hb, spool)
+    if _is_dozing(hb):
+        # Asleep between requests (see the module docstring). Wake it first so the
+        # request is seen on the next frame rather than after a retry.
+        wake_armorpaint(hb)
 
     _ensure_dirs(spool)
     if not _swept:
         _swept = True
         sweep_orphans(spool)
 
-    rid = mint_id()
-    payload = build_request(op, args, rid, timeout)
-
+    _last_spool = spool
     req_dir = spool / REQ_DIR
     tmp_path = req_dir / f"{rid}.json.tmp"
     final_path = req_dir / f"{rid}.json"
@@ -945,13 +1119,10 @@ def send_to_armorpaint(
         raise SpoolNotFound(
             f"Could not write the request into {req_dir}: {exc}", spool=str(spool)
         ) from exc
+    ring_doorbell(spool, rid)  # after the request, so a ring never names a missing file
 
     envelope = _await_response(spool, rid, op, timeout)
-    result = _interpret(envelope, op, rid)
-
-    if follow_pending:
-        result = _follow_pending(result, op, spool, timeout)
-    return result
+    return _interpret(envelope, op, rid)
 
 
 def _follow_pending(
@@ -1027,7 +1198,7 @@ def bridge_diagnostics(probe: bool = True) -> dict[str, Any]:
     out["res_dir_exists"] = (spool / RES_DIR).is_dir()
     out["bridge_lock_present"] = (spool / LOCK_FILE).is_file()
     out["server_wire_version"] = ENVELOPE_VERSION
-    out["server_supports_bridge_major"] = SUPPORTED_BRIDGE_MAJOR
+    out["server_supports_bridge_major"] = list(SUPPORTED_BRIDGE_MAJORS)
 
     try:
         out["pending_requests"] = len(list((spool / REQ_DIR).glob("*.json")))
@@ -1037,6 +1208,17 @@ def bridge_diagnostics(probe: bool = True) -> dict[str, Any]:
 
     hb = read_heartbeat(spool)
     out["heartbeat"] = hb
+    try:
+        try:
+            from .desktop_input import supported as _input_backend
+        except ImportError:
+            from desktop_input import supported as _input_backend  # type: ignore[no-redef]
+
+        out["wake_backend"] = _input_backend()
+    except Exception:
+        out["wake_backend"] = None
+    if hb is not None:
+        out["dozing"] = _is_dozing(hb)
     if hb is None:
         out["alive"] = False
         out["diagnosis"] = (
@@ -1055,8 +1237,20 @@ def bridge_diagnostics(probe: bool = True) -> dict[str, Any]:
         out["liveness"] = probe_liveness(spool)
         out["alive"] = True
         out["diagnosis"] = "Bridge is alive: heartbeat 't' advanced between two reads."
+        if out["liveness"].get("dozing_before_probe"):
+            out["diagnosis"] += (
+                " It was dozing (letting ArmorPaint sleep between requests) and was woken "
+                "for the probe; that is normal."
+            )
         if out["liveness"].get("restarted"):
             out["diagnosis"] += " (t decreased — ArmorPaint restarted.)"
+        if str(hb.get("bridge_version", "")).startswith("1.") and sys.platform != "win32":
+            out["warning"] = (
+                f"Bridge {hb.get('bridge_version')} polls by listing req/, and on Linux/macOS "
+                "each listing leaks a file descriptor inside ArmorPaint; launched from the "
+                "desktop (1024-fd limit) it hangs after about a minute of activity. Update "
+                "armorpaint_mcp_bridge.c in ArmorPaint's plugins folder to bridge 2."
+            )
     except BridgeError as exc:
         out["alive"] = False
         out["diagnosis"] = exc.message
