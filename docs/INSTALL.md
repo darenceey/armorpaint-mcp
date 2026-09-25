@@ -20,7 +20,7 @@ is untested.
 - **Python 3.11 or newer** — `python --version`. (`pyproject.toml` sets `requires-python = ">=3.11"`; pip refuses to install on 3.10.)
 - **An MCP client** that launches stdio servers (Claude Code, Claude Desktop, …).
 
-No compiler is required. The optional viewport patch (step 8) is the only part that needs one.
+No compiler is required. The optional native extension (step 8) is the only part that needs one.
 
 ## 1. Find ArmorPaint's `data` directory
 
@@ -231,30 +231,39 @@ No `env` block is needed when step 6's discovery finds your install. Add one onl
 Note the doubled backslashes — these are JSON strings. Forward slashes work too and are less
 error-prone. Restart your MCP client afterwards so it picks up the new server.
 
-## 8. Optional: viewport capture (needs a self-built ArmorPaint)
+## 8. Optional: the native extension (needs a self-built ArmorPaint)
 
-Skip this unless you specifically want the agent to see the shaded 3D viewport. Everything else
-works without it, and exported textures — which do reach disk — cover most of what an agent needs
-to check its own work.
+Skip this unless you want the agent to manage **layers**, use **exact undo/redo**, choose the
+**export format, bit depth and preset**, run **bakes**, change **render settings** (tone, LUT),
+resize the texture set, read **live project lists** or the **console**, or move the **camera**.
+Everything else — including window capture, UI automation, keyboard undo/redo, batching and
+resource search — works on the official binary.
 
-ArmorPaint's plugin API can capture the viewport to a GPU texture but has no binding that writes
-those pixels to a file. The patch adds one (three hunks, twelve lines, wrapping a function that
-already exists upstream):
+ArmorPaint implements all of that already; the plugin API just has no binding for it. The patch
+adds exactly one (`mcp_ext_call`), implemented in `patch/mcp_ext.c`:
 
 ```powershell
-python C:\src\armorpaint-mcp\patch\apply_viewport_patch.py E:\path\to\armorpaint
-# then rebuild, per upstream's readme:
-cd E:\path\to\armorpaint\paint
+git clone https://github.com/armory3d/armorpaint E:\src\armorpaint
+cd E:\src\armorpaint
+git checkout 906418acc600132fa927876d208eb452dc5a0967     # ArmorPaint 1.0
+python C:\src\armorpaint-mcp\patch\apply_ext_patch.py E:\src\armorpaint
+# then build, per upstream's readme:
+cd paint
 ..\base\make
-MSBuild build\ArmorPaint.vcxproj -p:Configuration=Release -p:Platform=x64 -p:LLVMInstallDir="C:\Program Files\LLVM"
+# open build\ArmorPaint.sln in Visual Studio (with clang tools) and build Release x64
 ```
 
-`--revert` undoes it. The script refuses to patch rather than guess if upstream has moved the
-function it anchors on. Full rationale, the exact diff, and the licence position:
-[UPSTREAM_CHANGES.md](UPSTREAM_CHANGES.md).
+`--revert` undoes it. Keep using the same plugin file: the bridge detects the extension by itself,
+and `ap_get_app_info` then reports `ext_state: 1`. Full rationale, the exact changes, and the
+licence position: [UPSTREAM_CHANGES.md](UPSTREAM_CHANGES.md).
 
-On a stock binary, `ap_capture_viewport` reports `unsupported` and names the missing
-binding. It never silently does nothing.
+The extension also writes viewport captures to a file, so it replaces the older, smaller
+**viewport patch** (`patch/apply_viewport_patch.py`), which is only worth applying on its own if
+you want nothing else. Builds from after 2026-09-09 have that binding upstream; either way the
+bridge detects it — there is no longer a `HAVE_VIEWPORT_PATCH` flag to set.
+
+On a build without the extension, its tools report `unsupported` with a hint. They never silently
+do nothing.
 
 ## 9. Smoke test
 
@@ -283,6 +292,8 @@ Get-Content "C:\ArmorPaint\data\mcp_spool\heartbeat.json"
 Get-ChildItem "C:\ArmorPaint\data\mcp_spool\req","C:\ArmorPaint\data\mcp_spool\res"
 ```
 
-A heartbeat whose `t` is frozen means the plugin loaded but is not being ticked: the bridge is
-disabled, or ArmorPaint is not running. (`t` is seconds since app start, not wall-clock time, so its
-absolute value means nothing — only that it advances.)
+A heartbeat whose `t` is frozen is **normal when it also says `"dozing": true`**: the bridge lets
+ArmorPaint sleep between requests and the server wakes it on demand. With `"dozing": false` a frozen
+`t` means the plugin loaded but is not being ticked: a modal dialog, a hang, or ArmorPaint is not
+running. (`t` is seconds since app start, not wall-clock time, so its absolute value means nothing
+— only that it advances.)

@@ -122,7 +122,8 @@ base-colour texture, where they are laid out flat.
 in  0 Strength 1.0 [0..2] | 1 Radius 1.0 [0..2] | 2 Offset 0.0 [-2..2]
 out 0 Value VALUE
 ```
-The general bake tool is unreachable (no bake-run binding), but this node is different: the node
+On a stock build the general bake tool is unreachable (no bake-run binding; with the native
+extension, `ap_bake` drives a `TEX_BAKE` node), but this node is different: the node
 sampled by the shader is a **node preview**, and `script_material_update()` re-bakes it. The update
 path calls `make_material_parse_paint_material(true)`, which walks the canvas and, for every
 `BAKE_CURVATURE` node, switches to the bake tool, runs a curvature bake into an R8 preview target,

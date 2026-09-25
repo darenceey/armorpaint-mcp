@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "armorpaint-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "MCP server that drives ArmorPaint 1.0 through a minic bridge plugin over a file mailbox."
 requires-python = ">=3.11"
 dependencies = [

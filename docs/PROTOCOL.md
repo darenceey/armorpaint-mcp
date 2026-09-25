@@ -37,6 +37,7 @@ pathological case of a truncated write that still returned.
                              Linux ~/.local/share/armorpaint-mcp/spool;
                              macOS ~/Library/Application Support/armorpaint-mcp/spool
   req/<id>.json              server → plugin   (written via os.replace)
+  doorbell                   server → plugin   (the newest request's id; written via os.replace)
   res/<id>.json              plugin → server   (body)
   res/<id>.done              plugin → server   (commit marker; see below)
   heartbeat.json             plugin → server   (liveness, rewritten ~1 Hz)
@@ -90,7 +91,7 @@ parsing garbage.
 
 **Heartbeat** — `heartbeat.json`, rewritten roughly once per second:
 ```json
-{ "v": 1, "pid_hint": "armorpaint", "bridge_version": "1.0.0", "app_version": "1.0",
+{ "v": 1, "pid_hint": "armorpaint", "bridge_version": "2.0.0", "app_version": "1.0",
   "t": 1234.567, "project": "C:/work/goblin.arm", "busy": false }
 ```
 `t` is `sys_time()` seconds since app start — **monotonic within a run, not wall clock.** Liveness is
@@ -99,10 +100,13 @@ judged by `t` *advancing* between two reads, never by comparing it to the system
 ## Server algorithm
 
 1. Mint `id`. Write `req/<id>.json` to `req/<id>.json.tmp`, then `os.replace()` onto the final name.
-2. Poll for `res/<id>.done` (see cadence below). On appearance: read `.done` → expected length; read
-   `res/<id>.json`; verify length; parse.
-3. Delete `res/<id>.json` and `res/<id>.done`. (The plugin already deleted the request.)
-4. On timeout, delete `req/<id>.json` best-effort and return a transport error naming the op.
+2. **Ring the doorbell:** write `<id>` (ASCII, no newline) to a temp file and `os.replace()` it onto
+   `doorbell`. Always *after* step 1, so a ring never names a missing file.
+3. Poll for `res/<id>.done` (see cadence below). On appearance: read `.done` → expected length; read
+   `res/<id>.json`; verify length; parse. While `req/<id>.json` still exists, ring again every
+   250 ms: two servers ringing at once lose one ring (last write wins), and the re-ring recovers it.
+4. Delete `res/<id>.json` and `res/<id>.done`. (The plugin already deleted the request.)
+5. On timeout, delete `req/<id>.json` best-effort and return a transport error naming the op.
 
 **Poll cadence:** 5 ms for the first 200 ms, then 25 ms, then 100 ms after 2 s. Most ops answer in
 one or two frames; bakes and exports take seconds. This keeps latency low without spinning.
@@ -111,13 +115,13 @@ one or two frames; bakes and exports take seconds. This keeps latency low withou
 
 ```
 on_update():
-    if not enabled: return          # the ONLY statement allowed above the next line
-    iron_delay_idle_sleep()         # MUST be next — see "The idle gate"
+    if awake: iron_delay_idle_sleep()   # before any early return — see "The idle gate"
     accumulate sys_real_delta(); return early unless >= poll_interval
 
-    name = FIRST ".json" in file_read_directory(spool + "/req")   # exactly ONE per frame
-    if name is None: return
-    id = name without ".json"
+    if not iron_file_exists(spool + "/doorbell"): return     # never list req/ — see below
+    id = contents of doorbell; data_delete_blob; iron_delete_file(doorbell)
+    name = id + ".json"
+    if not iron_file_exists(spool + "/req/" + name): return  # answered already, or abandoned
     if not id_is_safe(id): delete and return    # it becomes a reply filename
 
     path = spool + "/req/" + name
@@ -132,7 +136,10 @@ on_update():
     iron_file_save_bytes(res + "/" + id + ".done", length_of(reply), 0)   # commit
 ```
 
-Five things in there are load-bearing and easy to get wrong:
+Six things in there are load-bearing and easy to get wrong:
+
+- **Never list `req/` to poll.** See *The doorbell*: on Linux and macOS every directory listing
+  leaks a file descriptor, and a bridge that polls by listing hangs ArmorPaint within a minute.
 
 - **`data_delete_blob` is mandatory.** `data_get_blob` memoises by path in `data_cached_blobs`
   (`base/sources/engine.c:1879`) with no expiry. Omit the eviction and the bridge appears to work
@@ -141,16 +148,97 @@ Five things in there are load-bearing and easy to get wrong:
   would be re-executed on restart — replaying a destructive op into the user's project.
 - **The `.done` marker is written last, as a separate call.** Writing it in the same buffer, or
   first, defeats the whole commit scheme.
-- **Exactly one request per frame.** This is a memory-safety rule, not only a latency one: minic
+- **Budget script calls per frame.** This is a memory-safety rule, not only a latency one: minic
   charges ~29 KB of its 8 MB context arena per script function call and rewinds it only at the
   `on_update` boundary, giving roughly 280 calls per frame, and `minic_alloc` has no bounds check
-  (`minic.c:287`). Draining a backlog in one frame overflows the arena and corrupts the heap.
+  (`minic.c:287`). Draining an arbitrary backlog in one frame overflows the arena and corrupts the
+  heap. The bridge therefore opens **one request per frame**, and a `batch` request (below) runs
+  further items in the same frame only while its call counter stays under a budget sized from
+  measurement: a plain request peaks at ~650–800 KB, a batch frame at ~1.5 MB.
 - **Screen the body before parsing it.** `jsmn_parse` returns a *negative* token count for
   malformed input and `load_tokens` (`iron_json.c:270`) passes that straight into
   `malloc(sizeof(jsmntok_t) * count)` — `NULL` for a negative size — and then writes through it.
   An empty file, a torn write, or any stray `.json` dropped into `req/` takes ArmorPaint down
   mid-paint. The host exposes no validity check, so the plugin does a bracket/quote balance scan
   itself and rejects arrays outright.
+
+## The doorbell
+
+Why the bridge learns request ids from a file instead of listing `req/`: **on Linux and macOS,
+every directory listing inside ArmorPaint 1.0 leaks a file descriptor.** `iron_read_directory` and
+`file_read_directory` both go through `open_dir` / `close_dir` in `base/sources/kong/dir.c`, and
+the POSIX `close_dir` is an empty function — the `DIR *` from `opendir()` is never closed, so its
+descriptor and its buffer live until the process exits. (The Windows branch calls `FindClose` and
+does not leak.)
+
+Bridge 1.x polled by listing `req/` — up to 60 times a second during a conversation, 20 while
+lingering. MEASURED on ArmorPaint 1.0 (Arch package) under KDE Plasma 6 / XWayland / RADV,
+launched from the desktop, where a systemd user unit gives it a soft limit of **1024** descriptors:
+after ~32 s of activity the process held 1022 descriptors, 1006 of them on `req/`, and its main
+thread hung for good inside `gpu_present` — the Vulkan driver could no longer get a sync-file
+descriptor. No error anywhere: the window goes grey and stops answering. Launched from a terminal
+with a high limit, the same leak runs for hours before it bites, which is how it went unnoticed.
+
+Bridge 2 therefore polls one known file with `iron_file_exists` (an `fopen` + `fclose`, no leak).
+The cost of an idle poll is one failed `fopen`. What still lists directories, one descriptor per
+listing: the stale-request drain at plugin load, `fs_list`, and exports (which list the target
+directory to report the files they added). A long session of exports therefore still leaks slowly;
+`tests/test_live.py::test_polling_does_not_leak_file_descriptors` guards the polling path.
+
+The real fix is upstream: `close_dir` should call `closedir(dir->handle)`.
+
+## Batches
+
+One request can carry an ordered list of ops. Arrays cannot cross this wire, so item `i` is
+spelled out with prefixed keys:
+
+```json
+{"v":"1","id":"7-3","op":"batch","deadline_ms":"90000","a_count":"3","a_stop_on_error":"false",
+ "b0_op":"select_tool","b0_a_tool":"2","b1_op":"fill_layer","b2_op":"node_list"}
+```
+
+The plugin runs the items **in order**, reading item arguments as `b<i>_a_<name>` (never falling
+back to envelope-level keys), and answers once:
+
+```json
+{"v":1,"id":"7-3","ok":true,"result":{"count":3,"executed":3,"errors":0,"frames":2,
+ "stopped_early":false,"results":[{"i":0,"op":"select_tool","ok":true,"result":{...}}, ...]}}
+```
+
+Scheduling (`step_job` in the plugin): light items share a frame while the frame has used fewer
+than `CALL_BUDGET` script calls and less than 8 ms; GPU-heavy items (strokes, fills, layer ops,
+undo, captures) start a frame of their own; **heavy** items — exports, saves, opens, imports,
+bakes — also wait until no mouse button is held in the app, so they never stall the render thread
+in the middle of a stroke. A fill that schedules its next-frame refill ends the frame too.
+Nothing new is read from `req/` until the open request's reply is committed. A batch holds at most
+64 items and, like every request, at most 16 KB.
+
+## Dozing and waking
+
+The bridge no longer holds ArmorPaint awake for as long as it is enabled. It calls
+`iron_delay_idle_sleep()` only while there is a reason to: an open request, a pending refill, or
+less than `linger` seconds (default 10; `bridge_set_idle`) since the last request. Otherwise it
+lets the idle gate below put the app to sleep, and writes `"dozing": true` into the heartbeat.
+
+A sleeping app runs no `on_update`, so the **server** wakes it: before writing a request to a
+dozing bridge, and again every second while such a request sits unread, it sends ArmorPaint's
+window a synthetic pointer move — two, one pixel apart, ending where the real pointer already is,
+because Iron ignores a move with a zero delta and has no delta for the first move it sees. Any
+input event zeroes `paused_frames` (`iron.h` `_mouse_move` et al.), so the app runs ~120 frames,
+the bridge sees the request, and holds itself awake again for `linger`. Delivery is `XSendEvent`
+to the window on X11 (empty event mask: delivered to the creating client, no focus change),
+`PostMessageW` on Windows, `CGEventPostToPid` on macOS. Measured on Linux: asleep at frame 120,
+wiggle, frames resume; a ping to a dozing bridge answers in ~40 ms.
+
+A disabled bridge (`bridge_set_enabled false`) is simply a bridge that never holds the app awake
+and refuses every op except `bridge_set_enabled` and `ping` with `bridge_disabled`; since the
+server wakes it like any dozing bridge, it can be re-enabled remotely.
+
+Heartbeat fields added for this: `dozing` (bool), `linger` (s), `job_open` (a request is being
+worked on), `job_held` (a heavy item is waiting for the mouse to be released), `ext` (-1 unknown,
+0 absent, 1 native extension present). The server treats a frozen `t` as a fault only when the
+bridge is not dozing, the request is still unread, and the freeze has lasted `STALL_LIMIT_S`
+(8 s) — a single frame can legitimately take seconds.
 
 ## The idle gate
 
@@ -164,11 +252,10 @@ Five things in there are load-bearing and easy to get wrong:
 **Both are sticky**: once tripped, `on_update` no longer runs, so it cannot un-trip them. A polling
 bridge would go deaf precisely when an agent drives an unfocused app.
 
-`iron_delay_idle_sleep()` resets the idle counter, which is why it must be the **first statement**
-of `on_update` — upstream's own `make_tilesheet.c` uses exactly this pattern. **The cost is real:**
-ArmorPaint renders at full rate whenever the bridge is enabled. The bridge therefore ships with a
-visible enable/disable toggle, and the server's `bridge_set_enabled` tool flips it, so the user can
-stop paying that cost when no agent is working.
+`iron_delay_idle_sleep()` resets the idle counter; while the bridge wants the app awake it must be
+reached before any early return in `on_update` — upstream's own `make_tilesheet.c` uses exactly
+this pattern. **The cost is real:** an app held awake renders at full rate, which is why the
+bridge only holds it awake around requests and otherwise lets it sleep (see *Dozing and waking*).
 
 **Resolved — it defeats both.** The background gate is *not* a separate counter. `iron.h:215`
 increments the single `paused_frames` in each gate and `iron_delay_idle_sleep()` is one line,
@@ -188,7 +275,8 @@ that must stay awake is not.)
 minic exposes no threads. **Every handler runs inline on the render thread inside `on_update`**, so
 a slow handler is a visible hitch in the user's painting. Consequences baked into the design:
 
-- The plugin handles **at most one request per frame** — no batching a backlog into one frame.
+- The plugin opens **at most one request per frame**; a `batch` request runs several items per
+  frame within the call budget (see *Batches*), and heavy items wait for the mouse to be released.
 - Long ops (bake, export) *may* return `{"ok": true, "result": {"status": "pending", "token": …}}`
   immediately, and the server then polls with a `job_status` op. **The current bridge never emits
   this shape** — every op it implements completes inline, and export/save simply block for their
@@ -200,7 +288,9 @@ a slow handler is a visible hitch in the user's painting. Consequences baked int
 
 ## Error codes
 
-`no_project` · `bad_args` · `not_found` · `unsupported` · `app_busy` · `internal`.
+`no_project` · `bad_args` · `not_found` · `unsupported` · `app_busy` · `internal` ·
+`bridge_disabled`. Ops served by the optional native extension answer `unsupported` on a build
+without it.
 Anything the plugin cannot do is `unsupported` with a message naming the missing binding — never a
 silent no-op, and never a crash. minic has no exceptions and unchecked pointer deref, so **the
 dispatcher validates every argument before touching a binding**; one bad request must not take down
@@ -211,7 +301,9 @@ the user's session.
 This protocol carries names; it does not define them. **The names are
 `armorpaint_mcp/server.py`'s tool surface**: an `op` is an `ap_*` tool with the `ap_` prefix
 stripped, and the argument names are exactly what that tool's `_build_wire_args()` branch emits.
-`plugin/armorpaint_mcp_bridge.c` has one `else if` arm per op reading exactly those keys.
+`plugin/armorpaint_mcp_bridge.c` has one `else if` arm per op reading exactly those keys; ops it
+does not know go to the native extension (`patch/mcp_ext.c`) when the build has it. The pairing is
+checked by `tests/test_offline.py::test_every_bridge_tool_maps_to_a_handled_op`.
 
 Treat that pairing as part of the contract, because **neither kind of drift fails loudly**:
 
@@ -227,5 +319,10 @@ defined.
 
 ## Versioning
 
-`v` is the envelope version. The server refuses a bridge whose `bridge_version` major differs from
-its own and says so plainly, rather than failing later in a confusing way.
+`v` is the envelope version. The server refuses a bridge whose `bridge_version` major it does not
+support and says so plainly (`bridge_version_mismatch`), rather than failing later in a confusing way.
+
+| Bridge major | Poll mechanism | Server that speaks it |
+|---|---|---|
+| 1 | lists `req/` (leaks a descriptor per listing on Linux/macOS) | 1.x, and the current server — which also warns in `ap_bridge_status` |
+| 2 | the doorbell | the current server only. An older server never rings, so it would time out silently; the major bump makes it refuse the bridge instead |

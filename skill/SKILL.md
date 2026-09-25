@@ -24,38 +24,42 @@ Use it for:
 - exporting a texture set and validating the channel packing
 - Unity / HDRP handoff (`BaseColor` / `MaskMap` / `Normal`)
 - diagnosing "my export looks wrong", "nothing happened", "the bridge went deaf"
-- deciding what is impossible in ArmorPaint and must be asked of the human or done elsewhere
+- layer-stack construction, masks, bakes, export settings — **when the build carries the native
+  extension** (`ap_get_app_info` → `ext_state: 1`); otherwise see "The layer wall"
+- deciding what is out of reach in this session and must be asked of the human or done elsewhere
 
 Do not use it as the primary workflow for:
-- layer-stack construction, masks, groups, blend modes, layer opacity — **no bindings exist**, this is
-  human work in the UI (see "The layer wall")
-- baking mesh maps (AO, curvature, thickness) — no bake-run binding
 - modelling, UVs, or silhouette work — that is Blender's job
-- anything needing a shaded 3D view as the deliverable, on a stock build
 
 ## What Makes ArmorPaint Different (read before your first call)
 
 Six facts shape every decision. All are verified against `paint/sources/minic_api_list.h`
 (529 active bindings) and the interpreter in `base/sources/libs/minic.c`.
 
-1. **The tool surface is closed.** A plugin can only call those 529 bindings, and the MCP tools are a
-   thin, checked wrapper over them. If a capability is not in the tool list, it does not exist —
-   `docs/MINIC_DIALECT_AND_API.md` §2.14 records what was excluded and exactly why. Do not invent
+1. **The tool surface is closed, and it depends on the build.** A stock plugin can only call those
+   529 bindings. A build carrying the native extension (`patch/apply_ext_patch.py`) adds layers,
+   exact undo/redo, export format, bakes, render settings, live lists, camera views and console
+   read-back — `ap_get_app_info` → `ext_state: 1`. On a stock build those tools answer
+   `unsupported` with a hint. Check once per session and say which mode you are in. Do not invent
    tool names, and do not promise the user a capability you have not found in the server's own list.
-2. **There is no layer API.** One layer operation exists in the whole binding table:
-   fill the selected layer. Layers are the human's.
-3. **There is no undo binding.** Nothing you do can be revoked by you. The human's Ctrl+Z still
-   works, but you cannot drive it, and you cannot count on it after a fill.
-4. **You are blind by default.** On a stock build there is no plugin path from the GPU to an image
-   file for the viewport. Your only real eyes are the PNGs that `export_texture_run` writes to disk.
-   On **Linux**, `ap_capture_window` screenshots ArmorPaint's window from the server side on any
-   build and hands it back as an image (covered windows are fine, minimised ones are not). On a
-   **patched** build `ap_capture_viewport` gives you the shaded 3D view as a file. Either changes the
-   workflow substantially — try `ap_capture_window` once at the start, check `ap_get_app_info` →
-   `viewport_patch`, and say which mode you are in, rather than assuming.
-5. **You are a guest on the render thread.** Every handler runs inline in `on_update`, at most one
-   request per frame, and the bridge holds the app awake at full frame rate to stay reachable. A slow
-   op is a visible hitch in someone's brush stroke.
+2. **Layers: `ap_layer_*` with the extension; otherwise the human's.** With it you can list, create
+   (paint/fill/decal/group/masks), select, rename, reorder, set opacity/blending/visibility, merge,
+   clear and delete layers, each with the same undo step the Layers panel pushes. Without it the
+   only layer operation is "fill the selected layer".
+3. **Undo is yours too.** `ap_undo` / `ap_redo` are exact with the extension (and `ap_history`
+   shows what they will revert); on a stock build they press the app's own `ctrl+z` /
+   `ctrl+shift+z` via synthetic input — it works, but you cannot read back what was undone, so look
+   (`ap_capture_window`) afterwards. Still announce destructive steps: undo depth is finite
+   (`undo_steps` in `ap_get_config`).
+4. **You can see.** `ap_capture_window` screenshots ArmorPaint's window from the server side on any
+   build (covered windows are fine, minimised ones are not; on macOS it needs Screen Recording
+   permission). `ap_capture_viewport` gives the shaded 3D view alone when the build has
+   `viewport_save_texture_to_file` or the extension — the bridge detects either by itself. With the
+   extension, `ap_camera` turns the model to any preset view between captures.
+5. **You are a guest on the render thread.** Every handler runs inline in `on_update`. The bridge
+   lets ArmorPaint sleep between requests and the server wakes it when you call a tool, so an idle
+   agent costs nothing. Heavy ops (exports, saves, bakes) wait until the human releases the mouse
+   button. Group small edits with `ap_batch` — several run per frame.
 6. **Recompiling a material is not rendering it.** `ap_material_update` makes a graph edit take
    effect *as a paint source*; the viewport keeps showing the layer stack. Measured: captures before
    and after a colour change plus `ap_material_update` come back **byte-identical**. Nothing you do
@@ -94,7 +98,12 @@ Follow this order unless the task is clearly narrower.
 1. **Confirm the bridge is alive**
    - `ap_ping` — is the heartbeat's `t` advancing between two reads? (It is app-uptime seconds, not
      wall clock; never compare it to the system clock.)
-   - if it is dead: `ap_bridge_set_enabled true`, and check the plugin is loaded at all
+   - if it is dead: `ap_bridge_status` (it wakes a dozing app and says what it found), then
+     `ap_bridge_set_enabled true`, and check the plugin is loaded at all
+   - `bridge_version_mismatch` means the plugin and the server are from different releases: tell
+     the human to update the older half and restart the MCP client. A `warning` from
+     `ap_bridge_status` about bridge 1.x on Linux/macOS means ArmorPaint will freeze (grey window)
+     after a minute or so of activity: ask them to update the plugin before you do real work
 2. **Read the session**
    - `ap_get_app_info` — window title carries the **dirty marker** (see etiquette)
    - `ap_project_get_info` — filepath (`""` means never saved), basepath, envmap, fov
@@ -103,7 +112,8 @@ Follow this order unless the task is clearly narrower.
 3. **Classify the request**
    - additive (new material, new nodes, export to a new dir) — proceed
    - destructive (fill, new/open project, delete) — announce, and ask if the project is dirty
-   - impossible (layers, masks, bakes, per-set resolution) — say so now and offer the human-side step
+   - needs the extension (layers, masks, bakes, per-set resolution) — on a stock build say so now and
+     offer the human-side step, or drive the UI with `ap_ui_click` / `ap_ui_key` after looking
 4. **Set up the material**
    - `ap_material_create` a named material rather than mutating theirs
    - build the graph: `ap_node_add` → `ap_node_set_value` → `ap_node_connect` → **`_update`**
@@ -166,13 +176,11 @@ or as noise?" Do not ask "does it look good".
 **Level 0 — check which of these you actually need.** On Linux, `ap_capture_window` returns the
 whole ArmorPaint window (viewport plus UI) on any build; capture once, read off the viewport
 rectangle and pass it as `crop` from then on. That also collapses Levels 3–5 into "look at the
-render". Elsewhere: `ap_get_app_info` reports `viewport_patch`.
-When it is `true` (`docs/UPSTREAM_CHANGES.md`, source builds only) `ap_capture_viewport` writes a
-real PNG of the shaded viewport and hands it straight back as an image, and Levels 3–5 collapse into
-"look at the render": measured 11–15 ms in-app, ~140 ms round trip at 800×600. Set the display
-channel first (`ap_set_display_channel`) to isolate base color, roughness or normal in the same way
-Level 3 does, but shaded and in silhouette. When it is `false`, you are on the ladder above. Check
-once at the start of a session and say which mode you are in — never assume either way.
+render". `ap_capture_viewport` writes a real PNG of the shaded viewport alone when the build allows
+it (`ap_get_app_info` → `viewport_file_binding` 1 or `ext_state` 1; it is probed on first use), and
+hands it straight back as an image: measured 11–15 ms in-app, ~140 ms round trip at 800×600. Set
+the display channel first (`ap_set_display_channel`) to isolate base color, roughness or normal in
+the same way Level 3 does, but shaded and in silhouette.
 
 Two things the capture does **not** do, on any build. It photographs the frame **already drawn**, so
 apply your change, let a frame or two pass, then capture — a capture taken in the same breath as the
@@ -190,7 +198,7 @@ their render thread, while they may be holding a brush.
 `*` in `ap_get_app_info`'s title is the dirty flag, and it is the only one a plugin can see. Star
 present ⇒ the human has unsaved work ⇒ do not new, open, or fill without asking.
 
-**Know the destructive set.** These lose work with no prompt and no undo:
+**Know the destructive set.** These lose work with no prompt, and most with no undo:
 - `ap_project_new`, `ap_project_open` — replace the whole session
 - `ap_import_asset` with a `.arm` path — a project `.arm` routes to the *project* importer and
   replaces the session (`path_is_project` is just "ends with .arm"). Only pass `.arm` files you
@@ -208,9 +216,13 @@ so untouched channels are genuinely untouched, not zeroed.
 through to Save-As, which pops a file browser in their face. Guard on
 `ap_project_get_info.filepath != ""` and ask for a path instead.
 
-**Stay cheap.** One request per frame; keep handlers short; never poll in a tight loop. The bridge
-defeats the idle-sleep gate to stay reachable, which means ArmorPaint renders at full rate — real
-power and GPU cost — for as long as it is enabled. Turn it off when you are done.
+**Stay cheap.** Batch small edits (`ap_batch`); never poll in a tight loop. The bridge holds
+ArmorPaint awake (full frame rate) only for a few seconds after each request and then lets it
+sleep, so there is nothing to turn off when you are done.
+
+**Drive the UI only after looking.** `ap_ui_click` / `ap_ui_key` / `ap_ui_drag` act on the human's
+live session. Capture first, act on what you saw, capture again — and never click into a dialog
+or menu you have not identified.
 
 **Say what you did.** End with the concrete list: material name, nodes added, layer filled or not,
 files written (absolute paths), and anything you deliberately did not do because it needed consent.
@@ -221,12 +233,14 @@ files written (absolute paths), and anything you deliberately did not do because
 
 The request mentions layers, masks, groups, opacity, blend modes, or per-layer resolution.
 
-- Say plainly that none of it is reachable: `script_fill_layer` is the only layer binding in the 529,
-  `slot_layer_t` is not a registered struct so the active layer cannot even be inspected, and
-  `project_t.layer_datas` is `NULL` in a live session.
-- Then convert the request into what *is* reachable: a material graph plus a fill, per-channel write
-  masks, a `LAYER` / `LAYER_MASK` node that reads a layer the human selects in the node's combo, or
-  an explicit ask ("add a layer above and select it, then tell me").
+- **With the extension** (`ext_state: 1`): do it — `ap_layer_list` first (index 0 is the BOTTOM),
+  then `ap_layer_new` / `_select` / `_set` / `_move` / `_action`, then `ap_fill_layer` or paint into
+  the selected layer. Give every layer you create a name, and list the stack again at the end.
+- **Stock build**: say plainly that the plugin API cannot reach layers (`script_fill_layer` is the
+  only layer binding in the 529). Then convert the request into what *is* reachable: a material
+  graph plus a fill, per-channel write masks, a `LAYER` / `LAYER_MASK` node that reads a layer the
+  human selects in the node's combo, driving the Layers panel with `ap_ui_click` after a capture,
+  or an explicit ask ("add a layer above and select it, then tell me").
 
 Read: `references/armorpaint-workflow.md`, `references/material-nodes.md`
 
