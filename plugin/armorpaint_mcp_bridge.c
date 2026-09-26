@@ -2051,6 +2051,24 @@ char *dispatch(void *m, char *op) {
 		emit_object(ob);
 		return json_encode_end();
 	}
+	else if (string_equals(op, "camera_get")) {
+		// The viewport camera is a scene object named "Camera" (startup.c), not a
+		// paint object, so script_get_object cannot see it; scene_get_child can. Its
+		// world position lets the server tell which way a surface faces the view.
+		ob = scene_get_child("Camera");
+		if (ob == NULL) {
+			return fail("not_found", "no scene object named Camera");
+		}
+		if (ob->transform == NULL) {
+			return fail("internal", "the camera has no transform");
+		}
+		json_encode_begin();
+		emit_object(ob);
+		json_encode_f32("world_x", transform_world_x(ob->transform));
+		json_encode_f32("world_y", transform_world_y(ob->transform));
+		json_encode_f32("world_z", transform_world_z(ob->transform));
+		return json_encode_end();
+	}
 
 	// ---- objects & meshes -------------------------------------------------
 	else if (string_equals(op, "shape_list")) {

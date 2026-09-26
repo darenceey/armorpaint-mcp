@@ -65,7 +65,7 @@ try:  # normal package import
         spool_resolution,
     )
     from .window_capture import MAX_DOWNSCALE, CaptureError, capture_window
-    from . import desktop_input, image_diff, local_tools, node_catalogue, node_graph, recipes, strokes
+    from . import desktop_input, image_diff, local_tools, mesh_inspect, node_catalogue, node_graph, recipes, strokes
     from .transport import send_batch
 except ImportError:  # running server.py as a loose script
     __version__ = "1.1.0"
@@ -91,6 +91,7 @@ except ImportError:  # running server.py as a loose script
     import node_graph  # type: ignore[no-redef]
     import recipes  # type: ignore[no-redef]
     import strokes  # type: ignore[no-redef]
+    import mesh_inspect  # type: ignore[no-redef]
     from transport import send_batch  # type: ignore[no-redef]
 
 # ---------------------------------------------------------------------------
@@ -133,6 +134,7 @@ OP_TIMEOUTS: dict[str, float] = {
     "set_config": 20,
     "get_main_object": 15,
     "get_object": 15,
+    "camera_get": 15,
     "shape_list": 15,
     "shape_add": 120,
     "object_duplicate": 120,
@@ -1237,6 +1239,54 @@ TOOLS: list[types.Tool] = [
             "modifiers": {"type": "array", "items": {"type": "string", "enum": ["ctrl", "shift", "alt"]}},
         },
         ["points"],
+    ),
+    _tool(
+        "ap_paint_stroke_uv",
+        "Paint a stroke given in UV / TEXTURE space: [[u, v], ...] with u to the right and v "
+        "DOWN, (0,0) the top-left of an exported texture -- read positions straight off "
+        "ap_mesh_uv_layout's image. Each point is mapped onto the model through the mesh's UVs "
+        "and painted as a world-space stroke; a path that crosses from one UV island to "
+        "another is split, so it never cuts across the model, and points off the layout are "
+        "skipped and counted. Paints only where the camera sees the surface (the reply names "
+        "the direction each run faces). Shaping and pressure as ap_paint_stroke; spacing is "
+        "in UV units.",
+        {
+            "points": _stroke_points_schema(2, "u, v"),
+            **_STROKE_SHAPING,
+            "refresh": _b("Re-export the mesh first (it is cached for 30 s).", default=False),
+            "backfaces": _s("'skip' (default) leaves out parts of the path on surfaces turned away "
+                            "from the camera -- painted through the camera they would land on the "
+                            "front surface instead; 'paint' paints them anyway.",
+                            enum=["skip", "paint"], default="skip"),
+            "record": {"type": "object", "description": "As ap_paint_stroke."},
+        },
+        ["points"],
+    ),
+    _tool(
+        "ap_mesh_inspect",
+        "Check the paint mesh BEFORE painting: UV islands and seams, overlapping UVs (paint "
+        "lands in two places), mirrored or collapsed UV triangles, UDIM tiles, texel-density "
+        "spread between islands (some parts sharp, others blurry), and boundary / non-manifold "
+        "edges -- as numbers plus a list of issues with suggestions, and the UV layout as an "
+        "image. Exports the mesh as OBJ (as ap_export_mesh) and reads it; any build.",
+        {
+            "grid": _i("Raster resolution for the overlap measure.", minimum=32, maximum=1024, default=256),
+            "layout": _b("Include the UV layout image.", default=True),
+            "layout_size": _i("Layout image size.", minimum=64, maximum=2048, default=512),
+            "heat": _b("Colour the layout by texel density instead of flat.", default=False),
+            "refresh": _b("Re-export even if a recent export is cached (30 s).", default=False),
+        },
+    ),
+    _tool(
+        "ap_mesh_uv_layout",
+        "The paint mesh's UV layout as an image, v down like an exported texture: islands "
+        "filled, edges drawn, overlaps in RED; with heat=true islands are coloured by texel "
+        "density. Coordinates read off it are what ap_paint_stroke_uv takes.",
+        {
+            "size": _i("Image size in pixels.", minimum=64, maximum=4096, default=1024),
+            "heat": _b("Colour islands by texel density.", default=False),
+            "refresh": _b("Re-export the mesh first.", default=False),
+        },
     ),
     _tool(
         "ap_fill_layer",
@@ -2430,15 +2480,11 @@ def _stroke_paths(name: str, a: dict[str, Any]) -> list[list[tuple[float, ...]]]
     return shaped
 
 
-async def _stroke_tool(name: str, a: dict[str, Any]) -> list[types.TextContent | types.ImageContent]:
-    """Paint one or more strokes, streaming any that need more than one request. A
-    streamed stroke is always closed, even when a chunk fails."""
-    started = time.monotonic()
-    paths = _stroke_paths(name, a)
-    world = name.endswith("_world")
-    record = a.get("record")
-    if record is not None and not isinstance(record, dict):
-        raise BadArgs("'record' must be an object ({} for defaults).", arg="record")
+async def _paint_paths(
+    name: str, paths: list[list[tuple[float, ...]]], *, world: bool, record: dict[str, Any] | None
+) -> tuple[dict[str, Any] | None, dict[str, Any], list[Any]]:
+    """Paint strokes, streaming any that need more than one request. A streamed stroke is
+    always closed, even when a chunk fails. Returns (error payload or None, result, frames)."""
     film_args = {"downscale": 2, "settle_frames": 2, **(record or {})}
     loop = asyncio.get_running_loop()
     frames: list[Any] = []
@@ -2456,6 +2502,7 @@ async def _stroke_tool(name: str, a: dict[str, Any]) -> list[types.TextContent |
         plan = strokes.plan(path, world=world)
         streamed = streamed or len(plan) > 1
         open_stroke = False
+        op = ""
         try:
             for op, wire in plan:
                 result = await send(op, wire)
@@ -2478,21 +2525,178 @@ async def _stroke_tool(name: str, a: dict[str, Any]) -> list[types.TextContent |
             payload = exc.to_dict()
             payload.update({"tool": name, "painted_points": painted, "failed_op": op,
                             "note": "the stroke was closed; what was painted before the failure stays"})
-            return _text(payload)
+            return payload, {}, frames
+    return None, {"points": painted, "strokes": len(paths), "requests": requests, "streamed": streamed}, frames
 
-    result_block = {"points": painted, "strokes": len(paths), "requests": requests, "streamed": streamed}
-    payload: dict[str, Any] = {"ok": True, "op": name[3:], "result": result_block,
-                               "timing": {"total_ms": round((time.monotonic() - started) * 1000)}}
+
+def _record_arg(a: dict[str, Any]) -> dict[str, Any] | None:
+    record = a.get("record")
+    if record is not None and not isinstance(record, dict):
+        raise BadArgs("'record' must be an object ({} for defaults).", arg="record")
+    return record
+
+
+def _with_frames(payload: dict[str, Any], frames: list[Any]) -> list[types.TextContent | types.ImageContent]:
     content: list[types.TextContent | types.ImageContent] = []
     if frames:
         sheet = image_diff.contact_sheet([(f.width, f.height, f.pixels()) for f in frames],
                                          columns=min(4, len(frames)))
-        payload["record"] = {"frames": len(frames),
-                             "distinct_frames": len({f.pixels() for f in frames})}
+        payload["record"] = {"frames": len(frames), "distinct_frames": len({f.pixels() for f in frames})}
         content.append(_png_image(sheet))
     content.append(types.TextContent(type="text", text=json.dumps(payload, indent=2)))
     return content
 
+
+async def _stroke_tool(name: str, a: dict[str, Any]) -> list[types.TextContent | types.ImageContent]:
+    started = time.monotonic()
+    paths = _stroke_paths(name, a)
+    error, result, frames = await _paint_paths(name, paths, world=name.endswith("_world"), record=_record_arg(a))
+    if error is not None:
+        return _text(error)
+    payload: dict[str, Any] = {"ok": True, "op": name[3:], "result": result,
+                               "timing": {"total_ms": round((time.monotonic() - started) * 1000)}}
+    return _with_frames(payload, frames)
+
+
+# ---------------------------------------------------------------------------
+# Mesh (mesh_inspect.py): inspection, UV layout, UV-space strokes
+# ---------------------------------------------------------------------------
+
+_MESH_CACHE: dict[str, Any] = {}
+MESH_CACHE_S = 30.0
+
+
+def _current_mesh(refresh: bool) -> tuple[Any, dict[str, Any]]:
+    """Export the paint mesh (script_export_mesh -> OBJ) and parse it; reused for
+    MESH_CACHE_S unless ``refresh``. Upstream's exporter merges shared vertices with a
+    quadratic search, so a very large mesh takes a while -- as the Export Mesh dialog does."""
+    cached = _MESH_CACHE.get("entry")
+    if cached and not refresh and time.monotonic() - cached[1]["at"] < MESH_CACHE_S:
+        return cached[0], cached[1]
+    folder = _state_dir() / "mesh"
+    folder.mkdir(parents=True, exist_ok=True)
+    base = (folder / "current").as_posix()
+    obj = Path(base + ".obj")
+    if obj.exists():
+        obj.unlink()  # never parse a stale export if this one fails
+    started = time.monotonic()
+    send_to_armorpaint("export_mesh", {"path": base}, OP_TIMEOUTS["export_mesh"])
+    if not obj.exists():
+        raise BadArgs(f"ArmorPaint did not write {obj}; is a mesh loaded? (ap_get_main_object)")
+    mesh = mesh_inspect.parse_obj(obj.read_text(encoding="utf-8", errors="replace"))
+    info = {"obj_path": str(obj), "export_ms": round((time.monotonic() - started) * 1000), "at": time.monotonic()}
+    _MESH_CACHE["entry"] = (mesh, info)
+    return mesh, info
+
+
+def _mesh_tool(name: str, a: dict[str, Any]) -> list[types.TextContent | types.ImageContent]:
+    mesh, info = _current_mesh(bool(_opt_bool(a, "refresh")))
+    meta = {k: v for k, v in info.items() if k != "at"}
+    if name == "ap_mesh_uv_layout":
+        size = _opt_int(a, "size", 64, 4096) or 1024
+        png = mesh_inspect.uv_layout_png(mesh, size, heat=bool(_opt_bool(a, "heat")))
+        payload = {"ok": True, "size": size, **meta,
+                   "legend": "UDIM tile 1001, v down like an exported texture: blue islands, light edges, "
+                             "RED = covered more than once" + ("; islands coloured by texel density "
+                             "(blue low .. red high)" if _opt_bool(a, "heat") else "")}
+        return [_png_image(png), types.TextContent(type="text", text=json.dumps(payload, indent=2))]
+    grid = _opt_int(a, "grid", 32, 1024) or 256
+    payload = {"ok": True, "report": mesh_inspect.inspect(mesh, grid), **meta}
+    if _opt_bool(a, "layout") is False:
+        return _text(payload)
+    size = _opt_int(a, "layout_size", 64, 2048) or 512
+    png = mesh_inspect.uv_layout_png(mesh, size, heat=bool(_opt_bool(a, "heat")))
+    return [_png_image(png), types.TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+
+def _uv_points(a: dict[str, Any]) -> list[tuple[float, ...]]:
+    pts = _point_list(a, "points", 2)
+    if any(not (-0.001 <= p[0] <= 10.0 and -0.001 <= p[1] <= 10.0) for p in pts):
+        raise BadArgs("UV points are image-convention texture coordinates (u right, v down, 0..1 per UDIM "
+                      "tile); these are out of range.", arg="points")
+    return pts
+
+
+def _facing(normals: list[tuple[float, float, float]]) -> str:
+    n = [sum(v[k] for v in normals) for k in range(3)]
+    k = max(range(3), key=lambda i: abs(n[i]))
+    return ("+" if n[k] >= 0 else "-") + "xyz"[k]
+
+
+async def _uv_stroke_tool(a: dict[str, Any]) -> list[types.TextContent | types.ImageContent]:
+    started = time.monotonic()
+    pts = _uv_points(a)
+    shaped = strokes.shape(
+        pts, dims=2, smooth=bool(_opt_bool(a, "smooth")), spacing=_opt_float(a, "spacing", 0.0),
+        taper=_opt_str(a, "taper") or "none", taper_min=_opt_float(a, "taper_min", 0.01, 1.0) or 0.15,
+        jitter=_opt_float(a, "jitter", 0.0) or 0.0, seed=_opt_int(a, "seed") or 0,
+    )
+    loop = asyncio.get_running_loop()
+    mesh, _ = await loop.run_in_executor(None, partial(_current_mesh, bool(_opt_bool(a, "refresh"))))
+    runs, missed = mesh_inspect.uv_path_to_runs(mesh, shaped)
+    if not runs:
+        return _text({"ok": False, "code": "off_uv_layout", "tool": "ap_paint_stroke_uv",
+                      "error": "no point of the path lies on the UV layout (ap_mesh_uv_layout shows it)",
+                      "missed_points": len(missed)})
+    transforms: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        if run["object"] not in transforms:
+            transforms[run["object"]] = await loop.run_in_executor(
+                None, partial(send_to_armorpaint, "get_object", {"name": run["object"]}, OP_TIMEOUTS["get_object"])
+            )
+    backfaces = _opt_str(a, "backfaces") or "skip"
+    if backfaces not in ("skip", "paint"):
+        raise BadArgs("'backfaces' must be skip or paint.", arg="backfaces")
+    camera = None
+    if backfaces == "skip":
+        try:
+            cam = await loop.run_in_executor(None, partial(send_to_armorpaint, "camera_get", {}, 15.0))
+            if all(k in cam for k in ("world_x", "world_y", "world_z")):
+                camera = (cam["world_x"], cam["world_y"], cam["world_z"])
+        except BridgeError:
+            camera = None
+    paths = []
+    summary = []
+    skipped = []
+    for run in runs:
+        t = transforms[run["object"]]
+        world = [mesh_inspect.to_world(t, p[:3]) + tuple(p[3:]) for p in run["points"]]
+        normals = [mesh_inspect.to_world(t, n, direction=True) for n in run["normals"]]
+        entry = {"object": run["object"], "island": run["island"], "points": len(world),
+                 "from_index": run["indices"][0], "to_index": run["indices"][-1], "facing": _facing(normals)}
+        if camera is not None:
+            # Towards the camera means a positive dot product of the normal with the
+            # direction to the camera. Measured live: a back-facing point projects onto
+            # whatever FRONT surface covers it on screen and paints the wrong texels.
+            toward = sum(
+                sum(n[k] * (camera[k] - p[k]) for k in range(3)) > 0 for n, p in zip(normals, world)
+            )
+            if toward * 2 < len(world):
+                skipped.append(entry)
+                continue
+        paths.append(world)
+        summary.append(entry)
+    if not paths:
+        return _text({"ok": False, "code": "all_back_facing", "tool": "ap_paint_stroke_uv",
+                      "error": "every part of the path is on a surface turned away from the camera; painting "
+                               "it would land on whatever faces the camera instead",
+                      "skipped_runs": skipped,
+                      "hint": "turn the view towards the 'facing' axis (ap_camera, native extension), or pass "
+                              "backfaces='paint' to paint through the camera anyway"})
+    error, result, frames = await _paint_paths("ap_paint_stroke_uv", paths, world=True, record=_record_arg(a))
+    if error is not None:
+        return _text(error)
+    result.update({"runs": summary, "skipped_runs": skipped, "missed_points": len(missed),
+                   "missed_first": missed[:10],
+                   "camera_known": camera is not None})
+    payload = {
+        "ok": True, "op": "paint_stroke_uv", "result": result,
+        "note": "each run is painted as a world-space stroke through the camera: a run on a face "
+                "turned away from the camera, or hidden, paints nothing -- check with 'capture', "
+                "and turn the view (ap_camera, extension) towards its 'facing' axis",
+        "timing": {"total_ms": round((time.monotonic() - started) * 1000)},
+    }
+    return _with_frames(payload, frames)
 
 def _pointer_points(a: dict[str, Any]) -> list[tuple[int, int]]:
     raw = _point_list(a, "points", 2)
@@ -2597,7 +2801,8 @@ async def _capture_sequence_tool(a: dict[str, Any]) -> list[types.TextContent | 
 # operation (and, for the diff, before it) and returned in the same reply.
 CAPTURE_TOOLS = frozenset(
     {"ap_paint_stroke", "ap_paint_stroke_world", "ap_fill_layer", "ap_batch",
-     "ap_node_graph_apply", "ap_node_recipe", "ap_paint_stroke_pointer", "ap_stroke_end"}
+     "ap_node_graph_apply", "ap_node_recipe", "ap_paint_stroke_pointer", "ap_stroke_end",
+     "ap_paint_stroke_uv"}
 )
 
 _CAPTURE_ARG = {
@@ -2890,7 +3095,9 @@ def _graph_tool(name: str, a: dict[str, Any]) -> dict[str, Any]:
 
 # Tools that cannot be batch steps: answered locally, composed of several requests, or
 # would end the session.
-_UNBATCHABLE = LOCAL_TOOLS | GRAPH_TOOLS | {
+MESH_TOOLS = frozenset({"ap_mesh_inspect", "ap_mesh_uv_layout", "ap_paint_stroke_uv"})
+
+_UNBATCHABLE = LOCAL_TOOLS | GRAPH_TOOLS | MESH_TOOLS | {
     "ap_batch", "ap_quit", "ap_project_metadata", "ap_material_list", "ap_undo", "ap_redo",
 }
 
@@ -2984,6 +3191,13 @@ async def call_tool(
 
         if name in ("ap_paint_stroke", "ap_paint_stroke_world"):
             return await _stroke_tool(name, args)
+
+        if name == "ap_paint_stroke_uv":
+            return await _uv_stroke_tool(args)
+
+        if name in ("ap_mesh_inspect", "ap_mesh_uv_layout"):
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, partial(_mesh_tool, name, args))
 
         if name == "ap_paint_stroke_pointer":
             loop = asyncio.get_running_loop()
