@@ -3,7 +3,9 @@
 // ONE plugin binding, mcp_ext_call(op, args, prefix), that gives the armorpaint-mcp bridge the
 // operations ArmorPaint's minic API has no binding for: layer management, undo/redo, export
 // format / bit depth / preset, bake parameters and bake runs, render settings (tone and LUT),
-// texture-set resolution, live project lists, camera views and a file-based viewport capture.
+// texture-set resolution, live project lists, camera views, a file-based viewport capture,
+// the Meshes tab's edit operations (UV unwrap, normals, modifiers, re-import) and project
+// snapshots written without changing the project's own path.
 //
 // This file is NOT part of ArmorPaint. patch/apply_ext_patch.py copies it into a checkout as
 // paint/sources/mcp_ext.c and #includes it at the end of main.c's unity build, so every
@@ -22,7 +24,7 @@
 // Nothing here is reached unless a request asks for it, and no existing ArmorPaint behaviour
 // changes. Marker: armorpaint-mcp.
 
-#define MCP_EXT_VERSION 1
+#define MCP_EXT_VERSION 2
 
 // ---- output buffer ------------------------------------------------------------------------------
 
@@ -681,13 +683,24 @@ static void mcp_emit_history(void) {
 	mcp_kv_i("redos_available", history_redos);
 	mcp_kv_i("undo_steps_config", g_config->undo_steps);
 	int active = history_steps->length - 1 - history_redos;
+	mcp_kv_i("active_index", active);
+	// Every step, with an identity: its address, stable for as long as the step lives
+	// (history.c frees a step when it falls off the end or its redo branch is discarded).
+	// The server's checkpoints find their step again by it -- they can be older than any
+	// fixed window of recent steps, so the whole history is listed (it is at most
+	// undo_steps long).
 	mcp_open("steps", "[");
-	int from = history_steps->length > 32 ? history_steps->length - 32 : 0;
-	for (int i = from; i < history_steps->length; ++i) {
+	for (int i = 0; i < history_steps->length; ++i) {
 		history_step_t *s = history_steps->buffer[i];
+		char            id[32];
+		snprintf(id, sizeof(id), "%p", (void *)s);
 		mcp_open(NULL, "{");
 		mcp_kv_i("index", i);
+		mcp_kv_s("id", id);
 		mcp_kv_s("name", s->name);
+		mcp_kv_i("layer", s->layer);
+		mcp_kv_i("material", s->material);
+		mcp_kv_i("object", s->object);
 		mcp_kv_b("undone", i > active);
 		mcp_close("}");
 	}
@@ -1264,10 +1277,155 @@ static char *mcp_op_console_read(void) {
 
 // ---- entry point ----------------------------------------------------------------------------------
 
+// ---- mesh edits (the Meshes tab's edit menu, tab_meshes.c tab_meshes_draw_edit) -----------------
+
+static void mcp_emit_mesh_stats(void) {
+	int verts = 0, tris = 0;
+	for (int i = 0; i < g_project->_->paint_objects->length; ++i) {
+		mesh_data_t *md = ((mesh_object_t *)g_project->_->paint_objects->buffer[i])->data;
+		if (md == NULL || md->vertex_arrays == NULL || md->vertex_arrays->length < 1) {
+			continue;
+		}
+		verts += md->vertex_arrays->buffer[0]->values->length / 4;
+		if (md->index_array != NULL) {
+			tris += md->index_array->length / 3;
+		}
+	}
+	mcp_kv_i("objects", g_project->_->paint_objects->length);
+	mcp_kv_i("vertices", verts);
+	mcp_kv_i("triangles", tris);
+}
+
+// None of these is recorded in ArmorPaint's history (the menu pushes no step either), so
+// the server takes a project snapshot first. Ops that change UVs or topology leave paint
+// already on the layers where it was in texture space -- no longer where it was on the model.
+static char *mcp_op_mesh_op(void) {
+	char *action = mcp_arg("action");
+	if (action == NULL) {
+		return mcp_fail("bad_args", "missing 'action'");
+	}
+	if (strcmp(action, "unwrap") == 0) {
+#ifdef WITH_PLUGINS
+		plugin_uv_unwrap_button(); // the menu's UV Unwrap (tab_plugins.c): merges, unwraps, splits
+#else
+		return mcp_fail("unsupported", "this build has no UV unwrapper (built without WITH_PLUGINS)");
+#endif
+	}
+	else if (strcmp(action, "calc_normals") == 0) {
+		util_mesh_calc_normals(mcp_arg_b("smooth", true));
+		g_context->ddirty = 2;
+	}
+	else if (strcmp(action, "flip_normals") == 0) {
+		util_mesh_flip_normals();
+		g_context->ddirty = 2;
+	}
+	else if (strcmp(action, "to_origin") == 0) {
+		util_mesh_to_origin();
+		g_context->ddirty = 2;
+	}
+	else if (strcmp(action, "rotate_x") == 0) {
+		util_mesh_swap_axis(1, 2);
+		g_context->ddirty = 2;
+	}
+	else if (strcmp(action, "rotate_y") == 0) {
+		util_mesh_swap_axis(2, 0);
+		g_context->ddirty = 2;
+	}
+	else if (strcmp(action, "rotate_z") == 0) {
+		util_mesh_swap_axis(0, 1);
+		g_context->ddirty = 2;
+	}
+	else if (strcmp(action, "decimate") == 0) {
+		double strength = mcp_arg_f("strength", 0.5);
+		if (strength <= 0.0 || strength >= 1.0) {
+			return mcp_fail("bad_args", "strength must be between 0 and 1 (exclusive)");
+		}
+		util_mesh_decimate((f32)strength);
+	}
+	else if (strcmp(action, "smooth") == 0) {
+		util_mesh_smooth();
+	}
+	else if (strcmp(action, "subdivide") == 0) {
+		util_mesh_subdivide();
+	}
+	else if (strcmp(action, "bevel") == 0) {
+		double amount = mcp_arg_f("amount", 0.1);
+		if (amount <= 0.0 || amount > 1.0) {
+			return mcp_fail("bad_args", "amount must be in (0, 1]");
+		}
+		util_mesh_bevel((f32)amount);
+	}
+	else if (strcmp(action, "reimport") == 0) {
+		// project_reimport_mesh() opens the modal Import Mesh box and waits for a click;
+		// this calls what that box's button calls, keeping the layers and the camera.
+		char *path = mcp_arg("path");
+		if (path == NULL || path[0] == '\0') {
+			if (g_project->mesh_assets == NULL || g_project->mesh_assets->length < 1) {
+				return mcp_fail("bad_args", "no 'path' and the project records no mesh file to re-import");
+			}
+			path = g_project->mesh_assets->buffer[0];
+		}
+		if (!iron_file_exists(path)) {
+			return mcp_fail("not_found", "no mesh file at %s", path);
+		}
+		import_mesh_run(path, false, true, true);
+		g_context->ddirty = 2;
+	}
+	else {
+		return mcp_fail("bad_args", "unknown action '%s'; expected unwrap, calc_normals, flip_normals, to_origin, "
+		                            "rotate_x, rotate_y, rotate_z, decimate, smooth, subdivide, bevel or reimport",
+		                action);
+	}
+	mcp_begin_ok();
+	mcp_kv_s("action", action);
+	mcp_emit_mesh_stats();
+	return mcp_end_ok();
+}
+
+// ---- project snapshot ------------------------------------------------------------------------
+
+// Write the whole project to `path` WITHOUT making it the project's file: export_arm writes to
+// g_project->_->filepath, and on the way rewrites the asset, font, sound and mesh lists and the
+// envmap relative to that path and adds it to Recent Projects (export_arm.c). Every one of those
+// is put back, so the user's next save goes where it always did.
+static char *mcp_op_project_snapshot(void) {
+	char *path = mcp_arg("path");
+	if (path == NULL || strlen(path) < 5 || strcmp(path + strlen(path) - 4, ".arm") != 0) {
+		return mcp_fail("bad_args", "'path' must be an absolute path ending in .arm");
+	}
+	project_runtime_t *r                 = g_project->_;
+	char              *prev_filepath     = r->filepath;
+	char              *prev_envmap       = g_project->envmap;
+	string_array_t    *prev_assets       = g_project->assets;
+	string_array_t    *prev_font_assets  = g_project->font_assets;
+	string_array_t    *prev_sound_assets = g_project->sound_assets;
+	string_array_t    *prev_mesh_assets  = g_project->mesh_assets;
+	char              *snapshot          = string_copy(path);
+
+	r->filepath = snapshot;
+	export_arm_run_project();
+
+	string_array_remove(g_config->recent_projects, snapshot);
+	config_save();
+	r->filepath               = prev_filepath;
+	g_project->envmap         = prev_envmap;
+	g_project->assets         = prev_assets;
+	g_project->font_assets    = prev_font_assets;
+	g_project->sound_assets   = prev_sound_assets;
+	g_project->mesh_assets    = prev_mesh_assets;
+
+	mcp_begin_ok();
+	mcp_kv_s("path", snapshot);
+	mcp_kv_b("exists", iron_file_exists(snapshot));
+	mcp_kv_s("project_filepath", r->filepath);
+	mcp_kv_i("layers", r->layers->length);
+	return mcp_end_ok();
+}
+
 static const char *mcp_ops =
     "ext_info capture_viewport layer_list layer_select layer_new layer_delete layer_duplicate layer_set layer_move layer_action "
     "undo redo history export_presets export_textures_ex bake_settings bake bake_status render_settings texture_resolution "
-    "project_lists camera console_read";
+    "project_lists camera console_read mesh_op project_snapshot";
 
 char *mcp_ext_call(char *op, any_map_t *args, char *prefix) {
 	mcp_args   = args;
@@ -1348,6 +1506,12 @@ char *mcp_ext_call(char *op, any_map_t *args, char *prefix) {
 	}
 	if (strcmp(op, "project_lists") == 0) {
 		return mcp_op_project_lists();
+	}
+	if (strcmp(op, "mesh_op") == 0) {
+		return mcp_op_mesh_op();
+	}
+	if (strcmp(op, "project_snapshot") == 0) {
+		return mcp_op_project_snapshot();
 	}
 	if (strcmp(op, "camera") == 0) {
 		return mcp_op_camera();

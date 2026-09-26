@@ -1,0 +1,37 @@
+{
+ "name": "stone",
+ "description": "Rock: Voronoi cells for tone and crevice occlusion, fine noise grit as a bump, no metal. From skill/references/material-nodes.md.",
+ "params": {
+  "cell_scale": {"type": "number", "default": 6.0, "description": "Voronoi cell scale."},
+  "pale_color": {"type": "color", "default": [0.46, 0.45, 0.42, 1.0], "description": "Colour of the cell centres."},
+  "dark_color": {"type": "color", "default": [0.26, 0.25, 0.24, 1.0], "description": "Colour towards the cell edges."},
+  "bump_strength": {"type": "number", "default": 0.25, "description": "Grit bump strength."}
+ },
+ "spec": {
+  "nodes": {
+   "cell": {"type": "TEX_VORONOI", "inputs": {"Scale": "${cell_scale}", "Randomness": 0.9}, "buttons": {"Dimensions": "3D", "Feature Output": "F1"}},
+   "grit": {"type": "TEX_NOISE", "inputs": {"Scale": 45.0, "Detail": 7.0, "Roughness": 0.65}},
+   "pale": {"type": "RGB", "outputs": {"Color": "${pale_color}"}},
+   "dark": {"type": "RGB", "outputs": {"Color": "${dark_color}"}},
+   "tone": {"type": "MAPRANGE", "inputs": {"From Min": 0.0, "From Max": 0.6, "To Min": 0.0, "To Max": 1.0}, "buttons": {"Clamp": true}},
+   "mix": {"type": "MIX_RGB", "buttons": {"blend_type": "Mix"}},
+   "rough": {"type": "MAPRANGE", "inputs": {"To Min": 0.88, "To Max": 0.72}, "buttons": {"Clamp": false}},
+   "occ": {"type": "MAPRANGE", "inputs": {"From Min": 0.0, "From Max": 0.35, "To Min": 0.55, "To Max": 1.0}, "buttons": {"Clamp": true}},
+   "bump": {"type": "BUMP", "inputs": {"Strength": "${bump_strength}"}},
+   "out": {"existing": "OUTPUT_MATERIAL_PBR"}
+  },
+  "links": [
+   "cell.Distance -> tone.Value",
+   "tone.Value -> mix.Factor",
+   "pale.Color -> mix.Color 1",
+   "dark.Color -> mix.Color 2",
+   "mix.Color -> out.Base Color",
+   "tone.Value -> rough.Value",
+   "rough.Value -> out.Roughness",
+   "cell.Distance -> occ.Value",
+   "occ.Value -> out.Occlusion",
+   "grit.Factor -> bump.Height",
+   "bump.Normal Map -> out.Normal Map"
+  ]
+ }
+}

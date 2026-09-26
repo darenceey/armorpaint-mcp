@@ -133,6 +133,14 @@ and dilates it (`render/make_material.c:222-266`). Two consequences:
   whole graph API.
 - **The re-bake happens at document resolution on the render thread.** It is the most expensive
   single thing you can ask for. Do not call update in a loop while a human is painting.
+- **On a hard-edged mesh the curvature is a 1-texel line along the UV seams**, not a band along the
+  edges: it is the screen-space derivative of the normal, zero across every flat face. The
+  recipes put a `BLUR` (Strength 1.0) between the curvature and its map range and then map
+  0.03..0.12, which gives the default cube a visible worn edge (8-12 % of its texels).
+
+**TEX_TEXT** is refused by the server: on ArmorPaint 1.0 (Linux, radeonsi Vulkan) a material with
+it crashed the app on its first fill or stroke. Paint lettering with strokes
+(`ap_paint_stroke_uv` on the face's UV island) instead.
 
 **MIX_RGB**
 ```
@@ -222,7 +230,9 @@ Rules of thumb that survive the blindness:
 
 ## Recipes
 
-Each is an ordered op list. Node references are the ids returned by `ap_node_add`. Every recipe ends
+These four ship as parameterised graphs: `ap_node_recipe name=worn_painted_metal` (also
+`painted_wood`, `stone`, and `edge_wear_grunge`), which builds, recompiles and fills in one call and
+takes the previous graph as a snapshot. The op lists below show what they do, step by step; each ends
 with update, then a bake-to-plane so you can look at it.
 
 ### Worn painted metal

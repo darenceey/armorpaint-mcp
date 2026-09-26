@@ -688,6 +688,7 @@ Errors that *are* reported go to the console via `console_log` as
 | structs per context | 64 (≈40 pre-seeded) | `MINIC_MAX_STRUCTS` | dropped |
 | enum constants (process-wide) | 512 | `MINIC_MAX_ENUM_CONSTS` | dropped |
 | host globals | 64 | `MINIC_MAX_GLOBALS` | dropped |
+| script globals | 128 (the top-level scope) | `minic.c:1980` declares them in the top env, `:2092` `var_cap = MINIC_MAX_VARS` | error: `too many local variables` |
 | identifier length | 63 chars | `MINIC_MAX_NAME` | truncated |
 | registered host functions | 1024 (529 used) | `MINIC_MAX_EXTFUNS` | — |
 
@@ -1125,6 +1126,15 @@ SEPXYZ SHADER_GPU STRING TEX_BAKE TEX_BRICK TEX_CAMERA TEX_CHECKER TEX_COORD TEX
 TEX_IMAGE TEX_MAGIC TEX_NOISE TEX_TEXT TEX_VORONOI TEX_WAVE TILESHEET TILESHEET_ANIM UVMAP VALTORGB
 VALUE VECTOR VECT_MATH VECT_ROTATE VECT_TRANSFORM WIREFRAME`
 
+**Correction (checked live).** The list above came from grepping `.type = "..."`, which also
+matches *socket and button* types: `BOOL`, `ENUM`, `RGBA`, `STRING`, `VECTOR` and `CUSTOM` are
+not node types, and `script_material_create_node` returns NULL for them. Three more exist but
+cannot be created in a material canvas: `GROUP_INPUT` / `GROUP_OUTPUT` live only inside a group's
+canvas, `NEURAL_IMAGE_TO_3D_MESH` is registered only on Windows, and `NEURAL_TEXTURE_MESH` only
+with the experimental option (`nodes_material.c`). The server now validates against a socket
+catalogue parsed from `nodes_material/*.c` and `nodes_neural/*.c` (`tools/gen_node_sockets.py`),
+and a live test checks every type's sockets against a real `node_add`.
+
 Custom nodes (plugin-defined) — `plugin_material_category_add/remove`,
 `plugin_material_custom_nodes_set/remove` (`:529-536`); `hello_node.c` is the full recipe.
 Brush-graph equivalents exist (`plugin_brush_*`), but brush node types are only
@@ -1143,6 +1153,13 @@ Brush-graph equivalents exist (`plugin_brush_*`), but brush node types are only
 
 `script_paint(x, y)` takes **normalised screen coordinates** and must be terminated by
 `script_paint_end()` to close the stroke; `dev/test.c:60-70` paints two strokes this way.
+
+**A script stroke survives across frames.** `script_paint_begin_stroke` is guarded by
+`script_paint_active`, so it runs once per stroke, and only `script_paint_end` clears the flag.
+The bridge's `stroke_begin` / `stroke_points` / `stroke_end` rely on this to stream a stroke of
+any length. Each `script_paint_at` renders its dab immediately
+(`render_path_paint_commands_paint`), so context fields written between two calls, such as
+`brush_radius` and `brush_opacity`, apply per dab. That is per-point pressure, verified live.
 `script_paint_world(x, y, z)` is the world-space variant.
 
 Both silently no-op unless a project is open, a layer is selected and it is not a group
@@ -1480,7 +1497,12 @@ most rows have a remedy from outside it:
 | project metadata | server-side `ap_project_metadata` (a JSON sidecar beside the `.arm`) |
 | `read_console_log` | extension `console_read` |
 | UI automation | server-side synthetic input to the window (`ap_ui_click/key/drag/scroll`) |
-| `list_channels`, `add_channel`, texture sets / UV tiles, arbitrary script eval | not covered |
+| node edits missing from the undo history | server-side graph snapshots and checkpoints (`ap_node_graph_snapshot`, `ap_checkpoint`) |
+| mesh edits: UV unwrap, normals, modifiers, re-import | extension `mesh_op` (the Meshes tab's handlers) |
+| a project copy that does not change the project's path | extension `project_snapshot` |
+| reading the mesh's UVs and topology | `script_export_mesh` writes an OBJ; the server reads it (`ap_mesh_inspect`) |
+| the viewport camera's position | stock `scene_get_child("Camera")` (the bridge's `camera_get`) |
+| `list_channels`, `add_channel`, texture sets / UV tiles, arbitrary script eval, group-node canvases | not covered |
 
 The native extension is `patch/mcp_ext.c`, added to a self-built ArmorPaint by
 `patch/apply_ext_patch.py`; see `docs/UPSTREAM_CHANGES.md`.

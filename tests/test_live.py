@@ -225,7 +225,7 @@ def test_regression_sweep_of_original_tools(tmp_path, ext):
     """The pre-existing tool surface still works end to end (scratch project)."""
     ok = lambda r: r.get("ok") is True  # noqa: E731
 
-    assert ok(call("ap_project_new"))
+    assert ok(call("ap_project_new", discard_unsaved=True))
     arm = str(tmp_path / "sweep.arm")
     assert ok(call("ap_project_save_as", path=arm))
     for _ in range(40):
@@ -286,7 +286,7 @@ def test_regression_sweep_of_original_tools(tmp_path, ext):
     assert ok(call("ap_project_list_scripts"))
     assert ok(call("ap_material_list"))
     assert ok(call("ap_import_asset", path=str(tmp_path / "tex" / png)))
-    assert ok(call("ap_project_open", path=arm))
+    assert ok(call("ap_project_open", path=arm, discard_unsaved=True))
     assert ok(call("ap_project_save"))
 
 
