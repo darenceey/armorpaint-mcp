@@ -29,7 +29,9 @@ Use it for:
 - deciding what is out of reach in this session and must be asked of the human or done elsewhere
 
 Do not use it as the primary workflow for:
-- modelling, UVs, or silhouette work — that is Blender's job
+- modelling, seam placement or hand UV editing — that is Blender's job. ArmorPaint can **diagnose**
+  a mesh (`ap_mesh_inspect`) and, with the extension, run its own unwrap and mesh modifiers
+  (`ap_mesh_op`), but it has no seam or UV-editing tools
 
 ## What Makes ArmorPaint Different (read before your first call)
 
@@ -46,11 +48,15 @@ Six facts shape every decision. All are verified against `paint/sources/minic_ap
    (paint/fill/decal/group/masks), select, rename, reorder, set opacity/blending/visibility, merge,
    clear and delete layers, each with the same undo step the Layers panel pushes. Without it the
    only layer operation is "fill the selected layer".
-3. **Undo is yours too.** `ap_undo` / `ap_redo` are exact with the extension (and `ap_history`
-   shows what they will revert); on a stock build they press the app's own `ctrl+z` /
-   `ctrl+shift+z` via synthetic input — it works, but you cannot read back what was undone, so look
-   (`ap_capture_window`) afterwards. Still announce destructive steps: undo depth is finite
-   (`undo_steps` in `ap_get_config`).
+3. **Undo is yours too, but it does not cover everything.** `ap_undo` / `ap_redo` are exact with
+   the extension (and `ap_history` shows what they will revert); on a stock build they press the
+   app's own `ctrl+z` / `ctrl+shift+z` via synthetic input and report whether anything visibly
+   changed (`verified`). ArmorPaint's history records paint, fills, layers and material
+   create/delete, **not node edits, config, camera or mesh changes**. So before a risky sequence
+   take `ap_checkpoint` (history position plus a graph snapshot; `kind: "project"` for mesh or
+   project-level changes) and `ap_rollback` if it goes wrong. Destructive tools take one by
+   themselves and name it in their reply. Undo depth is finite (`undo_steps` in `ap_get_config`),
+   and a rollback refuses rather than guessing once its step has fallen off.
 4. **You can see.** `ap_capture_window` screenshots ArmorPaint's window from the server side on any
    build (covered windows are fine, minimised ones are not; on macOS it needs Screen Recording
    permission). `ap_capture_viewport` gives the shaded 3D view alone when the build has
@@ -84,7 +90,11 @@ Six facts shape every decision. All are verified against `paint/sources/minic_ap
 - **The material graph is your control surface.** Where a Substance workflow reaches for a layer
   stack, here you build nodes and fill. Read `references/material-nodes.md`.
 - **Look at your output.** An export you did not read back is not a finished job. Read
-  `references/armorpaint-workflow.md` §"Close the loop".
+  `references/armorpaint-workflow.md` §"Close the loop". For anything visible in the window, pass
+  `capture: {}` to the tool doing the work: the reply shows the result and flags
+  `no_visible_change`, which is the fingerprint of a silent no-op.
+- **Checkpoint before you gamble.** `ap_checkpoint` before a sequence you may want to take back;
+  `ap_batch(atomic=true)` when a group of steps must happen all or not at all.
 - **One thing per frame, small payloads.** Bulk data moves by path, never inline.
 - **Forward slashes in every path.** Backslashes truncate string literals on the plugin side.
 - **Ground truth is local.** `docs/MINIC_DIALECT_AND_API.md`, `docs/API_REFERENCE.md`,
@@ -109,6 +119,9 @@ Follow this order unless the task is clearly narrower.
    - `ap_project_get_info` — filepath (`""` means never saved), basepath, envmap, fov
    - `ap_get_context` — active material name, `layer != NULL`, tool, brush params, viewport mode
    - `ap_get_main_object` — the paint object
+   - `ap_mesh_inspect` — once per mesh, **before painting**: overlapping UVs mean paint lands
+     twice, uneven texel density means blurry patches, and none of it can be fixed after paint is on
+     the layers (paint lives in texture space). Tell the human what it found
 3. **Classify the request**
    - additive (new material, new nodes, export to a new dir) — proceed
    - destructive (fill, new/open project, delete) — announce, and ask if the project is dirty
@@ -116,12 +129,22 @@ Follow this order unless the task is clearly narrower.
      offer the human-side step, or drive the UI with `ap_ui_click` / `ap_ui_key` after looking
 4. **Set up the material**
    - `ap_material_create` a named material rather than mutating theirs
-   - build the graph: `ap_node_add` → `ap_node_set_value` → `ap_node_connect` → **`_update`**
+   - start from `ap_node_recipe` (list them with no name) or write the graph as one
+     `ap_node_graph_apply` spec: sockets by name, validated before anything changes, rolled back
+     on failure, recompiled and filled for you. `ap_node_graph_get` reads a graph back whole;
+     `ap_node_graph_lint` finds dead nodes and links into disabled channels
+   - the per-node tools (`ap_node_add` → `ap_node_set_value` → `ap_node_connect` → **`_update`**)
+     remain for single edits
    - `ap_material_set_channels` to mask which channels a fill is allowed to touch
 5. **Apply it**
    - confirm a layer is selected (`ctx.layer != NULL`); if not, ask the human to add/select one
    - `ap_fill_layer` for whole-object coverage (this **clears** the layer first)
-   - `ap_paint_stroke_world` only when a stroke is genuinely needed, and only with the camera framed
+   - strokes when hand-work is wanted: `ap_paint_stroke` (screen, any length, with `taper`,
+     `smooth`, `jitter`, per-point pressure, or a `generate`d scratch or dabs),
+     `ap_paint_stroke_world`, `ap_paint_stroke_uv` (aim by texture coordinates read off
+     `ap_mesh_uv_layout`; parts facing away from the camera are skipped and reported), or
+     `ap_paint_stroke_pointer` to let ArmorPaint's own stroke engine paint. Pass `capture: {}`
+     and check the result
 6. **Export**
    - `ap_fs_mkdir` a fresh, timestamped directory
    - `ap_export_textures <dir>` (layers) or `ap_export_material_bake <dir>` (material swatch on a plane)
@@ -269,16 +292,18 @@ Work in this order, because each step is cheaper than the next:
 
 1. Is the bridge alive? (`ap_ping`; heartbeat `t` advancing; bridge enabled?)
 2. Did the op return `ok`? An `unsupported` error names the missing binding — believe it and stop.
-3. Was a precondition silently false?
+3. Did the window change at all? Re-run the step with `capture: {}` — `no_visible_change: true`
+   means ArmorPaint did nothing visible, whatever the reply said.
+4. Was a precondition silently false?
    - fill/paint: `ctx.layer == NULL`, layer is a group, or the layer is a **fill layer** (paint is
      refused on fill layers unless the tool is picker/material/colorid)
    - paint: the screen point missed the mesh, or the world point is behind the camera (dropped
      silently); strokes are camera-dependent
    - material op: the name did not match — a material's name is its **canvas** name
    - node op: socket index out of range, or you never called `_update`
-4. Did it work but land somewhere you did not look? Check the channel write masks
+5. Did it work but land somewhere you did not look? Check the channel write masks
    (`ap_material_get_active`), then export and look.
-5. Only then suspect the app: `ap_console_write` a marker, and ask the human what the UI shows.
+6. Only then suspect the app: `ap_console_write` a marker, and ask the human what the UI shows.
 
 Read: `references/armorpaint-workflow.md`
 

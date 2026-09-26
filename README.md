@@ -10,14 +10,23 @@ and export textures — against a **stock, unmodified ArmorPaint**, including th
 > This is an independent third-party tool. Please do not file ArmorPaint bugs for it, and do not
 > file its bugs upstream.
 
-> **Status: works, lightly travelled.** The original 58 tools are implemented and were exercised against a
-> live ArmorPaint 1.0: a 66-call sweep covering 42 tools returned **60 OK, 6 structured errors (all
+> **This release: bridge 2.1, native extension 2.** It answers a review that listed five
+> shortcomings (stroke kinematics, feedback latency, node-graph building, mesh/UV repair, undo and
+> state). What could be fixed was, and what cannot be is argued in
+> [Review response](#review-response-what-changed-and-what-cannot). The new work was built test
+> first and verified **live on Linux** against ArmorPaint 1.0 built from the pinned commit, under
+> Xvfb with openbox and Mesa's lavapipe (`tools/live_harness.sh`). Every `tests/test_live*.py`
+> suite passes on the stock build (41 passed; the 8 skipped need the extension) and on the
+> extension build (47 passed; the 2 skipped are stock-only), alongside the offline suite.
+>
+> **Earlier status: works, lightly travelled.** The original 58-tool surface is implemented and was exercised against a
+> live ArmorPaint 1.0: a 66-call sweep covering 42 of the tools returned **60 OK, 6 structured errors (all
 > deliberate bad-input probes), 0 crashes or timeouts**, at 15–513 ms per call. That includes the
 > destructive surface — `project_new`, `project_open`, `project_save_as`, `material_delete`,
 > `export_*` and the paint ops — run against a scratch project.
 >
 > **Linux** was then tested separately (Arch/CachyOS, ArmorPaint 1.0 system package, Vulkan/RADV):
-> an MCP stdio sweep over all 58 tools returned **77 OK and 5 structured errors (all deliberate
+> an MCP stdio sweep over all 58 of the original tools returned **77 OK and 5 structured errors (all deliberate
 > probes), 0 crashes or timeouts**. Getting there needed Linux-specific plugin fixes; see
 > [Linux notes](#linux-notes).
 >
@@ -34,7 +43,7 @@ and export textures — against a **stock, unmodified ArmorPaint**, including th
 > hung ArmorPaint after ~30 s (see [Linux notes](#linux-notes)), and keyboard undo worked only 6
 > times in 10. After the fixes: 13 of the 14 live tests pass (the 14th needs the extension and is
 > skipped), keyboard undo and redo 20/20 each, 150 s of continuous requests with a flat descriptor
-> count, wakes from 15–90 s dozes in 19–37 ms, and a real MCP stdio session lists all 88 tools. 22
+> count, wakes from 15–90 s dozes in 19–37 ms, and a real MCP stdio session listed every tool of that release (88). 22
 > offline tests cover the rest (`tests/test_offline.py`). The extension build has not been re-run
 > since the fixes.
 >
@@ -189,7 +198,7 @@ frame. A bake or a large export still takes as long as ArmorPaint takes.
 
 ## Tool index
 
-88 tools, in three groups by what answers them:
+106 tools, in three groups by what answers them:
 
 - **Stock bridge** — a named minic binding or a registered struct field, on any ArmorPaint 1.0.
   Tabulated in [docs/MINIC_DIALECT_AND_API.md](docs/MINIC_DIALECT_AND_API.md) §2.13.
@@ -276,23 +285,48 @@ socket and button with its index, name, type and default, e.g. `4:Scale:VALUE=5`
 `ap_node_set_value` (float / color / vector / button).
 
 Node types are Blender-style uppercase identifiers — `TEX_NOISE`, `TEX_BRICK`, `RGB`, `MIX_RGB` —
-and `ap_node_add` validates against the 76 legal names rather than passing an unknown string into
-the app. The list is in `docs/MINIC_DIALECT_AND_API.md` §2.6.
+and `ap_node_add` validates against the **socket catalogue** (`armorpaint_mcp/data/node_sockets.json`,
+generated from ArmorPaint's own node sources by `tools/gen_node_sockets.py`): 68 types a material
+canvas can create here. The hand-written list it replaced also held `BOOL`, `ENUM`, `RGBA`,
+`STRING`, `VECTOR` and `CUSTOM`, which are socket and button types that ArmorPaint rejects as
+unknown node types (checked live).
 
-**Painting & viewport** (8)
+**Whole graphs & recipes** (6) — one call instead of dozens, and nothing half-done:
 
 | Tool | Does |
 |---|---|
-| `ap_select_tool` | Select one of the 14 tools, and read back what took |
+| `ap_node_graph_get` | The whole graph in one call: every node, its sockets **by name** with their values, its buttons, and every link with both ends named |
+| `ap_node_graph_apply` | Build or change the graph from a declarative spec: nodes by your own keys, sockets by name (`"noise.Color -> mix.Color 2"`, `"Value[1]"` where names repeat), dropdowns by option name (`"blend_type": "Multiply"`). Validated against the catalogue **before** anything is sent (types, socket names, value shapes, link cycles), then sent as batches, recompiled, and filled so it shows. **Any failing step puts the graph back exactly as it was.** Keeps the previous graph as a snapshot; lays out new nodes automatically |
+| `ap_node_graph_lint` | Cycles, nodes that feed nothing, links into paint channels the material has switched off, socket type conversions |
+| `ap_node_graph_snapshot` / `ap_node_graph_restore` | Save the graph, and bring it back with the fewest operations (re-created nodes get new ids; `id_map` says which). This is how a node edit is undone: **ArmorPaint's history does not record node edits** |
+| `ap_node_recipe` | Parameterised looks: `worn_painted_metal`, `painted_wood`, `stone`, and `edge_wear_grunge` (curvature-driven edge wear masked by Voronoi grunge). List, render the spec, or apply |
+
+**Painting & viewport** (16)
+
+| Tool | Does |
+|---|---|
+| `ap_select_tool` | Select one of the 14 painting tools, and read back what took |
 | `ap_set_brush` | Radius, opacity, hardness, scale, angle, blending |
-| `ap_paint_stroke` | A stroke in screen space, as a point list |
-| `ap_paint_stroke_world` | A stroke in world space |
+| `ap_paint_stroke` | A stroke in screen space, **any length**: up to 48 points go in one request, longer strokes are streamed over several frames as one continuous ArmorPaint stroke. Per-point pressure (`[x, y, radius, opacity]` multipliers, verified live: a taper really is thicker at its start), `smooth` (Catmull-Rom), `spacing`, `taper` (in/out/both), seeded `jitter`, or `generate` a scratch, zigzag, spiral or scattered dabs. `record` films it into a contact sheet |
+| `ap_paint_stroke_world` | The same in world space (camera-independent aim; the point must still be visible) |
+| `ap_stroke_begin` / `ap_stroke_points` / `ap_stroke_end` | Paint one stroke piece by piece and look in between. Any other tool call closes an open stroke (a capture does not); so do 5 s without points |
+| `ap_paint_stroke_pointer` ▣ | A real press-drag-release in the window, so ArmorPaint's **own** stroke engine paints (its spacing, lazy mouse, symmetry). Window pixels. Paced to the measured frame time: events faster than a frame broke strokes into pieces (measured) |
+| `ap_paint_stroke_uv` | A stroke in **texture space** (u right, v down, as in an exported texture or `ap_mesh_uv_layout`), mapped onto the model through its UVs. Split at island changes so it never cuts across the model; parts on faces turned away from the camera are skipped, because painting them would land on whatever faces the camera (measured). Calibrated live against exported textures |
 | `ap_fill_layer` | Fill the active layer. The first fill after `ap_material_update` is repeated on the next frame, because on its own it left the viewport showing the previous material in about half of measured edits |
 | `ap_set_display_channel` | Switch the viewport display channel (one of 16) |
 | `ap_capture_to_project` | Capture the viewport **into the project as a texture asset** (not a file you can read) |
-| `ap_capture_window` ▣ | **Screenshot ArmorPaint's window and return it as an image** — the shaded viewport plus the UI. Reads the window's own pixels from outside the app, so it works while the window is covered and never steals focus: Linux X11/XWayland `XGetImage` (verified, ~130 ms for 1720×960), Windows `PrintWindow(PW_RENDERFULLCONTENT)`, macOS `screencapture -l` (needs Screen Recording permission). Optional `crop` and `downscale` |
+| `ap_capture_window` ▣ | **Screenshot ArmorPaint's window and return it as an image** — the shaded viewport plus the UI. `diff_against` (`"last"` or a capture id) adds what changed: bounding box, fraction and a zoomed image of the change. Reads the window's own pixels from outside the app, so it works while the window is covered and never steals focus: Linux X11/XWayland `XGetImage` (verified, ~130 ms for 1720×960), Windows `PrintWindow(PW_RENDERFULLCONTENT)`, macOS `screencapture -l` (needs Screen Recording permission). Optional `crop` and `downscale` |
 | `ap_capture_viewport` | The 3D viewport alone to a real PNG, returned as an image. Works when the build exports `viewport_save_texture_to_file` (upstream since 2026-09-09, commit `1e14e27e`, or `patch/apply_viewport_patch.py`) **or** carries the native extension; the bridge detects either on first use — no flag to set. Otherwise `unsupported` |
+| `ap_capture_sequence` ▣ | Film the window for up to 10 s at up to 10 fps, as one contact sheet |
 | `ap_camera` ◆ | Preset views (front/back/left/right/top/bottom/reset), orbit, zoom, FOV |
+
+**Look in the same call.** `ap_paint_stroke`, `_world`, `_uv`, `_pointer`, `ap_stroke_end`,
+`ap_fill_layer`, `ap_batch`, `ap_node_graph_apply` and `ap_node_recipe` take `capture: {}`: the
+window is captured before and after, and the reply carries the after-image, the changed region and
+a `no_visible_change` flag, which is how a silent no-op shows itself. Settling waits 3 frames (a
+fill is complete on the 3rd, measured) and a noise floor keeps the brush cursor, which moves on its
+own, from counting. Bridge replies also carry `timing`: the round trip, and the handler time
+inside ArmorPaint.
 
 **Layers** ◆ (8) — the Layers panel, with the same undo steps it pushes.
 
@@ -307,7 +341,28 @@ the app. The list is in `docs/MINIC_DIALECT_AND_API.md` §2.6.
 | `ap_layer_action` | clear, merge_down, merge_group, to_fill, to_paint, apply_mask, invert_mask |
 
 **History** (3) — `ap_undo` and `ap_redo` (◆ exact, reporting the history; on a stock build they
-press ArmorPaint's own `ctrl+z` / `ctrl+shift+z` through synthetic input), `ap_history` ◆.
+press ArmorPaint's own `ctrl+z` / `ctrl+shift+z` through synthetic input and then compare the
+context, the material, its graph and the window's pixels before and after, so the reply says
+whether anything changed), `ap_history` ◆. ArmorPaint's history covers paint, fills, layers and
+material create/delete; it does **not** cover node edits, config, camera or mesh operations
+(`script_material_*` push no history step, checked live). The checkpoints below cover those.
+
+**Checkpoints** (3) — `ap_checkpoint`, `ap_rollback`, `ap_checkpoint_list`. A checkpoint records
+ArmorPaint's history position by step identity (◆), a snapshot of the node graph, or (◆, `kind:
+"project"`) the whole project written to a snapshot file without changing the project's own path.
+Rollback is checked against the live history first. If the step fell off the end (more than
+`undo_steps` since) or was discarded by a branch, it refuses and says which, instead of undoing to
+the wrong place. Destructive tools (fill, layer delete/actions, material delete, texture
+resolution, mesh ops, project new/open) take one automatically and name it in their reply;
+`ARMORPAINT_MCP_AUTOCHECKPOINT=0` turns that off. `ap_batch(atomic=true)` is all or nothing.
+
+**Mesh & UV** (3) — check the mesh before painting, and fix what ArmorPaint can fix:
+
+| Tool | Does |
+|---|---|
+| `ap_mesh_inspect` | Exports the mesh (as `ap_export_mesh`) and reports UV islands and seams, overlap, UV triangles mirrored against the rest or collapsed, UDIM tiles, texel-density spread between islands, and boundary / non-manifold edges, each issue with a suggestion; plus the layout as an image. Any build |
+| `ap_mesh_uv_layout` | The UV layout as an image, v down like an exported texture: overlaps red, optional texel-density heat map |
+| `ap_mesh_op` ◆ | The Meshes tab's edits: UV unwrap, normals (smooth/flat/flip), to origin, rotate, decimate, smooth, subdivide, bevel, and a re-import that keeps the layers. A project checkpoint is taken first (none of these is in ArmorPaint's history); UV or topology changes need `confirm_invalidates_paint` |
 
 **Bake & render** ◆ (5) — `ap_bake` (curvature, normal, object normal, height, derivative,
 position, texcoord, material/object id, vertex colour, and — with hardware ray tracing — occlusion,
@@ -340,6 +395,8 @@ ap_fill_layer   (or ap_paint_stroke / _world)       APPLY it   <-- the step peop
 ap_capture_window   (or ap_capture_viewport)        look at it
 ```
 
+`ap_node_graph_apply` and `ap_node_recipe` do all four steps (the capture with `capture: {}`).
+
 **`ap_material_update` does not render.** ArmorPaint's viewport shows the *layer stack*; the node
 graph is only the paint *source*. Measured: viewport captures taken before and after a colour
 change plus `ap_material_update` are **byte-identical** — the pixels change only once you fill or
@@ -359,7 +416,7 @@ binding, `mcp_ext_call`, that the bridge detects at run time.
 |---|---|---|
 | **No 3D viewport capture on a stock binary** — `viewport_save_texture` only writes into the project | `ap_capture_window` screenshots the window from outside the app; `ap_capture_viewport` detects `viewport_save_texture_to_file` or the extension by itself (the `HAVE_VIEWPORT_PATCH` flag is gone) | Window capture: any build — Linux verified; Windows and macOS implemented, not yet run on hardware. Viewport-only: builds from after 2026-09-09, or with a patch |
 | **ArmorPaint renders at full rate while the bridge is enabled** | The bridge holds the app awake only for `linger` seconds (default 10) after a request, then lets it sleep. The server wakes it before the next request with a synthetic 1-pixel pointer move (Iron resets its idle counter on any input event): measured 120 frames asleep → wiggle → frames resume, ping answered in 38 ms. `ap_bridge_set_idle` tunes or disables it | Linux verified; Windows implemented; macOS defaults to never sleeping because its wake path (`CGEventPostToPid`) is untested |
-| **One request per frame** | `ap_batch` sends up to 64 steps as one request; the plugin runs several light steps per frame while its per-frame script-call budget allows (each script call costs ~29 KB of minic's 8 MB arena, measured peak 1.5 MB for a batch frame) and gives GPU-heavy steps a frame each. Between requests of a conversation it polls every frame instead of every 50 ms. Measured: 9 steps in 3 frames | Any build |
+| **One request per frame** | Strokes are streamed: `stroke_begin` / `stroke_points` / `stroke_end` keep one ArmorPaint stroke open across frames, so a stroke has no length limit. `ap_batch` sends up to 64 steps as one request; the plugin runs several light steps per frame while its per-frame script-call budget allows (each script call costs ~29 KB of minic's 8 MB arena, measured peak 1.5 MB for a batch frame) and gives GPU-heavy steps a frame each. Between requests of a conversation it polls every frame instead of every 50 ms. Measured: 9 steps in 3 frames | Any build |
 | **A slow handler is a visible hitch** | Heavy ops (exports, saves, opens, imports, bakes) wait until no mouse button is held in the app, so they never land mid-stroke, and publish `busy` first. (The old README promised a pending-token mechanism that was never implemented; this replaces it.) A handler still runs inline — ArmorPaint's GPU work belongs to the render thread | Any build |
 | **No layer control, layer state unreadable** | `ap_layer_*`: list, select, create (paint/fill/decal/group/masks), delete, duplicate, rename, opacity, blending, visibility, reorder, merge, clear, convert, apply/invert mask — each pushing the same undo step as the Layers panel | Native extension |
 | **No undo/redo** | `ap_undo` / `ap_redo` / `ap_history` through the extension; on a stock build `ap_undo` / `ap_redo` press the app's own shortcuts (measured: a created material disappears and comes back, 20 of 20 each way) | Extension: exact. Stock: keystroke |
@@ -380,6 +437,100 @@ binding, `mcp_ext_call`, that the bridge detects at run time.
 - Windows and macOS code paths for capture, wake and input are unverified on real hardware.
 - Some things remain out of reach even with the extension: arbitrary script evaluation, and
   anything the extension does not wrap (see `docs/MINIC_DIALECT_AND_API.md` §2.14).
+
+## Review response: what changed, and what cannot
+
+A review of this project named five things it could not do. Each is taken in turn below: what
+was built, and what stays out of reach, with the reason. Everything here is tested; what cannot
+be tested is listed at the end, not skipped.
+
+### 1. Stroke kinematics
+
+**Built.** ArmorPaint keeps a script stroke open across frames: upstream's
+`script_paint_begin_stroke` runs once per stroke and only `script_paint_end` closes it. So
+strokes are now streamed (bridge ops `stroke_begin` / `stroke_points` / `stroke_end`) and have no
+length limit. Each point can carry its own pressure, as radius and opacity multipliers per dab.
+Shaping (smoothing, spacing, taper, jitter) and generators (scratch, zigzag, spiral, dabs) make
+organic strokes from a few points. `ap_paint_stroke_pointer` hands a stroke to ArmorPaint's own
+stroke engine, and `ap_paint_stroke_uv` paints in texture space.
+
+**Cannot be done.** Real pen pressure and tilt: synthetic window input (XSendEvent, Win32
+PostMessage) carries no tablet axes, and the plugin API has no pen binding. Per-point pressure
+and the pointer path are the substitute.
+
+### 2. Visual feedback latency
+
+**Built.** A tool can return what it did in the same reply (`capture`), with the changed region
+and a `no_visible_change` flag. `ap_capture_window` diffs against an earlier capture.
+Recorded strokes and `ap_capture_sequence` give a filmstrip. Replies carry `timing`.
+
+**Cannot be done.** A model correcting a stroke 30 times a second. A model turn takes seconds; a
+request round trip takes tens of milliseconds and a capture about 130 ms. A socket would save
+milliseconds, not seconds, and the plugin API has no inbound socket anyway
+([ARCHITECTURE.md](docs/ARCHITECTURE.md)). What can be done is to cut the number of turns, which
+the items above do. A closed control loop would have to run without the model.
+
+### 3. Node graphs
+
+**Built.** A whole-graph read, a declarative apply that validates before it touches anything and
+rolls back on failure, lint, snapshots, recipes, and a socket catalogue generated from
+ArmorPaint's source.
+
+**Cannot be done on a stock build.** Editing the canvas inside a `GROUP` node (the node API
+reaches only the material's top-level canvas), setting string-valued buttons (the setter writes
+only floats), and brush graphs (five node types; custom brush nodes cannot read their inputs).
+The extension could reach group canvases; that is not done yet.
+
+### 4. Mesh and UV topology
+
+**Built.** `ap_mesh_inspect` and `ap_mesh_uv_layout` diagnose UV and topology problems on any
+build. `ap_mesh_op` (◆) runs ArmorPaint's own unwrap and mesh modifiers, and re-imports a
+repaired mesh while keeping the layers.
+
+**Cannot be done.** Seam placement, hand UV editing and arbitrary topology edits: ArmorPaint has
+no tools for them, only the whole-mesh operations above, so that work belongs in a 3D tool, with
+`ap_mesh_op reimport` to bring the result back. Carrying existing paint over to new UVs is not
+possible either: layers are stored in texture space and ArmorPaint has no UV-to-UV transfer. This
+is why inspection comes before painting, and why UV-changing ops need confirmation.
+
+### 5. State, undo and rollback
+
+**Built.** Checkpoints that combine the undo history (by step identity), graph snapshots and
+project snapshots. Rollback refuses with a reason instead of drifting. Destructive tools take a
+checkpoint automatically, batches can be atomic, and stock undo reports whether it changed
+anything. The server keeps no mirror of ArmorPaint's state. Every read is live, and a
+checkpoint's history part is checked against the live history each time, so the two cannot
+silently drift apart.
+
+**Cannot be done.** Undoing node, config, camera or mesh operations through ArmorPaint's own
+history (upstream does not record them; checkpoints cover them from outside). Unlimited
+history: depth is `undo_steps`, and each step keeps copies of layers in GPU memory. A stock build
+cannot snapshot an unsaved project without changing its path, so project checkpoints need the
+extension.
+
+### Physically untestable, stated rather than skipped
+
+- **Windows and macOS** paths for pointer strokes and filmstrip capture: no hardware here.
+  Offline tests check the event construction with mocks; the code stays labelled "implemented,
+  not run on hardware".
+- **Whether a stroke looks organic** is taste. Tests check geometry: smoothness, spacing, taper.
+- **The unwrap guard for builds without `WITH_PLUGINS`**: every build that can load this plugin
+  has plugins, so the `#else` branch cannot run; a static test checks it exists.
+- **The GPU memory cost of a larger `undo_steps`** depends on the GPU; documented, not asserted.
+- **A model in a 30 Hz loop** is not built; `timing` reports measurements, not pass/fail.
+
+## Testing
+
+```sh
+python -m pytest tests/                        # offline: no ArmorPaint needed
+tools/live_harness.sh build /tmp/ap            # or: build /tmp/ap-ext --ext
+tools/live_harness.sh run /tmp/ap &            # Xvfb :99 + openbox + ArmorPaint on lavapipe
+DISPLAY=:99 ARMORPAINT_LIVE=1 python -m pytest tests/test_live*.py
+```
+
+Live tests skip only for "this needs the extension" or "this needs a stock build", never to
+hide a missing test. `tests/fake_armorpaint.py` answers the node, history and project ops offline,
+in the reply shapes recorded from a live ArmorPaint.
 
 ## Linux notes
 
@@ -491,7 +642,8 @@ class of problem. Details in [docs/INSTALL.md](docs/INSTALL.md).
 | [docs/MINIC_DIALECT_AND_API.md](docs/MINIC_DIALECT_AND_API.md) | The minic dialect and the whole plugin API, read out of the source. If you are writing a plugin, this is the document. |
 | [docs/API_REFERENCE.md](docs/API_REFERENCE.md) | The generated binding list |
 | [docs/UPSTREAM_CHANGES.md](docs/UPSTREAM_CHANGES.md) | The optional native extension and viewport patch, exactly |
-| [tests/](tests/) | `test_offline.py` (no app needed) and `test_live.py` (`ARMORPAINT_LIVE=1`, against a running ArmorPaint) |
+| [tests/](tests/) | Offline tests (no app needed) and `test_live*.py` (`ARMORPAINT_LIVE=1`, against a running ArmorPaint); see [Testing](#testing) |
+| [tools/](tools/) | `live_harness.sh` (build and run ArmorPaint headless for the live tests) and `gen_node_sockets.py` (regenerate the socket catalogue) |
 
 Everything in `docs/` was derived by reading ArmorPaint 1.0 at commit
 `906418acc600132fa927876d208eb452dc5a0967`. Public web documentation for ArmorPaint's scripting

@@ -222,7 +222,9 @@ Rules of thumb that survive the blindness:
 
 ## Recipes
 
-Each is an ordered op list. Node references are the ids returned by `ap_node_add`. Every recipe ends
+These four ship as parameterised graphs: `ap_node_recipe name=worn_painted_metal` (also
+`painted_wood`, `stone`, and `edge_wear_grunge`), which builds, recompiles and fills in one call and
+takes the previous graph as a snapshot. The op lists below show what they do, step by step; each ends
 with update, then a bake-to-plane so you can look at it.
 
 ### Worn painted metal

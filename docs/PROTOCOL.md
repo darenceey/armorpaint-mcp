@@ -91,7 +91,7 @@ parsing garbage.
 
 **Heartbeat** — `heartbeat.json`, rewritten roughly once per second:
 ```json
-{ "v": 1, "pid_hint": "armorpaint", "bridge_version": "2.0.0", "app_version": "1.0",
+{ "v": 1, "pid_hint": "armorpaint", "bridge_version": "2.1.0", "app_version": "1.0",
   "t": 1234.567, "project": "C:/work/goblin.arm", "busy": false }
 ```
 `t` is `sys_time()` seconds since app start — **monotonic within a run, not wall clock.** Liveness is
@@ -235,7 +235,8 @@ and refuses every op except `bridge_set_enabled` and `ping` with `bridge_disable
 server wakes it like any dozing bridge, it can be re-enabled remotely.
 
 Heartbeat fields added for this: `dozing` (bool), `linger` (s), `job_open` (a request is being
-worked on), `job_held` (a heavy item is waiting for the mouse to be released), `ext` (-1 unknown,
+worked on), `job_held` (a heavy item is waiting for the mouse to be released), `stroke_open`
+(bridge 2.1: a streamed stroke is open between `stroke_begin` and `stroke_end`), `ext` (-1 unknown,
 0 absent, 1 native extension present). The server treats a frozen `t` as a fault only when the
 bridge is not dozing, the request is still unread, and the freeze has lasted `STALL_LIMIT_S`
 (8 s) — a single frame can legitimately take seconds.

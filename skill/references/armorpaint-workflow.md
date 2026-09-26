@@ -115,7 +115,9 @@ Guards that make it a silent no-op: no layer selected, or the layer is a group.
 
 ## Painting
 
-Strokes exist, and they are the least reliable thing you can do blind.
+Strokes exist, and they are the least reliable thing you can do blind: always pass `capture: {}`
+and look at `no_visible_change`. They are no longer limited to one frame: any length is streamed
+as one stroke, and each point can carry pressure (`[x, y, radius, opacity]` multipliers).
 
 ```
 ap_select_tool tool=brush           (a NAME, not an index: bake blur brush clone colorid
@@ -137,6 +139,11 @@ ap_paint_stroke        "x,y; x,y; ..."          -> N x script_paint + paint_end
   `script_paint_end()` is what dilates and commits.
 - **Paint is refused on a fill layer** unless the tool is picker, material or colorid
   (`script_paint_allowed`, `minic_impl.c:187`). A no-op here looks identical to success.
+
+Aiming by texture coordinates: `ap_paint_stroke_uv` maps UV points (read off `ap_mesh_uv_layout`,
+v down) onto the model and paints them; a path crossing between UV islands is split, and parts on
+faces turned away from the camera are skipped and reported by the direction they face — turn the
+view that way (`ap_camera`, extension) and paint them again.
 
 Practical rule: use strokes only when the user has framed the camera and asked for a stroke, or for
 deliberately loose hand-work they will review. Everything else goes through a material plus a fill.

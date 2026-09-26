@@ -68,7 +68,7 @@ try:  # normal package import
     from . import checkpoints, desktop_input, image_diff, local_tools, mesh_inspect, node_catalogue, node_graph, recipes, strokes
     from .transport import send_batch
 except ImportError:  # running server.py as a loose script
-    __version__ = "1.1.0"
+    __version__ = "1.2.0"
     from transport import (  # type: ignore[no-redef]
         BadArgs,
         BridgeError,

@@ -124,9 +124,14 @@ A tool-per-function design would therefore break, invisibly, at tool 32 — and 
 (a few tools mysteriously unavailable) points nowhere near the cause.
 
 So the bridge is **one `dispatch()` function containing an `if / else if` chain**, one arm per
-operation. Arms are not functions; the chain can grow past 54 without approaching the cap. The
-other caps are respected the same way: 32 arrays with 512 total elements, 128 locals per scope, 64
-globals, 20 parameters.
+operation. Arms are not functions; the chain can grow without approaching the cap. The bridge
+does use helper functions, and has now reached the cap exactly: 32 of 32 (`end_stroke`, added
+with streamed strokes, was the last), so any further logic must be a `dispatch()` arm. The other
+caps are respected the same way: 32 arrays with 512 total elements, 128 locals per scope, 20
+parameters, and 128 script globals. Script globals live in the top-level scope, so they share its
+`MINIC_MAX_VARS` = 128 (`minic.c:1980` declares them there, `:2092` sets the cap). An earlier
+version of this document said 64, but that is `MINIC_MAX_GLOBALS`, the cap on *host* globals. The
+bridge uses 70.
 
 There are more silent failures where that came from — no `#define`, no `switch`, no ternary, no
 casts, non-short-circuiting `&&` and `||`, `main` must be the last function in the file — all
@@ -222,6 +227,16 @@ inside `on_update`. Two consequences are designed around rather than worked arou
 Throughput is thus no longer one op per frame: an *n*-step plan sent as `ap_batch` takes about
 *n*/3 frames for light steps, and between the requests of a conversation the bridge polls every
 frame instead of every 50 ms.
+
+**A stroke is no longer bounded by one frame either.** Every number in a stroke request costs a
+`to_float` script call, so a request carries at most 48 points and 150 numbers. A longer stroke
+is streamed: `stroke_begin`, then `stroke_points` requests, then `stroke_end`. That works because
+ArmorPaint keeps a script stroke open across frames: `script_paint_begin_stroke` runs once per
+stroke (it is guarded by `script_paint_active`, `minic_impl.c`) and only `script_paint_end`
+dilates and closes it. Each `script_paint` call renders its dab at once, so a brush radius or
+opacity written just before it applies to that dab, which is how per-point pressure works
+(verified live). An open stroke is closed before any other op runs and after 5 s without points,
+so it can never be left dangling in the paint tool.
 
 ### And one more: the JSON parser cannot handle nested objects or arrays
 
