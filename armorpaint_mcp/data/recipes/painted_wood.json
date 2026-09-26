@@ -1,0 +1,39 @@
+{
+ "name": "painted_wood",
+ "description": "Wood grain (wave bands plus a fibre bump) under a paint coat that chips off on the edges (curvature). From skill/references/material-nodes.md.",
+ "params": {
+  "paint_color": {"type": "color", "default": [0.55, 0.15, 0.13, 1.0], "description": "Paint colour."},
+  "grain_scale": {"type": "number", "default": 3.0, "description": "Scale of the wood grain bands."},
+  "chip_min": {"type": "number", "default": 0.55, "description": "Curvature where paint starts to chip; raise for less chipping."}
+ },
+ "spec": {
+  "nodes": {
+   "grain": {"type": "TEX_WAVE", "inputs": {"Scale": "${grain_scale}", "Distortion": 1.8, "Detail Scale": 2.5}, "buttons": {"Wave Type": "Bands", "Direction": "X", "Wave Profile": "Saw"}},
+   "fibre": {"type": "TEX_NOISE", "inputs": {"Scale": 40.0, "Detail": 6.0}},
+   "dark": {"type": "RGB", "outputs": {"Color": [0.20, 0.12, 0.06, 1.0]}},
+   "light": {"type": "RGB", "outputs": {"Color": [0.45, 0.30, 0.16, 1.0]}},
+   "wood": {"type": "MIX_RGB", "buttons": {"blend_type": "Mix"}},
+   "paint": {"type": "RGB", "outputs": {"Color": "${paint_color}"}},
+   "curv": {"type": "BAKE_CURVATURE", "inputs": {"Strength": 1.0, "Radius": 0.7}},
+   "bare": {"type": "MAPRANGE", "inputs": {"From Min": "${chip_min}", "From Max": 0.8, "To Min": 0.0, "To Max": 1.0}, "buttons": {"Clamp": true}},
+   "top": {"type": "MIX_RGB", "buttons": {"blend_type": "Mix"}},
+   "rough": {"type": "MAPRANGE", "inputs": {"To Min": 0.42, "To Max": 0.75}, "buttons": {"Clamp": true}},
+   "bump": {"type": "BUMP", "inputs": {"Strength": 0.18}},
+   "out": {"existing": "OUTPUT_MATERIAL_PBR"}
+  },
+  "links": [
+   "grain.Factor -> wood.Factor",
+   "dark.Color -> wood.Color 1",
+   "light.Color -> wood.Color 2",
+   "curv.Value -> bare.Value",
+   "bare.Value -> top.Factor",
+   "paint.Color -> top.Color 1",
+   "wood.Color -> top.Color 2",
+   "top.Color -> out.Base Color",
+   "bare.Value -> rough.Value",
+   "rough.Value -> out.Roughness",
+   "fibre.Factor -> bump.Height",
+   "bump.Normal Map -> out.Normal Map"
+  ]
+ }
+}

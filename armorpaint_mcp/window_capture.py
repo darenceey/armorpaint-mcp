@@ -59,6 +59,13 @@ class Capture:
     window_id: int
     window_title: str
     method: str
+    rgb: bytes | None = None  # packed 8-bit RGB, filled lazily by pixels()
+
+    def pixels(self) -> bytes:
+        """The image as packed RGB rows (for diffing), decoded from the PNG once."""
+        if self.rgb is None:
+            _, _, self.rgb = _decode_png_rgb(self.png)
+        return self.rgb
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -646,7 +653,7 @@ def _decode_png_rgb(data: bytes) -> tuple[int, int, bytes]:
     for y in range(height):
         f = raw[y * (stride + 1)]
         line = bytearray(raw[y * (stride + 1) + 1 : (y + 1) * (stride + 1)])
-        for i in range(stride):
+        for i in range(stride if f else 0):  # filter 0 (what the capture backends write): as is
             a = line[i - bpp] if i >= bpp else 0
             b = prev[i]
             c = prev[i - bpp] if i >= bpp else 0

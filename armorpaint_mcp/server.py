@@ -39,8 +39,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
+import sys
 import time
+from collections import OrderedDict
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -62,7 +65,7 @@ try:  # normal package import
         spool_resolution,
     )
     from .window_capture import MAX_DOWNSCALE, CaptureError, capture_window
-    from . import desktop_input, local_tools
+    from . import desktop_input, image_diff, local_tools, node_catalogue, node_graph, recipes
     from .transport import send_batch
 except ImportError:  # running server.py as a loose script
     __version__ = "1.1.0"
@@ -82,7 +85,11 @@ except ImportError:  # running server.py as a loose script
         capture_window,
     )
     import desktop_input  # type: ignore[no-redef]
+    import image_diff  # type: ignore[no-redef]
     import local_tools  # type: ignore[no-redef]
+    import node_catalogue  # type: ignore[no-redef]
+    import node_graph  # type: ignore[no-redef]
+    import recipes  # type: ignore[no-redef]
     from transport import send_batch  # type: ignore[no-redef]
 
 # ---------------------------------------------------------------------------
@@ -283,20 +290,11 @@ VIEWPORT_MODES = {
     "path_trace": 15,
 }
 
-# Valid script_material_create_node(type) strings: nodes_material/*.c plus the pre-created
-# OUTPUT_MATERIAL_PBR. Validated here so a typo cannot reach the binding.
-NODE_TYPES = frozenset(
-    """ATTRIBUTE BAKE_CURVATURE BLUR BOOL BRIGHTCONTRAST BUMP CLAMP COLMASK COMBINE_COLOR
-    COMBXYZ CURVE_RGB CURVE_VEC CUSTOM DIRECT_WARP ENUM FLOAT_CURVE GAMMA GROUP GROUP_INPUT
-    GROUP_OUTPUT HUE_SAT INVERT_COLOR LAYER LAYER_MASK MAPPING MAPRANGE MATERIAL MATH
-    MIX_NORMAL_MAP MIX_RGB NEURAL_EDIT_IMAGE NEURAL_IMAGE_TO_3D_MESH NEURAL_IMAGE_TO_PBR
-    NEURAL_REPEAT NEURAL_SAVE_IMAGE NEURAL_TEXT_TO_IMAGE NEURAL_UPSCALE_IMAGE NEW_GEOMETRY
-    NORMAL NORMAL_MAP OBJECT_INFO OUTPUT_MATERIAL_PBR PICKER QUANTIZE REPLACECOL RGB RGBA
-    RGBTOBW SCRIPT_CPU SEPARATE_COLOR SEPXYZ SHADER_GPU STRING TEX_BAKE TEX_BRICK TEX_CAMERA
-    TEX_CHECKER TEX_COORD TEX_GABOR TEX_GRADIENT TEX_IMAGE TEX_MAGIC TEX_NOISE TEX_TEXT
-    TEX_VORONOI TEX_WAVE TILESHEET TILESHEET_ANIM UVMAP VALTORGB VALUE VECTOR VECT_MATH
-    VECT_ROTATE VECT_TRANSFORM WIREFRAME""".split()
-)
+# Valid script_material_create_node(type) strings: the node types in the socket catalogue
+# (data/node_sockets.json, generated from nodes_material/*.c and nodes_neural/*.c) that a
+# material canvas can create on this platform. The output node is pre-created with each
+# material. Validated here so a typo cannot reach the binding.
+NODE_TYPES = frozenset(node_catalogue.creatable(node_catalogue.load(), sys.platform))
 
 # Built-in primitives accepted by script_shape_add (minic_impl.c:702). Reported, not
 # enforced — the list is per-build and the plugin validates against script_shape_list().
@@ -1053,6 +1051,81 @@ TOOLS: list[types.Tool] = [
         },
         ["id", "kind"],
     ),
+    # ---- whole graphs --------------------------------------------------------
+    _tool(
+        "ap_node_graph_get",
+        "The active material's WHOLE node graph in one call: every node with its input and "
+        "output sockets BY NAME and their current values, every button, and every link with "
+        "both ends named. Use it instead of ap_node_list + one ap_node_get per node.",
+    ),
+    _tool(
+        "ap_node_graph_apply",
+        "Build or change the active material's graph from a declarative spec, as one "
+        "operation. The spec names nodes with your own keys and sockets BY NAME, so no ids or "
+        "socket indices are needed: {\"nodes\": {\"noise\": {\"type\": \"TEX_NOISE\", "
+        "\"inputs\": {\"Scale\": 4}}, \"mix\": {\"type\": \"MIX_RGB\", \"buttons\": "
+        "{\"blend_type\": \"Multiply\"}}, \"out\": {\"existing\": \"OUTPUT_MATERIAL_PBR\"}}, "
+        "\"links\": [\"noise.Color -> mix.Color 2\", \"mix.Color -> out.Base Color\"]}. "
+        "A node is new ({type, optional x/y}), or an existing one ({existing: TYPE} for the "
+        "first of that type, or {id: N}). 'inputs'/'outputs' set socket values (a number, or "
+        "[r,g,b(,a)] / [x,y,z]); 'buttons' set dropdowns by option name, checkboxes by "
+        "true/false, sliders by number. Where several sockets share a name, write "
+        "'Value[1]' (the second) or '#1' (index). Everything is validated against the node "
+        "catalogue BEFORE anything changes; then nodes are added, values set and links made "
+        "in batches, the material is recompiled, and (fill=true, the default) the selected "
+        "layer is filled so the result is visible. If any step fails the graph is put back "
+        "exactly as it was. The previous graph is kept as a snapshot (snapshot_id) for "
+        "ap_node_graph_restore. Missing positions are laid out automatically.",
+        {
+            "spec": {"type": "object", "description": "The graph spec (see above)."},
+            "mode": _s("'merge' adds to the graph; 'replace' first removes every node except "
+                       "the output and nodes the spec refers to.", enum=["merge", "replace"],
+                       default="merge"),
+            "dry_run": _b("Validate and return the plan without changing anything.", default=False),
+            "fill": _b("Fill the selected layer afterwards so the change shows.", default=True),
+            "label": _s("Label for the automatic before-snapshot."),
+        },
+        ["spec"],
+    ),
+    _tool(
+        "ap_node_graph_lint",
+        "Check the active material's graph for problems that otherwise only show as a wrong "
+        "render: link cycles, nodes that feed nothing reaching the output, links into paint "
+        "channels the material has switched off, and socket type conversions.",
+    ),
+    _tool(
+        "ap_node_graph_snapshot",
+        "Save the active material's graph so it can be put back with ap_node_graph_restore. "
+        "ArmorPaint's undo history does not record node edits, so this is how a graph edit "
+        "is taken back. With list=true, list the saved snapshots instead.",
+        {"label": _s("A label to find it by."), "list": _b("List snapshots instead.", default=False)},
+    ),
+    _tool(
+        "ap_node_graph_restore",
+        "Put the active material's graph back to a snapshot: removes nodes added since, "
+        "re-creates removed ones (they get new ids; id_map says which), resets socket and "
+        "button values and relinks. Node positions and custom node names cannot be written "
+        "by the bridge and stay as they are.",
+        {
+            "snapshot_id": _s("From ap_node_graph_snapshot or ap_node_graph_apply."),
+            "force": _b("Restore even if a different material is now active.", default=False),
+        },
+        ["snapshot_id"],
+    ),
+    _tool(
+        "ap_node_recipe",
+        "Ready-made material graphs with parameters (worn_painted_metal, painted_wood, stone, "
+        "edge_wear_grunge, ...). No name: list them with their parameters. With a name: "
+        "return the filled-in spec, or with apply=true build it (as ap_node_graph_apply).",
+        {
+            "name": _s("Recipe name."),
+            "params": {"type": "object", "description": "Parameter values; defaults for the rest."},
+            "apply": _b("Build it into the active material.", default=False),
+            "mode": _s("As ap_node_graph_apply.", enum=["merge", "replace"], default="replace"),
+            "fill": _b("As ap_node_graph_apply.", default=True),
+            "dry_run": _b("As ap_node_graph_apply.", default=False),
+        },
+    ),
     # ---- painting & viewport ---------------------------------------------
     _tool(
         "ap_select_tool",
@@ -1200,9 +1273,17 @@ TOOLS: list[types.Tool] = [
                 "if the bridge is not running.",
                 default=True,
             ),
+            "settle_frames": _i("How many frames to wait when settling (a fill needs 3).",
+                                minimum=1, maximum=30, default=3),
             "include_image": _b(
                 "Return the PNG inline. Set false (with 'path') to keep the response small.",
                 default=True,
+            ),
+            "diff_against": _s(
+                "Compare with an earlier capture: 'last', or a capture_id from an earlier "
+                "reply (the server keeps the last 8). Adds the changed-pixel bounding box and "
+                "fraction, and a second image zoomed on the change. Both captures need the "
+                "same crop and downscale."
             ),
         },
     ),
@@ -1343,22 +1424,27 @@ TOOLS += [
     # ---- history ---------------------------------------------------------------
     _tool(
         "ap_undo",
-        "Undo the last step(s) — anything ArmorPaint records: paint, fills, node edits, "
-        "layer and material changes. Uses the native extension (exact, and reports the "
-        "history); on a stock build it presses the app's own undo shortcut (ctrl+z) through "
-        "synthetic input instead, which cannot report what was undone.",
+        "Undo the last step(s) of ArmorPaint's own history: paint strokes, fills, layer "
+        "changes and material create/delete. Material NODE edits are NOT in that history "
+        "(ArmorPaint's node API records no undo step), and neither are config, camera or "
+        "mesh changes: to take back a graph edit, restore a graph snapshot "
+        "(ap_node_graph_snapshot / ap_node_graph_restore; ap_node_graph_apply keeps one "
+        "automatically). Uses the native extension (exact, and reports the history); on a "
+        "stock build it presses the app's own undo shortcut (ctrl+z) through synthetic input "
+        "instead, which cannot report what was undone.",
         {"steps": _i("How many steps.", minimum=1, maximum=64, default=1)},
     ),
     _tool(
         "ap_redo",
-        "Redo undone step(s). Native extension, or the ctrl+shift+z shortcut on a stock "
-        "build (see ap_undo).",
+        "Redo undone step(s) of ArmorPaint's history, which does NOT include node edits (see "
+        "ap_undo). Native extension, or the ctrl+shift+z shortcut on a stock build.",
         {"steps": _i("How many steps.", minimum=1, maximum=64, default=1)},
     ),
     _tool(
         "ap_history",
         "The undo history: the last 32 step names, which are undone, and how many "
-        "undos/redos are available. Needs the native extension.",
+        "undos/redos are available. Node edits never appear in it (see ap_undo). Needs the "
+        "native extension.",
     ),
     # ---- export / bake / render ------------------------------------------------
     _tool(
@@ -1778,9 +1864,10 @@ def _build_wire_args(name: str, a: dict[str, Any]) -> dict[str, Any]:
         node_type = _req_str(a, "type").upper()
         if node_type not in NODE_TYPES:
             raise BadArgs(
-                f"Unknown node type {node_type!r}. This list comes from the running build's "
-                f"own --api dump; a node added by a newer ArmorPaint would need this server "
-                f"updated. Valid types: " + " ".join(sorted(NODE_TYPES)),
+                f"Unknown node type {node_type!r}. This list is the socket catalogue "
+                f"(data/node_sockets.json, generated from ArmorPaint 1.0's node sources); a node "
+                f"added by a newer ArmorPaint needs it regenerated (tools/gen_node_sockets.py). "
+                f"Valid types: " + " ".join(sorted(NODE_TYPES)),
                 arg="type",
             )
         return {
@@ -2091,37 +2178,67 @@ def _image_content(path: Path, max_bytes: int) -> types.ImageContent:
 # MCP server definition
 # ---------------------------------------------------------------------------
 
-async def _capture_window_tool(
-    args: dict[str, Any],
-) -> list[types.TextContent | types.ImageContent]:
-    crop_raw = args.get("crop")
-    crop: tuple[int, int, int, int] | None = None
-    if crop_raw is not None:
-        if (
-            not isinstance(crop_raw, list)
-            or len(crop_raw) != 4
-            or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in crop_raw)
-        ):
-            raise BadArgs("'crop' must be [x, y, width, height] as four numbers.", arg="crop")
-        crop = (int(crop_raw[0]), int(crop_raw[1]), int(crop_raw[2]), int(crop_raw[3]))
-    downscale = _opt_int(args, "downscale", 1, MAX_DOWNSCALE) or 1
-    save_to = _norm_path(args, "path", required=False)
-    if save_to is not None and not save_to.lower().endswith(".png"):
-        raise BadArgs("'path' must end in .png.", arg="path")
+_CAPTURE_RING = 8
 
+# Pings (one per ArmorPaint frame) before a capture. Measured live: a fill's result is
+# complete on the 3rd frame after it -- 440, 54 772, 55 011 changed pixels after 1, 2 and 3
+# pings -- because the fill is repeated on the next frame and the viewport redraws after.
+SETTLE_FRAMES = 3
+_CAPTURES: "OrderedDict[str, Any]" = OrderedDict()
+_capture_seq = 0
+
+NO_CHANGE_WARNING = (
+    "The window shows no visible change (at most a few pixels, as the brush cursor or a UI "
+    "widget alone would change). The operation may have been a silent no-op -- no "
+    "layer selected, a group layer, paint refused on a fill layer, a stroke off the model or "
+    "behind the camera -- or the change lies outside the captured area."
+)
+
+
+def _remember_capture(cap: Any) -> str:
+    global _capture_seq
+    _capture_seq += 1
+    cid = f"c{_capture_seq}"
+    _CAPTURES[cid] = cap
+    while len(_CAPTURES) > _CAPTURE_RING:
+        _CAPTURES.popitem(last=False)
+    return cid
+
+
+def _parse_crop(args: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    crop_raw = args.get("crop")
+    if crop_raw is None:
+        return None
+    if (
+        not isinstance(crop_raw, list)
+        or len(crop_raw) != 4
+        or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in crop_raw)
+    ):
+        raise BadArgs("'crop' must be [x, y, width, height] as four numbers.", arg="crop")
+    return (int(crop_raw[0]), int(crop_raw[1]), int(crop_raw[2]), int(crop_raw[3]))
+
+
+async def _grab(args: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    """Settle (a ping, so the last edit has rendered), then capture the window.
+    Returns (capture or None, report)."""
+    crop = _parse_crop(args)
+    downscale = _opt_int(args, "downscale", 1, MAX_DOWNSCALE) or 1
     loop = asyncio.get_running_loop()
     report: dict[str, Any] = {"ok": True}
+    started = time.monotonic()
 
     # Settle: a ping is answered in the frame AFTER any earlier request, and that earlier
     # frame has been rendered by then. The heartbeat's title picks the right window if
     # more than one ArmorPaint is open.
     hb = read_heartbeat()
     title = hb.get("app_title") if isinstance(hb, dict) else None
+    frames = _opt_int(args, "settle_frames", 1, 30) or SETTLE_FRAMES
     if _opt_bool(args, "settle") is not False and hb is not None:
         try:
-            await loop.run_in_executor(None, partial(send_to_armorpaint, "ping", {}, 5.0))
+            for _ in range(frames):
+                await loop.run_in_executor(None, partial(send_to_armorpaint, "ping", {}, 5.0))
             await asyncio.sleep(0.05)  # let the compositor pick up the presented frame
-            report["settled"] = True
+            report["settled"] = frames
         except BridgeError as exc:
             report["settled"] = False
             report["settle_error"] = exc.message
@@ -2133,14 +2250,55 @@ async def _capture_window_tool(
             None, partial(capture_window, title or None, crop, downscale)
         )
     except CaptureError as exc:
-        return _text(
-            {"ok": False, "code": exc.code, "error": exc.message, "tool": "ap_capture_window"}
-        )
-
+        return None, {"ok": False, "code": exc.code, "error": exc.message}
     report.update(cap.describe())
+    report["capture_id"] = _remember_capture(cap)
+    report["capture_ms"] = round((time.monotonic() - started) * 1000)
+    return cap, report
+
+
+def _png_image(png: bytes) -> types.ImageContent:
+    return types.ImageContent(type="image", data=base64.b64encode(png).decode("ascii"), mimeType="image/png")
+
+
+def _compare(before: Any, after: Any) -> tuple[dict[str, Any], bytes | None]:
+    """image_diff over two captures; the highlight PNG when something changed."""
+    try:
+        d = image_diff.diff(before.width, before.height, before.pixels(), after.pixels(),
+                            w2=after.width, h2=after.height)
+    except ValueError as exc:
+        return {"error": str(exc)}, None
+    if d["bbox"] is None:
+        return d, None
+    return d, image_diff.highlight(after.width, after.height, before.pixels(), after.pixels(), d["bbox"])
+
+
+async def _capture_window_tool(
+    args: dict[str, Any],
+) -> list[types.TextContent | types.ImageContent]:
+    save_to = _norm_path(args, "path", required=False)
+    if save_to is not None and not save_to.lower().endswith(".png"):
+        raise BadArgs("'path' must end in .png.", arg="path")
+    against = _opt_str(args, "diff_against")
+    previous = next(reversed(_CAPTURES)) if (against == "last" and _CAPTURES) else against
+
+    cap, report = await _grab(args)
+    if cap is None:
+        report["tool"] = "ap_capture_window"
+        return _text(report)
     if save_to is not None:
         Path(save_to).write_bytes(cap.png)
         report["path"] = save_to
+    extra: list[types.ImageContent] = []
+    if against is not None:
+        if previous is None or previous not in _CAPTURES or previous == report["capture_id"]:
+            report["diff"] = {"error": f"no capture {against!r} to compare with (the server keeps the last "
+                                       f"{_CAPTURE_RING}: {', '.join(_CAPTURES) or 'none'})"}
+        else:
+            d, hl = _compare(_CAPTURES[previous], cap)
+            report["diff"] = {"against": previous, **d}
+            if hl is not None:
+                extra.append(_png_image(hl))
     if len(cap.png) > MAX_IMAGE_BYTES:
         report["image_error"] = (
             f"PNG is {len(cap.png)} bytes, over the {MAX_IMAGE_BYTES}-byte inline limit; "
@@ -2149,11 +2307,68 @@ async def _capture_window_tool(
         return _text(report)
     text = types.TextContent(type="text", text=json.dumps(report, indent=2))
     if _opt_bool(args, "include_image") is False:
-        return [text]
-    image = types.ImageContent(
-        type="image", data=base64.b64encode(cap.png).decode("ascii"), mimeType="image/png"
-    )
-    return [image, text]
+        return [*extra, text]
+    return [_png_image(cap.png), *extra, text]
+
+
+# Tools that take an optional 'capture' argument: the window is captured after the
+# operation (and, for the diff, before it) and returned in the same reply.
+CAPTURE_TOOLS = frozenset(
+    {"ap_paint_stroke", "ap_paint_stroke_world", "ap_fill_layer", "ap_batch",
+     "ap_node_graph_apply", "ap_node_recipe"}
+)
+
+_CAPTURE_ARG = {
+    "type": "object",
+    "description": (
+        "Look in the same call: capture ArmorPaint's window after the operation and return "
+        "it with the result, saving a round trip. {} for the whole window; optional 'crop' "
+        "[x,y,w,h] and 'downscale' as ap_capture_window. By default the window is also "
+        "captured BEFORE and the reply says what changed (bounding box, fraction) with a "
+        "zoomed image of it, and flags no_visible_change -- the tell-tale of a silent "
+        "no-op. 'diff': false skips the before-capture."
+    ),
+    "properties": {
+        "crop": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
+        "downscale": {"type": "integer", "minimum": 1, "maximum": MAX_DOWNSCALE},
+        "settle_frames": {"type": "integer", "minimum": 1, "maximum": 30, "default": 3},
+        "diff": {"type": "boolean", "default": True},
+    },
+}
+
+for _t in TOOLS:
+    if _t.name in CAPTURE_TOOLS:
+        _t.inputSchema.setdefault("properties", {})["capture"] = _CAPTURE_ARG
+
+
+async def _with_capture(
+    name: str, args: dict[str, Any]
+) -> list[types.TextContent | types.ImageContent]:
+    opts = args.get("capture")
+    if not isinstance(opts, dict):
+        raise BadArgs("'capture' must be an object ({} captures the whole window).", arg="capture")
+    grab_args = {k: opts[k] for k in ("crop", "downscale", "settle_frames") if k in opts}
+    want_diff = opts.get("diff", True) is not False
+    before, before_report = (await _grab(grab_args)) if want_diff else (None, None)
+    content = await call_tool(name, {k: v for k, v in args.items() if k != "capture"})
+    texts = [c for c in content if getattr(c, "type", "") == "text"]
+    others = [c for c in content if getattr(c, "type", "") != "text"]
+    payload = json.loads(texts[-1].text) if texts else {}
+    after, block = await _grab(grab_args)
+    images: list[types.ImageContent] = []
+    if after is not None:
+        images.append(_png_image(after.png))
+        if before is not None:
+            d, hl = _compare(before, after)
+            block["diff"] = {"against": before_report["capture_id"], **d}
+            if hl is not None:
+                images.append(_png_image(hl))
+            if d.get("no_visible_change"):
+                block["warning"] = NO_CHANGE_WARNING
+        elif want_diff:
+            block["diff"] = {"error": f"no before-capture: {before_report.get('error')}"}
+    payload["capture"] = block
+    return [*others, *images, types.TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
 
 
 def _frame_fence() -> desktop_input.Fence:
@@ -2301,8 +2516,101 @@ def _undo_tool(op: str, wire: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# Tools that cannot be batch steps: answered locally, or would end the session.
-_UNBATCHABLE = LOCAL_TOOLS | {"ap_batch", "ap_quit", "ap_project_metadata", "ap_material_list", "ap_undo", "ap_redo"}
+GRAPH_TOOLS = frozenset(
+    {"ap_node_graph_get", "ap_node_graph_apply", "ap_node_graph_lint", "ap_node_graph_snapshot",
+     "ap_node_graph_restore", "ap_node_recipe"}
+)
+
+class _SpoolBridge:
+    """node_graph's two-method bridge over the real mailbox."""
+
+    def call(self, op: str, wire: dict[str, Any]) -> dict[str, Any]:
+        return send_to_armorpaint(op, wire, OP_TIMEOUTS.get(op, DEFAULT_TIMEOUT_S))
+
+    def batch(self, items: list[tuple[str, dict[str, Any]]], stop_on_error: bool = False) -> dict[str, Any]:
+        timeout = sum(OP_TIMEOUTS.get(op, DEFAULT_TIMEOUT_S) for op, _ in items)
+        return send_batch(items, min(timeout, 900.0), stop_on_error)
+
+
+def graph_bridge() -> node_graph.Bridge:
+    return _SpoolBridge()
+
+
+STATE_ENV = "ARMORPAINT_MCP_STATE"
+
+
+def _state_dir() -> Path:
+    """Where the server keeps its own state (graph snapshots, ...): $ARMORPAINT_MCP_STATE,
+    else a folder in the spool, which the plugin never touches."""
+    env = os.environ.get(STATE_ENV)
+    return Path(env) if env else spool_resolution().path / "mcp_state"
+
+
+def _snapshots() -> node_graph.SnapshotStore:
+    return node_graph.SnapshotStore(_state_dir() / "graph_snapshots")
+
+
+def _apply_report(report: dict[str, Any], label: str | None) -> dict[str, Any]:
+    snap = report.pop("snapshot", None)
+    if report.get("ok") and snap is not None:
+        report["snapshot_id"] = _snapshots().put(snap, label=label or "before ap_node_graph_apply")
+    return report
+
+
+def _graph_tool(name: str, a: dict[str, Any]) -> dict[str, Any]:
+    bridge = graph_bridge()
+    try:
+        if name == "ap_node_graph_get":
+            return {"ok": True, "graph": node_graph.read_graph(bridge)}
+        if name == "ap_node_graph_lint":
+            return {"ok": True, "issues": node_graph.lint(node_graph.read_graph(bridge))}
+        if name == "ap_node_graph_snapshot":
+            store = _snapshots()
+            if _opt_bool(a, "list"):
+                return {"ok": True, "snapshots": store.list()}
+            sid = store.put(node_graph.snapshot(bridge), label=_opt_str(a, "label"))
+            return {"ok": True, "snapshot_id": sid}
+        if name == "ap_node_graph_restore":
+            sid = _req_str(a, "snapshot_id")
+            try:
+                entry = _snapshots().get(sid)
+            except KeyError:
+                return {"ok": False, "code": "not_found", "error": f"no graph snapshot {sid!r}",
+                        "hint": "ap_node_graph_snapshot(list=true) lists them."}
+            return node_graph.restore(bridge, entry["snapshot"], force=bool(_opt_bool(a, "force")))
+
+        mode = _opt_str(a, "mode")
+        dry_run = bool(_opt_bool(a, "dry_run"))
+        fill = _opt_bool(a, "fill") is not False
+        if name == "ap_node_graph_apply":
+            spec = a.get("spec")
+            if not isinstance(spec, dict):
+                raise BadArgs("'spec' must be an object with 'nodes' (and optionally 'links').", arg="spec")
+            report = node_graph.apply(bridge, spec, mode=mode or "merge", dry_run=dry_run, fill=fill)
+            return _apply_report(report, _opt_str(a, "label"))
+        if name == "ap_node_recipe":
+            rname = _opt_str(a, "name")
+            if not rname:
+                return {"ok": True, "recipes": recipes.list_recipes()}
+            params = a.get("params") or {}
+            if not isinstance(params, dict):
+                raise BadArgs("'params' must be an object.", arg="params")
+            spec = recipes.render(rname, params)
+            if not _opt_bool(a, "apply") and not dry_run:
+                return {"ok": True, "name": rname, "spec": spec,
+                        "hint": "apply=true builds it; or edit the spec and pass it to ap_node_graph_apply."}
+            report = node_graph.apply(bridge, spec, mode=mode or "replace", dry_run=dry_run, fill=fill)
+            return _apply_report(report, f"before recipe {rname}")
+    except node_graph.SpecError as exc:
+        return {"ok": False, "code": "bad_spec", "problems": exc.problems}
+    raise BadArgs(f"unhandled graph tool {name}")
+
+
+# Tools that cannot be batch steps: answered locally, composed of several requests, or
+# would end the session.
+_UNBATCHABLE = LOCAL_TOOLS | GRAPH_TOOLS | {
+    "ap_batch", "ap_quit", "ap_project_metadata", "ap_material_list", "ap_undo", "ap_redo",
+}
 
 
 def _batch_tool(a: dict[str, Any]) -> dict[str, Any]:
@@ -2371,8 +2679,12 @@ async def call_tool(
 ) -> list[types.TextContent | types.ImageContent]:
     """Route one MCP tool call through the file mailbox to the ArmorPaint bridge."""
     args = arguments or {}
+    started = time.monotonic()
 
     try:
+        if name in CAPTURE_TOOLS and args.get("capture") is not None:
+            return await _with_capture(name, args)
+
         # --- locally answered tools ---------------------------------------
         if name == "ap_bridge_status":
             probe = _opt_bool(args, "probe")
@@ -2431,6 +2743,9 @@ async def call_tool(
         if name == "ap_batch":
             return _text(await loop.run_in_executor(None, partial(_batch_tool, args)))
 
+        if name in GRAPH_TOOLS:
+            return _text(await loop.run_in_executor(None, partial(_graph_tool, name, args)))
+
         # --- bridge round trip --------------------------------------------
         wire = _build_wire_args(name, args)
         op = _wire_op(name, wire)
@@ -2442,6 +2757,7 @@ async def call_tool(
         if name in ("ap_undo", "ap_redo"):
             return _text(await loop.run_in_executor(None, partial(_undo_tool, op, wire)))
 
+        sent_at = time.monotonic()
         try:
             result = await loop.run_in_executor(
                 None, partial(send_to_armorpaint, op, wire, timeout)
@@ -2462,6 +2778,14 @@ async def call_tool(
             raise
 
         payload: dict[str, Any] = {"ok": True, "op": op, "result": result}
+        now = time.monotonic()
+        payload["timing"] = {
+            "total_ms": round((now - started) * 1000),
+            # request written -> reply read: poll latency, frame wait and the handler
+            "round_trip_ms": round((now - sent_at) * 1000),
+            # the handler alone, as measured inside ArmorPaint
+            "handler_ms": result.get("elapsed_ms") if isinstance(result, dict) else None,
+        }
 
         # Echo resolved enums so the caller can see what the name mapped to.
         if name == "ap_select_tool":

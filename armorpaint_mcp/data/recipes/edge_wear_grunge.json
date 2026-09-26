@@ -1,0 +1,41 @@
+{
+ "name": "edge_wear_grunge",
+ "description": "Curvature-driven edge wear masked by Voronoi grunge: paint wears through to the base where edges are convex AND the grunge allows, which breaks up the otherwise uniform edge line. Drives base colour, roughness and metallic from one mask.",
+ "params": {
+  "paint_color": {"type": "color", "default": [0.35, 0.08, 0.06, 1.0], "description": "Paint colour."},
+  "base_color": {"type": "color", "default": [0.55, 0.55, 0.55, 1.0], "description": "Colour showing through the wear."},
+  "wear_amount": {"type": "number", "default": 0.5, "description": "Curvature where wear starts (lower = more wear)."},
+  "grunge_scale": {"type": "number", "default": 8.0, "description": "Voronoi grunge scale."},
+  "paint_roughness": {"type": "number", "default": 0.55, "description": "Roughness of the paint (worn areas go to 0.3)."},
+  "base_metallic": {"type": "number", "default": 1.0, "description": "Metallic of the worn-through base (0 for a dielectric under the paint)."}
+ },
+ "spec": {
+  "nodes": {
+   "curv": {"type": "BAKE_CURVATURE", "inputs": {"Strength": 1.0, "Radius": 0.8}},
+   "edge": {"type": "MAPRANGE", "inputs": {"From Min": "${wear_amount}", "From Max": 0.8, "To Min": 0.0, "To Max": 1.0}, "buttons": {"Clamp": true}},
+   "grunge": {"type": "TEX_VORONOI", "inputs": {"Scale": "${grunge_scale}", "Randomness": 1.0}, "buttons": {"Feature Output": "F1"}},
+   "grunge_mask": {"type": "MAPRANGE", "inputs": {"From Min": 0.1, "From Max": 0.6, "To Min": 0.0, "To Max": 1.0}, "buttons": {"Clamp": true}},
+   "wear": {"type": "MATH", "buttons": {"operation": "Multiply", "Clamp": true}},
+   "paint": {"type": "RGB", "outputs": {"Color": "${paint_color}"}},
+   "base": {"type": "RGB", "outputs": {"Color": "${base_color}"}},
+   "mix": {"type": "MIX_RGB", "buttons": {"blend_type": "Mix"}},
+   "rough": {"type": "MAPRANGE", "inputs": {"To Min": "${paint_roughness}", "To Max": 0.3}, "buttons": {"Clamp": true}},
+   "metal": {"type": "MAPRANGE", "inputs": {"To Min": 0.0, "To Max": "${base_metallic}"}, "buttons": {"Clamp": true}},
+   "out": {"existing": "OUTPUT_MATERIAL_PBR"}
+  },
+  "links": [
+   "curv.Value -> edge.Value",
+   "grunge.Distance -> grunge_mask.Value",
+   "edge.Value -> wear.Value[0]",
+   "grunge_mask.Value -> wear.Value[1]",
+   "wear.Value -> mix.Factor",
+   "paint.Color -> mix.Color 1",
+   "base.Color -> mix.Color 2",
+   "mix.Color -> out.Base Color",
+   "wear.Value -> rough.Value",
+   "rough.Value -> out.Roughness",
+   "wear.Value -> metal.Value",
+   "metal.Value -> out.Metallic"
+  ]
+ }
+}

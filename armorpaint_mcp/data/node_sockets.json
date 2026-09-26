@@ -1,0 +1,3808 @@
+{
+ "_meta": {
+  "generator": "tools/gen_node_sockets.py",
+  "armorpaint_commit": "906418acc600132fa927876d208eb452dc5a0967",
+  "source": "paint/sources/nodes_material/*.c, nodes_neural/*.c",
+  "node_count": 71
+ },
+ "nodes": {
+  "ATTRIBUTE": {
+   "name": "Attribute",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Alpha",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Name",
+     "type": "STRING",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/attribute_node.c"
+  },
+  "BAKE_CURVATURE": {
+   "name": "Curvature Texture",
+   "inputs": [
+    {
+     "name": "Strength",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Radius",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Offset",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/curvature_bake_node.c"
+  },
+  "BLUR": {
+   "name": "Blur",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Strength",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/blur_node.c"
+  },
+  "BRIGHTCONTRAST": {
+   "name": "Brightness/Contrast",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Brightness",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Contrast",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/brightness_contrast_node.c"
+  },
+  "BUMP": {
+   "name": "Bump",
+   "inputs": [
+    {
+     "name": "Strength",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Distance",
+     "type": "VALUE",
+     "default": [
+      0.001
+     ]
+    },
+    {
+     "name": "Height",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Normal",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Normal Map",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Invert",
+     "type": "BOOL",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/bump_node.c"
+  },
+  "CLAMP": {
+   "name": "Clamp",
+   "inputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "Min",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Max",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "operation",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "Min Max",
+      "Range"
+     ]
+    }
+   ],
+   "file": "nodes_material/clamp_node.c"
+  },
+  "COLMASK": {
+   "name": "Color Mask",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Mask Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Radius",
+     "type": "VALUE",
+     "default": [
+      0.1
+     ]
+    },
+    {
+     "name": "Fuzziness",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Mask",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/color_mask_node.c"
+  },
+  "COMBINE_COLOR": {
+   "name": "Combine Color",
+   "inputs": [
+    {
+     "name": "R",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "G",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "B",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/combine_color_node.c"
+  },
+  "COMBXYZ": {
+   "name": "Combine XYZ",
+   "inputs": [
+    {
+     "name": "X",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Y",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Z",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/combine_xyz_node.c"
+  },
+  "CURVE_RGB": {
+   "name": "RGB Curves",
+   "inputs": [
+    {
+     "name": "Fac",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "nodes_material_rgb_curves_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/rgb_curves_node.c"
+  },
+  "CURVE_VEC": {
+   "name": "Vector Curves",
+   "inputs": [
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "nodes_material_vector_curves_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/vector_curves_node.c"
+  },
+  "DIRECT_WARP": {
+   "name": "Warp",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Angle",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Mask",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/warp_node.c"
+  },
+  "FLOAT_CURVE": {
+   "name": "Float Curve",
+   "inputs": [
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "nodes_material_float_curve_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/float_curve_node.c"
+  },
+  "GAMMA": {
+   "name": "Gamma",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Gamma",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/gamma_node.c"
+  },
+  "GROUP": {
+   "name": "New Group",
+   "inputs": [],
+   "outputs": [],
+   "buttons": [
+    {
+     "name": "nodes_material_new_group_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/group_node.c"
+  },
+  "GROUP_INPUT": {
+   "name": "Group Input",
+   "inputs": [],
+   "outputs": [],
+   "buttons": [
+    {
+     "name": "nodes_material_group_input_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/group_node.c",
+   "availability": "group_canvas_only"
+  },
+  "GROUP_OUTPUT": {
+   "name": "Group Output",
+   "inputs": [],
+   "outputs": [],
+   "buttons": [
+    {
+     "name": "nodes_material_group_output_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/group_node.c",
+   "availability": "group_canvas_only"
+  },
+  "HUE_SAT": {
+   "name": "Hue/Saturation/Value",
+   "inputs": [
+    {
+     "name": "Hue",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "Saturation",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/hue_saturation_value_node.c"
+  },
+  "INVERT_COLOR": {
+   "name": "Invert Color",
+   "inputs": [
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/invert_color_node.c"
+  },
+  "LAYER": {
+   "name": "Layer",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Base Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    },
+    {
+     "name": "Opacity",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Occlusion",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Roughness",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Metallic",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Normal Map",
+     "type": "VECTOR",
+     "default": [
+      0.5,
+      0.5,
+      1.0
+     ]
+    },
+    {
+     "name": "Emission",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Height",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Subsurface",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Layer",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/layer_node.c"
+  },
+  "LAYER_MASK": {
+   "name": "Layer Mask",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Layer",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/layer_mask_node.c"
+  },
+  "MAPPING": {
+   "name": "Mapping",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Location",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Rotation",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Scale",
+     "type": "VECTOR",
+     "default": [
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/mapping_node.c"
+  },
+  "MAPRANGE": {
+   "name": "Map Range",
+   "inputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "From Min",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "From Max",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "To Min",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "To Max",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Clamp",
+     "type": "BOOL",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/map_range_node.c"
+  },
+  "MATERIAL": {
+   "name": "Material",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Base Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    },
+    {
+     "name": "Opacity",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Occlusion",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Roughness",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Metallic",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Normal Map",
+     "type": "VECTOR",
+     "default": [
+      0.5,
+      0.5,
+      1.0
+     ]
+    },
+    {
+     "name": "Emission",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Height",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Subsurface",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Material",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/material_node.c"
+  },
+  "MATH": {
+   "name": "Math",
+   "inputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "operation",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "Add",
+      "Subtract",
+      "Multiply",
+      "Divide",
+      "Power",
+      "Logarithm",
+      "Square Root",
+      "Inverse Square Root",
+      "Absolute",
+      "Exponent",
+      "Minimum",
+      "Maximum",
+      "Less Than",
+      "Greater Than",
+      "Sign",
+      "Round",
+      "Floor",
+      "Ceil",
+      "Truncate",
+      "Fraction",
+      "Truncated Modulo",
+      "Floored Modulo",
+      "Snap",
+      "Ping-Pong",
+      "Sine",
+      "Cosine",
+      "Tangent",
+      "Arcsine",
+      "Arccosine",
+      "Arctangent",
+      "Arctan2",
+      "Hyperbolic Sine",
+      "Hyperbolic Cosine",
+      "Hyperbolic Tangent",
+      "To Radians",
+      "To Degrees"
+     ]
+    },
+    {
+     "name": "Clamp",
+     "type": "BOOL",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/math2_node.c"
+  },
+  "MIX_NORMAL_MAP": {
+   "name": "Mix Normal Map",
+   "inputs": [
+    {
+     "name": "Normal Map 1",
+     "type": "VECTOR",
+     "default": [
+      0.5,
+      0.5,
+      1.0
+     ]
+    },
+    {
+     "name": "Normal Map 2",
+     "type": "VECTOR",
+     "default": [
+      0.5,
+      0.5,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Normal Map",
+     "type": "VECTOR",
+     "default": [
+      0.5,
+      0.5,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "blend_type",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "Partial Derivative",
+      "Whiteout",
+      "Reoriented"
+     ]
+    }
+   ],
+   "file": "nodes_material/mix_normal_map_node.c"
+  },
+  "MIX_RGB": {
+   "name": "Mix Color",
+   "inputs": [
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "Color 1",
+     "type": "RGBA",
+     "default": [
+      0.5,
+      0.5,
+      0.5,
+      1.0
+     ]
+    },
+    {
+     "name": "Color 2",
+     "type": "RGBA",
+     "default": [
+      0.5,
+      0.5,
+      0.5,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "blend_type",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "Mix",
+      "Darken",
+      "Multiply",
+      "Burn",
+      "Lighten",
+      "Screen",
+      "Dodge",
+      "Add",
+      "Overlay",
+      "Soft Light",
+      "Linear Light",
+      "Difference",
+      "Exclusion",
+      "Subtract",
+      "Divide",
+      "Hue",
+      "Saturation",
+      "Color",
+      "Value"
+     ]
+    },
+    {
+     "name": "Clamp Factor",
+     "type": "BOOL",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Clamp Result",
+     "type": "BOOL",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/mix_color_node.c"
+  },
+  "NEURAL_EDIT_IMAGE": {
+   "name": "Edit Image",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "name": "Mask",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "edit_image_node_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_neural/edit_image_node.c"
+  },
+  "NEURAL_IMAGE_TO_3D_MESH": {
+   "name": "Image to 3D Mesh",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Mesh",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "image_to_3d_mesh_node_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_neural/image_to_3d_mesh_node.c",
+   "availability": "windows_only"
+  },
+  "NEURAL_IMAGE_TO_PBR": {
+   "name": "Image to PBR",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Base Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    },
+    {
+     "name": "Occlusion",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Roughness",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Normal Map",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    },
+    {
+     "name": "Height",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "image_to_pbr_node_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Tile",
+     "type": "BOOL",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_neural/image_to_pbr_node.c"
+  },
+  "NEURAL_REPEAT": {
+   "name": "Repeat",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Out",
+     "type": "BOOL",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "repeat_node_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_neural/repeat_node.c"
+  },
+  "NEURAL_SAVE_IMAGE": {
+   "name": "Save Image",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [],
+   "buttons": [],
+   "file": "nodes_neural/save_image_node.c"
+  },
+  "NEURAL_TEXTURE_MESH": {
+   "name": "Texture Mesh",
+   "inputs": [
+    {
+     "name": "In",
+     "type": "BOOL",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "texture_mesh_node_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_neural/texture_mesh_node.c",
+   "availability": "experimental_only"
+  },
+  "NEURAL_TEXT_TO_IMAGE": {
+   "name": "Text to Image",
+   "inputs": [
+    {
+     "name": "In",
+     "type": "BOOL",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "text_to_image_node_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Tile",
+     "type": "BOOL",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_neural/text_to_image_node.c"
+  },
+  "NEURAL_UPSCALE_IMAGE": {
+   "name": "Upscale Image",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "upscale_image_node_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Tile",
+     "type": "BOOL",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_neural/upscale_image_node.c"
+  },
+  "NEW_GEOMETRY": {
+   "name": "Geometry",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Position",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Normal",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Tangent",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Incoming",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Parametric",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Pointiness",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/geometry_node.c"
+  },
+  "NORMAL": {
+   "name": "Normal",
+   "inputs": [
+    {
+     "name": "Normal",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Normal",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Dot",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/normal_node.c"
+  },
+  "NORMAL_MAP": {
+   "name": "Normal Map",
+   "inputs": [
+    {
+     "name": "Strength",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Normal Map",
+     "type": "VECTOR",
+     "default": [
+      0.5,
+      0.5,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Normal Map",
+     "type": "VECTOR",
+     "default": [
+      0.5,
+      0.5,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/normal_map_node.c"
+  },
+  "OBJECT_INFO": {
+   "name": "Object Info",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Location",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Object Index",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Material Index",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Random",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/object_info_node.c"
+  },
+  "OUTPUT_MATERIAL_PBR": {
+   "name": "Material Output",
+   "inputs": [
+    {
+     "name": "Base Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Opacity",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Occlusion",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Roughness",
+     "type": "VALUE",
+     "default": [
+      0.1
+     ]
+    },
+    {
+     "name": "Metallic",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Normal Map",
+     "type": "VECTOR",
+     "default": [
+      0.5,
+      0.5,
+      1.0
+     ]
+    },
+    {
+     "name": "Emission",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Height",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Subsurface",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "outputs": [],
+   "buttons": [],
+   "file": "nodes_material/material_output_node.c"
+  },
+  "PICKER": {
+   "name": "Picker",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Base Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    },
+    {
+     "name": "Opacity",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Occlusion",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Roughness",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Metallic",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Normal Map",
+     "type": "VECTOR",
+     "default": [
+      0.5,
+      0.5,
+      1.0
+     ]
+    },
+    {
+     "name": "Emission",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Height",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Subsurface",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/picker_node.c"
+  },
+  "QUANTIZE": {
+   "name": "Quantize",
+   "inputs": [
+    {
+     "name": "Strength",
+     "type": "VALUE",
+     "default": [
+      0.1
+     ]
+    },
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/quantize_node.c"
+  },
+  "REPLACECOL": {
+   "name": "Replace Color",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Old Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "New Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Radius",
+     "type": "VALUE",
+     "default": [
+      0.1
+     ]
+    },
+    {
+     "name": "Fuzziness",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/replace_color_node.c"
+  },
+  "RGB": {
+   "name": "Color",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.5,
+      0.5,
+      0.5,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "RGBA",
+     "type": "RGBA",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/rgb_node.c"
+  },
+  "RGBTOBW": {
+   "name": "RGB to BW",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.5,
+      0.5,
+      0.5,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Val",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/rgb_to_bw_node.c"
+  },
+  "SCRIPT_CPU": {
+   "name": "Script",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": " ",
+     "type": "STRING",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "script_node_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/script_node.c"
+  },
+  "SEPARATE_COLOR": {
+   "name": "Separate Color",
+   "inputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "R",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "G",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "B",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/separate_color_node.c"
+  },
+  "SEPXYZ": {
+   "name": "Separate XYZ",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "X",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Y",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Z",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/separate_xyz_node.c"
+  },
+  "SHADER_GPU": {
+   "name": "Shader",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": " ",
+     "type": "STRING",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/shader_node.c"
+  },
+  "TEX_BAKE": {
+   "name": "Bake Texture",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "bake_texture_node_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/bake_texture_node.c"
+  },
+  "TEX_BRICK": {
+   "name": "Brick Texture",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Color 1",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8
+     ]
+    },
+    {
+     "name": "Color 2",
+     "type": "RGBA",
+     "default": [
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    {
+     "name": "Mortar",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Scale",
+     "type": "VALUE",
+     "default": [
+      5.0
+     ]
+    },
+    {
+     "name": "Mortar Size",
+     "type": "VALUE",
+     "default": [
+      0.02
+     ]
+    },
+    {
+     "name": "Mortar Smooth",
+     "type": "VALUE",
+     "default": [
+      0.1
+     ]
+    },
+    {
+     "name": "Bias",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Brick Width",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "Row Height",
+     "type": "VALUE",
+     "default": [
+      0.25
+     ]
+    },
+    {
+     "name": "Offset",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "Frequency",
+     "type": "VALUE",
+     "default": [
+      2.0
+     ]
+    },
+    {
+     "name": "Squash",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Frequency",
+     "type": "VALUE",
+     "default": [
+      2.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/brick_texture_node.c"
+  },
+  "TEX_CAMERA": {
+   "name": "Camera Texture",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/camera_texture_node.c"
+  },
+  "TEX_CHECKER": {
+   "name": "Checker Texture",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Color 1",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8
+     ]
+    },
+    {
+     "name": "Color 2",
+     "type": "RGBA",
+     "default": [
+      0.2,
+      0.2,
+      0.2
+     ]
+    },
+    {
+     "name": "Scale",
+     "type": "VALUE",
+     "default": [
+      5.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/checker_texture_node.c"
+  },
+  "TEX_COORD": {
+   "name": "Texture Coordinate",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Generated",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Normal",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "UV",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Object",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Camera",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Window",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "buttons": [],
+   "file": "nodes_material/texture_coordinate_node.c"
+  },
+  "TEX_GABOR": {
+   "name": "Gabor Texture",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Scale",
+     "type": "VALUE",
+     "default": [
+      5.0
+     ]
+    },
+    {
+     "name": "Frequency",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Anisotropy",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Orientation 3D",
+     "type": "VECTOR",
+     "default": [
+      1.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Orientation 2D",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "Phase",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "Intensity",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Dimensions",
+     "type": "ENUM",
+     "default": [
+      1.0
+     ],
+     "options": [
+      "2D",
+      "3D"
+     ]
+    }
+   ],
+   "file": "nodes_material/gabor_texture_node.c"
+  },
+  "TEX_GRADIENT": {
+   "name": "Gradient Texture",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "gradient_type",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "Linear",
+      "Diagonal",
+      "Radial",
+      "Spherical"
+     ]
+    }
+   ],
+   "file": "nodes_material/gradient_texture_node.c"
+  },
+  "TEX_IMAGE": {
+   "name": "Image Texture",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    },
+    {
+     "name": "Alpha",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "File",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Color Space",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "Auto",
+      "Linear",
+      "sRGB",
+      "DirectX Normal Map"
+     ]
+    }
+   ],
+   "file": "nodes_material/image_texture_node.c"
+  },
+  "TEX_MAGIC": {
+   "name": "Magic Texture",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Scale",
+     "type": "VALUE",
+     "default": [
+      5.0
+     ]
+    },
+    {
+     "name": "Distortion",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Depth",
+     "type": "VALUE",
+     "default": [
+      2.0
+     ]
+    }
+   ],
+   "file": "nodes_material/magic_texture_node.c"
+  },
+  "TEX_NOISE": {
+   "name": "Noise Texture",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Scale",
+     "type": "VALUE",
+     "default": [
+      5.0
+     ]
+    },
+    {
+     "name": "Detail",
+     "type": "VALUE",
+     "default": [
+      2.0
+     ]
+    },
+    {
+     "name": "Roughness",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "Lacunarity",
+     "type": "VALUE",
+     "default": [
+      2.0
+     ]
+    },
+    {
+     "name": "Distortion",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.5,
+      0.5,
+      0.5,
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Dimensions",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "3D"
+     ]
+    },
+    {
+     "name": "Type",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "fBM"
+     ]
+    },
+    {
+     "name": "Normalize",
+     "type": "BOOL",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/noise_texture_node.c"
+  },
+  "TEX_TEXT": {
+   "name": "Text Texture",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    },
+    {
+     "name": "Alpha",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "text",
+     "type": "STRING",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/text_texture_node.c"
+  },
+  "TEX_VORONOI": {
+   "name": "Voronoi Texture",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Scale",
+     "type": "VALUE",
+     "default": [
+      5.0
+     ]
+    },
+    {
+     "name": "Detail",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Roughness",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "Lacunarity",
+     "type": "VALUE",
+     "default": [
+      2.0
+     ]
+    },
+    {
+     "name": "Randomness",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Distance",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Position",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Dimensions",
+     "type": "ENUM",
+     "default": [
+      1.0
+     ],
+     "options": [
+      "2D",
+      "3D"
+     ]
+    },
+    {
+     "name": "Feature Output",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "F1",
+      "F2"
+     ]
+    },
+    {
+     "name": "Normalize",
+     "type": "BOOL",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/voronoi_texture_node.c"
+  },
+  "TEX_WAVE": {
+   "name": "Wave Texture",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Scale",
+     "type": "VALUE",
+     "default": [
+      5.0
+     ]
+    },
+    {
+     "name": "Distortion",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Detail Scale",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    },
+    {
+     "name": "Detail Roughness",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    },
+    {
+     "name": "Phase Offset",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.8,
+      0.8,
+      0.8,
+      1.0
+     ]
+    },
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      1.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Wave Type",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "Bands",
+      "Rings"
+     ]
+    },
+    {
+     "name": "Direction",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "X",
+      "Y",
+      "Z",
+      "Diagonal"
+     ]
+    },
+    {
+     "name": "Wave Profile",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "Sine",
+      "Saw",
+      "Triangle"
+     ]
+    }
+   ],
+   "file": "nodes_material/wave_texture_node.c"
+  },
+  "TILESHEET": {
+   "name": "Tilesheet",
+   "inputs": [
+    {
+     "name": "Tile X",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    },
+    {
+     "name": "Tile Y",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "UV",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Tiles X",
+     "type": "VALUE",
+     "default": [
+      4.0
+     ]
+    },
+    {
+     "name": "Tiles Y",
+     "type": "VALUE",
+     "default": [
+      4.0
+     ]
+    }
+   ],
+   "file": "nodes_material/tilesheet_node.c"
+  },
+  "TILESHEET_ANIM": {
+   "name": "Tilesheet Animation",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "UV",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Tiles X",
+     "type": "VALUE",
+     "default": [
+      4.0
+     ]
+    },
+    {
+     "name": "Tiles Y",
+     "type": "VALUE",
+     "default": [
+      4.0
+     ]
+    },
+    {
+     "name": "Framerate",
+     "type": "VALUE",
+     "default": [
+      12.0
+     ]
+    },
+    {
+     "name": "tilesheet_animation_node_button",
+     "type": "CUSTOM",
+     "default": []
+    },
+    {
+     "name": "Animation",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "none"
+     ]
+    }
+   ],
+   "file": "nodes_material/tilesheet_animation_node.c"
+  },
+  "UVMAP": {
+   "name": "UV Map",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "UV",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "UV Map",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/uv_map_node.c"
+  },
+  "VALTORGB": {
+   "name": "Color Ramp",
+   "inputs": [
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      0.5
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Color",
+     "type": "RGBA",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    },
+    {
+     "name": "Alpha",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "nodes_material_color_ramp_button",
+     "type": "CUSTOM",
+     "default": [
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "file": "nodes_material/color_ramp_node.c"
+  },
+  "VALUE": {
+   "name": "Value",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/value_node.c"
+  },
+  "VECT_MATH": {
+   "name": "Vector Math",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Value",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "operation",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "Add",
+      "Subtract",
+      "Multiply",
+      "Divide",
+      "Average",
+      "Cross Product",
+      "Project",
+      "Reflect",
+      "Dot Product",
+      "Distance",
+      "Length",
+      "Scale",
+      "Normalize",
+      "Absolute",
+      "Power",
+      "Sign",
+      "Minimum",
+      "Maximum",
+      "Floor",
+      "Ceil",
+      "Fraction",
+      "Modulo",
+      "Snap",
+      "Sine",
+      "Cosine",
+      "Tangent"
+     ]
+    }
+   ],
+   "file": "nodes_material/vector_math2_node.c"
+  },
+  "VECT_ROTATE": {
+   "name": "Vector Rotate",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Center",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    },
+    {
+     "name": "Axis",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      1.0
+     ]
+    },
+    {
+     "name": "Angle",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Invert",
+     "type": "BOOL",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/vector_rotate_node.c"
+  },
+  "VECT_TRANSFORM": {
+   "name": "Vector Transform",
+   "inputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Vector",
+     "type": "VECTOR",
+     "default": [
+      0.0,
+      0.0,
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "type",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "Vector",
+      "Point",
+      "Normal"
+     ]
+    },
+    {
+     "name": "Convert From",
+     "type": "ENUM",
+     "default": [
+      1.0
+     ],
+     "options": [
+      "World",
+      "Object",
+      "Camera"
+     ]
+    },
+    {
+     "name": "Convert To",
+     "type": "ENUM",
+     "default": [
+      0.0
+     ],
+     "options": [
+      "World",
+      "Object",
+      "Camera"
+     ]
+    }
+   ],
+   "file": "nodes_material/vector_transform_node.c"
+  },
+  "WIREFRAME": {
+   "name": "Wireframe",
+   "inputs": [
+    {
+     "name": "Size",
+     "type": "VALUE",
+     "default": [
+      0.01
+     ]
+    }
+   ],
+   "outputs": [
+    {
+     "name": "Factor",
+     "type": "VALUE",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "buttons": [
+    {
+     "name": "Pixel Size",
+     "type": "BOOL",
+     "default": [
+      0.0
+     ]
+    }
+   ],
+   "file": "nodes_material/wireframe_node.c"
+  }
+ }
+}

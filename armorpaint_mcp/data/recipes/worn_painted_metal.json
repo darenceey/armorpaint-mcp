@@ -1,0 +1,40 @@
+{
+ "name": "worn_painted_metal",
+ "description": "Painted metal worn through to bare metal on convex edges (curvature), broken up by noise grime; a bump from the grime. From skill/references/material-nodes.md.",
+ "params": {
+  "paint_color": {"type": "color", "default": [0.10, 0.13, 0.16, 1.0], "description": "Paint colour (RGBA 0..1)."},
+  "metal_color": {"type": "color", "default": [0.62, 0.60, 0.57, 1.0], "description": "Exposed metal colour."},
+  "wear_min": {"type": "number", "default": 0.45, "description": "Curvature where wear starts; raise for less wear."},
+  "wear_max": {"type": "number", "default": 0.75, "description": "Curvature where wear is complete."},
+  "grime_scale": {"type": "number", "default": 14.0, "description": "Noise scale of the grime breakup."},
+  "paint_roughness": {"type": "number", "default": 0.62, "description": "Roughness of the painted areas (bare metal is 0.28)."}
+ },
+ "spec": {
+  "nodes": {
+   "paint": {"type": "RGB", "outputs": {"Color": "${paint_color}"}},
+   "metal": {"type": "RGB", "outputs": {"Color": "${metal_color}"}},
+   "curv": {"type": "BAKE_CURVATURE", "inputs": {"Strength": 1.2, "Radius": 0.8, "Offset": 0.0}},
+   "edge": {"type": "MAPRANGE", "inputs": {"From Min": "${wear_min}", "From Max": "${wear_max}", "To Min": 0.0, "To Max": 1.0}, "buttons": {"Clamp": true}},
+   "grime": {"type": "TEX_NOISE", "inputs": {"Scale": "${grime_scale}", "Detail": 5.0}},
+   "mask": {"type": "MATH", "buttons": {"operation": "Multiply"}},
+   "mix": {"type": "MIX_RGB", "buttons": {"blend_type": "Mix"}},
+   "rough": {"type": "MAPRANGE", "inputs": {"To Min": "${paint_roughness}", "To Max": 0.28}, "buttons": {"Clamp": false}},
+   "bump": {"type": "BUMP", "inputs": {"Strength": 0.12}},
+   "out": {"existing": "OUTPUT_MATERIAL_PBR"}
+  },
+  "links": [
+   "curv.Value -> edge.Value",
+   "edge.Value -> mask.Value[0]",
+   "grime.Factor -> mask.Value[1]",
+   "mask.Value -> mix.Factor",
+   "paint.Color -> mix.Color 1",
+   "metal.Color -> mix.Color 2",
+   "mix.Color -> out.Base Color",
+   "mask.Value -> out.Metallic",
+   "mask.Value -> rough.Value",
+   "rough.Value -> out.Roughness",
+   "grime.Factor -> bump.Height",
+   "bump.Normal Map -> out.Normal Map"
+  ]
+ }
+}
