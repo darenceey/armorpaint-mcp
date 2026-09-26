@@ -119,7 +119,8 @@ def test_every_bridge_tool_maps_to_a_handled_op():
     """Every op the server can send is handled by the plugin or by the native extension."""
     plugin_ops = set(re.findall(r'string_equals\(op, "([a-z_]+)"\)', PLUGIN))
     ext_ops = set(re.findall(r'strcmp\(op, "([a-z_]+)"\) == 0', EXT))
-    local = server.LOCAL_TOOLS | server.GRAPH_TOOLS | server.MESH_TOOLS | {"ap_batch", "ap_project_metadata"}
+    local = (server.LOCAL_TOOLS | server.GRAPH_TOOLS | server.MESH_TOOLS | server.CHECKPOINT_TOOLS
+             | {"ap_batch", "ap_project_metadata"}) - {"ap_mesh_op"}
     for tool in server.TOOLS:
         if tool.name in local:
             continue

@@ -107,7 +107,10 @@ class FakeArmorPaint:
         self.log.append((op, dict(wire)))
         if (op, self._counts[op]) in self.fail_on:
             raise OpFailed(op, "internal", f"injected failure of {op} #{self._counts[op]}")
-        return getattr(self, "op_" + op)(wire)
+        handler = getattr(self, "op_" + op, None)
+        if handler is None:  # as a stock build answers an extension op
+            raise OpFailed(op, "unsupported", f"'{op}' needs the native extension")
+        return handler(wire)
 
     def batch(self, items: list[tuple[str, dict[str, Any]]], stop_on_error: bool = False) -> dict[str, Any]:
         results, errors, executed, stopped = [], 0, 0, False
@@ -228,3 +231,79 @@ class FakeArmorPaint:
             ),
             "links": sorted((key(lk["from_id"]), lk["from_socket"], key(lk["to_id"]), lk["to_socket"]) for lk in self.links),
         }
+
+
+class FakeExtArmorPaint(FakeArmorPaint):
+    """Adds the native extension's history, as history.c keeps it: steps with an identity,
+    undo/redo moving a cursor, a new step discarding the redo branch, and the oldest step
+    falling off once there are more than undo_steps. Fills push a step; node edits do not
+    (upstream's script_material_* record none). Plus project snapshots and paths."""
+
+    def __init__(self, undo_steps: int = 8) -> None:
+        super().__init__()
+        self.undo_steps = undo_steps
+        self.steps: list[dict[str, Any]] = []
+        self.redos = 0
+        self._next_step = 1
+        self.filepath = ""
+        self.files: dict[str, dict[str, Any]] = {}
+        self.opened: list[str] = []
+
+    def push(self, name: str) -> None:
+        if self.redos:
+            del self.steps[len(self.steps) - self.redos :]
+            self.redos = 0
+        self.steps.append({"id": f"0x{self._next_step:x}", "name": name})
+        self._next_step += 1
+        if len(self.steps) > self.undo_steps:
+            self.steps.pop(0)
+
+    def _history(self) -> dict[str, Any]:
+        active = len(self.steps) - 1 - self.redos
+        return {
+            "undos_available": len(self.steps) - self.redos, "redos_available": self.redos,
+            "undo_steps_config": self.undo_steps, "active_index": active,
+            "steps": [{"index": i, "id": st["id"], "name": st["name"], "undone": i > active}
+                      for i, st in enumerate(self.steps)],
+        }
+
+    def op_history(self, wire: dict[str, Any]) -> dict[str, Any]:
+        return self._history()
+
+    def op_undo(self, wire: dict[str, Any]) -> dict[str, Any]:
+        done = 0
+        for _ in range(int(wire.get("steps", 1))):
+            if len(self.steps) - self.redos <= 0:
+                break
+            self.redos += 1
+            done += 1
+        return {"undone": done, **self._history()}
+
+    def op_redo(self, wire: dict[str, Any]) -> dict[str, Any]:
+        done = 0
+        for _ in range(int(wire.get("steps", 1))):
+            if self.redos <= 0:
+                break
+            self.redos -= 1
+            done += 1
+        return {"redone": done, **self._history()}
+
+    def op_fill_layer(self, wire: dict[str, Any]) -> dict[str, Any]:
+        self.push("Fill Layer")
+        return super().op_fill_layer(wire)
+
+    def op_project_snapshot(self, wire: dict[str, Any]) -> dict[str, Any]:
+        self.files[wire["path"]] = self.state()
+        return {"path": wire["path"], "exists": True, "project_filepath": self.filepath}
+
+    def op_project_open(self, wire: dict[str, Any]) -> dict[str, Any]:
+        self.opened.append(wire["path"])
+        self.filepath = wire["path"]
+        return {}
+
+    def op_project_set_path(self, wire: dict[str, Any]) -> dict[str, Any]:
+        self.filepath = wire["path"]
+        return {"path": wire["path"]}
+
+    def op_project_get_info(self, wire: dict[str, Any]) -> dict[str, Any]:
+        return {"filepath": self.filepath}

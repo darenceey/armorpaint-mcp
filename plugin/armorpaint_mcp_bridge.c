@@ -1204,6 +1204,12 @@ int op_cost(char *op) {
 	if (string_equals(op, "texture_resolution")) {
 		return 3;
 	}
+	if (string_equals(op, "mesh_op")) {
+		return 3;
+	}
+	if (string_equals(op, "project_snapshot")) {
+		return 3;
+	}
 	if (string_equals(op, "quit")) {
 		return 3;
 	}
@@ -1537,6 +1543,21 @@ char *dispatch(void *m, char *op) {
 		// conclude its own save had failed.
 		json_encode_bool("deferred", 1);
 		json_encode_string("note", "the write is queued for the next frame; confirm with fs_stat rather than trusting this reply");
+		return json_encode_end();
+	}
+	else if (string_equals(op, "project_set_path")) {
+		// Point the open project at a file without saving: after a snapshot is opened
+		// to roll back, the project must save to the user's file again, not the snapshot.
+		s1 = arg(m, "path");
+		if (s1 == NULL) {
+			return fail("bad_args", "missing 'path'");
+		}
+		if (!path_ok(s1)) {
+			return fail("bad_args", "'path' is empty, over-long, or contains a quote, newline, $ or backtick");
+		}
+		project_filepath_set(s1);
+		json_encode_begin();
+		json_encode_string("path", jesc(project_filepath_get()));
 		return json_encode_end();
 	}
 	else if (string_equals(op, "project_get_info")) {

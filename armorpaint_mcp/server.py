@@ -65,7 +65,7 @@ try:  # normal package import
         spool_resolution,
     )
     from .window_capture import MAX_DOWNSCALE, CaptureError, capture_window
-    from . import desktop_input, image_diff, local_tools, mesh_inspect, node_catalogue, node_graph, recipes, strokes
+    from . import checkpoints, desktop_input, image_diff, local_tools, mesh_inspect, node_catalogue, node_graph, recipes, strokes
     from .transport import send_batch
 except ImportError:  # running server.py as a loose script
     __version__ = "1.1.0"
@@ -92,6 +92,7 @@ except ImportError:  # running server.py as a loose script
     import recipes  # type: ignore[no-redef]
     import strokes  # type: ignore[no-redef]
     import mesh_inspect  # type: ignore[no-redef]
+    import checkpoints  # type: ignore[no-redef]
     from transport import send_batch  # type: ignore[no-redef]
 
 # ---------------------------------------------------------------------------
@@ -189,6 +190,9 @@ OP_TIMEOUTS: dict[str, float] = {
     "project_lists": 15,
     "camera": 15,
     "console_read": 10,
+    "mesh_op": 600,
+    "project_snapshot": 600,
+    "project_set_path": 15,
 }
 
 # Answered by the optional native extension; on a stock build the bridge says "unsupported".
@@ -198,7 +202,7 @@ EXT_TOOLS = frozenset(
         "ap_layer_duplicate", "ap_layer_set", "ap_layer_move", "ap_layer_action",
         "ap_history", "ap_export_presets", "ap_bake", "ap_bake_status", "ap_bake_settings",
         "ap_render_settings", "ap_texture_resolution", "ap_project_lists", "ap_camera",
-        "ap_console_read",
+        "ap_console_read", "ap_mesh_op",
     }
 )
 EXT_HINT = (
@@ -1289,6 +1293,58 @@ TOOLS: list[types.Tool] = [
         },
     ),
     _tool(
+        "ap_mesh_op",
+        "Edit the paint mesh as the Meshes tab does (native extension): 'unwrap' (new UVs), "
+        "'calc_normals' (smooth or flat), 'flip_normals', 'to_origin', 'rotate_x/y/z' (90 "
+        "degrees), 'decimate', 'smooth', 'subdivide', 'bevel', and 'reimport' (load the mesh "
+        "file again -- or another OBJ/FBX/... given as 'path' -- keeping the layers). None of "
+        "these is in ArmorPaint's undo history, so a PROJECT checkpoint is written first; "
+        "ap_rollback(checkpoint_id) takes it back. unwrap, decimate, smooth, subdivide, bevel "
+        "and reimport change UVs or topology: paint already on the layers stays where it is "
+        "in texture space and no longer lines up with the model, so they need "
+        "confirm_invalidates_paint=true. Check a mesh first with ap_mesh_inspect.",
+        {
+            "action": _s("What to do.", enum=["unwrap", "calc_normals", "flip_normals", "to_origin",
+                                               "rotate_x", "rotate_y", "rotate_z", "decimate", "smooth",
+                                               "subdivide", "bevel", "reimport"]),
+            "smooth": _b("calc_normals: smooth (true) or flat.", default=True),
+            "strength": _n("decimate: 0..1, how much to reduce.", default=0.5),
+            "amount": _n("bevel: 0..1.", default=0.1),
+            "path": _s(f"reimport: the mesh file (default: the project's own). {_PATH_NOTE}"),
+            "confirm_invalidates_paint": _b("Required for ops that change UVs or topology.", default=False),
+        },
+        ["action"],
+    ),
+    _tool(
+        "ap_checkpoint",
+        "Mark a point to roll back to with ap_rollback. 'auto' (default) records ArmorPaint's "
+        "undo history position (native extension) and a snapshot of the node graph (node "
+        "edits are not in that history); 'project' writes the whole project to a snapshot "
+        "file (extension) for things no history records -- mesh edits, texture resolution, "
+        "opening another project. A history checkpoint lasts as long as its step is in the "
+        "history: undo_steps (ap_set_config) bounds how far back that is. Destructive tools "
+        "take one automatically (their reply names it); set ARMORPAINT_MCP_AUTOCHECKPOINT=0 "
+        "to turn that off.",
+        {
+            "label": _s("A label to find it by."),
+            "kind": _s("Which parts.", enum=list(checkpoints.KINDS), default="auto"),
+        },
+    ),
+    _tool(
+        "ap_rollback",
+        "Roll back to a checkpoint: undo (or redo) to its history step, restore its node graph, "
+        "or reopen its project snapshot. Checked against the live state first: if its history "
+        "step is gone -- it fell off the end of the history, or was undone and replaced by a "
+        "new action -- it refuses and says which, instead of undoing to the wrong place.",
+        {"checkpoint_id": _s("From ap_checkpoint, ap_checkpoint_list, or a tool's 'checkpoint'.")},
+        ["checkpoint_id"],
+    ),
+    _tool(
+        "ap_checkpoint_list",
+        "The checkpoints kept by this server, newest last, each with how many more history "
+        "steps it survives (history_headroom; 0 means it is gone or about to go).",
+    ),
+    _tool(
         "ap_fill_layer",
         "Fill the selected layer with the active material and push an undo step. THIS IS THE "
         "STEP THAT MAKES A NODE-GRAPH EDIT VISIBLE — ap_material_update only recompiles the "
@@ -1464,6 +1520,13 @@ TOOLS += [
                 },
                 "description": "Steps to run in order.",
             },
+            "atomic": _b(
+                "All or nothing: take a checkpoint first (undo history position with the "
+                "native extension, and the node graph), stop at the first failing step, and "
+                "roll back to the checkpoint if any step fails. On a stock build only the "
+                "graph part can be rolled back.",
+                default=False,
+            ),
             "stop_on_error": _b("Skip the remaining steps after the first failure.", default=False),
         },
         ["steps"],
@@ -2982,6 +3045,7 @@ def _undo_tool(op: str, wire: dict[str, Any]) -> dict[str, Any]:
     hb = read_heartbeat()
     title = (hb.get("app_title") if isinstance(hb, dict) else None) or None
     fence = _frame_fence()
+    before = _state_fingerprint()
     try:
         for _ in range(steps):
             desktop_input.key("z", mods, title, fence)
@@ -2993,14 +3057,186 @@ def _undo_tool(op: str, wire: dict[str, Any]) -> dict[str, Any]:
             f"ArmorPaint's window, and the latter failed: {exc.message}",
             "hint": EXT_HINT,
         }
+    after = _state_fingerprint()
+    changed = _compare_fingerprints(before, after)
+    looked_at = [k for k, v in before.items() if v is not None]
     return {
         "ok": True,
         "op": op,
         "method": f"keyboard shortcut {'+'.join(mods)}+z sent {steps}x (stock build)",
-        "note": "Sent as ArmorPaint's default keymap shortcut; if the keymap was changed, or a "
-        "text field has focus, it may not act. The history cannot be read back without the "
-        "native extension -- verify with ap_capture_window.",
+        # A stock build cannot read the history, so compare what it can read before and
+        # after: the context, the material and its graph, and the window's pixels.
+        "verified": {
+            "changed": bool(changed),
+            "changed_parts": changed,
+            "compared": looked_at,
+            "note": (
+                "the state changed after the shortcut" if changed else
+                "nothing the bridge or the window shows changed: the shortcut may not have reached "
+                "ArmorPaint (a focused text field, a changed keymap), or there was nothing to "
+                f"{op}"
+            ),
+        },
     }
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints (checkpoints.py), automatic checkpoints, mesh ops, verified undo
+# ---------------------------------------------------------------------------
+
+CHECKPOINT_TOOLS = frozenset({"ap_checkpoint", "ap_rollback", "ap_checkpoint_list", "ap_mesh_op"})
+AUTOCHECKPOINT_ENV = "ARMORPAINT_MCP_AUTOCHECKPOINT"
+
+# Tools that destroy state, and the checkpoint taken before them. 'history' needs the
+# native extension (a stock build has no readable history, so gets none); 'project' too.
+AUTO_CHECKPOINT = {
+    "ap_fill_layer": "history",
+    "ap_layer_delete": "history",
+    "ap_layer_action": "history",
+    "ap_material_delete": "history",
+    "ap_texture_resolution": "project",
+    "ap_project_new": "project",
+    "ap_project_open": "project",
+}
+
+UV_CHANGING_MESH_OPS = frozenset({"unwrap", "decimate", "smooth", "subdivide", "bevel", "reimport"})
+
+
+def _checkpoint_stores() -> tuple[Any, Any, Path]:
+    state = _state_dir()
+    return checkpoints.CheckpointStore(state / "checkpoints"), _snapshots(), state / "project_snapshots"
+
+
+def _take_checkpoint(kind: str, label: str) -> dict[str, Any]:
+    cps, graphs, snaps = _checkpoint_stores()
+    return checkpoints.take(graph_bridge(), kind=kind, label=label, store=cps, graph_store=graphs, snapshot_dir=snaps)
+
+
+def _auto_checkpoint(name: str) -> dict[str, Any] | None:
+    kind = AUTO_CHECKPOINT.get(name)
+    if kind is None or os.environ.get(AUTOCHECKPOINT_ENV) == "0":
+        return None
+    try:
+        entry = _take_checkpoint(kind, f"before {name}")
+    except OpFailed as exc:
+        if exc.code == "unsupported":
+            return None  # stock build: nothing readable to checkpoint
+        return {"error": f"no checkpoint could be taken ({exc.code}: {exc.message}); the operation ran anyway"}
+    return {"id": entry["id"], "kinds": entry["kinds"], "rollback": f"ap_rollback(checkpoint_id='{entry['id']}')"}
+
+
+def _checkpoint_tool(name: str, a: dict[str, Any]) -> dict[str, Any]:
+    cps, graphs, _ = _checkpoint_stores()
+    if name == "ap_checkpoint_list":
+        bridge = graph_bridge()
+        out = []
+        for e in cps.list():
+            out.append({k: e.get(k) for k in ("id", "label", "created", "kinds", "material")}
+                       | {"history_headroom": checkpoints.headroom(bridge, e)})
+        return {"ok": True, "checkpoints": out}
+    if name == "ap_rollback":
+        cid = _req_str(a, "checkpoint_id")
+        try:
+            entry = cps.get(cid)
+        except KeyError:
+            return {"ok": False, "code": "not_found", "error": f"no checkpoint {cid!r}",
+                    "hint": "ap_checkpoint_list lists them."}
+        report = checkpoints.rollback(graph_bridge(), entry, graph_store=graphs)
+        _MESH_CACHE.clear()
+        return {**report, "checkpoint_id": cid}
+    kind = _opt_str(a, "kind") or "auto"
+    if kind not in checkpoints.KINDS:
+        raise BadArgs(f"'kind' must be one of {', '.join(checkpoints.KINDS)}.", arg="kind")
+    try:
+        entry = _take_checkpoint(kind, _opt_str(a, "label") or "")
+    except OpFailed as exc:
+        out = {"ok": False, "code": exc.code, "error": exc.message}
+        if exc.code == "unsupported":
+            out["hint"] = EXT_HINT
+        return out
+    return {"ok": True, "checkpoint_id": entry["id"], "kinds": entry["kinds"],
+            "history_headroom": checkpoints.headroom(graph_bridge(), entry)}
+
+
+def _mesh_op_args(a: dict[str, Any]) -> dict[str, Any]:
+    action = _req_str(a, "action")
+    known = {"unwrap", "calc_normals", "flip_normals", "to_origin", "rotate_x", "rotate_y", "rotate_z",
+             "decimate", "smooth", "subdivide", "bevel", "reimport"}
+    if action not in known:
+        raise BadArgs(f"'action' must be one of {', '.join(sorted(known))}.", arg="action")
+    if action in UV_CHANGING_MESH_OPS and not _opt_bool(a, "confirm_invalidates_paint"):
+        raise BadArgs(
+            f"'{action}' changes the mesh's UVs or topology: paint already on the layers stays where it "
+            f"is in texture space and will no longer line up with the model. Pass "
+            f"confirm_invalidates_paint=true to go ahead (a project checkpoint is taken first).",
+            arg="confirm_invalidates_paint",
+        )
+    wire: dict[str, Any] = {"action": action}
+    if action == "calc_normals":
+        wire["smooth"] = _opt_bool(a, "smooth") is not False
+    if action == "decimate" and a.get("strength") is not None:
+        wire["strength"] = _num(a["strength"], "strength")
+    if action == "bevel" and a.get("amount") is not None:
+        wire["amount"] = _num(a["amount"], "amount")
+    if action == "reimport":
+        path = _norm_path(a, "path", required=False)
+        if path:
+            wire["path"] = path
+    return wire
+
+
+def _mesh_op_tool(a: dict[str, Any]) -> dict[str, Any]:
+    wire = _mesh_op_args(a)
+    try:
+        entry = _take_checkpoint("project", f"before mesh {wire['action']}")
+    except OpFailed as exc:
+        out = {"ok": False, "code": exc.code, "error": exc.message, "tool": "ap_mesh_op"}
+        if exc.code == "unsupported":
+            out["hint"] = EXT_HINT
+        return out
+    result = send_to_armorpaint("mesh_op", wire, OP_TIMEOUTS["mesh_op"])
+    _MESH_CACHE.clear()
+    return {"ok": True, "op": "mesh_op", "result": result,
+            "checkpoint": {"id": entry["id"], "kinds": entry["kinds"],
+                           "rollback": f"ap_rollback(checkpoint_id='{entry['id']}')"}}
+
+
+def _state_fingerprint() -> dict[str, Any]:
+    """What a stock build lets the server see of the project: the context, the active
+    material and its graph, and the window's pixels. Parts that cannot be read are None."""
+    parts: dict[str, Any] = {}
+    for key, op in (("context", "get_context"), ("node_graph", "node_list"), ("material", "material_get_active")):
+        try:
+            reply = send_to_armorpaint(op, {}, 15.0)
+            parts[key] = json.dumps({k: v for k, v in reply.items() if k != "elapsed_ms"}, sort_keys=True)
+        except BridgeError:
+            parts[key] = None
+    try:
+        hb = read_heartbeat()
+        title = (hb.get("app_title") if isinstance(hb, dict) else None) or None
+        parts["window"] = capture_window(title, None, 2)
+    except (CaptureError, OSError):
+        parts["window"] = None
+    return parts
+
+
+def _compare_fingerprints(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    changed = []
+    for key in before:
+        a, b = before[key], after.get(key)
+        if a is None or b is None:
+            continue
+        if key == "window":
+            try:
+                d = image_diff.diff(a.width, a.height, a.pixels(), b.pixels(), w2=b.width, h2=b.height)
+            except ValueError:
+                changed.append(key)
+                continue
+            if not d["no_visible_change"]:
+                changed.append(key)
+        elif a != b:
+            changed.append(key)
+    return changed
 
 
 GRAPH_TOOLS = frozenset(
@@ -3097,7 +3333,7 @@ def _graph_tool(name: str, a: dict[str, Any]) -> dict[str, Any]:
 # would end the session.
 MESH_TOOLS = frozenset({"ap_mesh_inspect", "ap_mesh_uv_layout", "ap_paint_stroke_uv"})
 
-_UNBATCHABLE = LOCAL_TOOLS | GRAPH_TOOLS | MESH_TOOLS | {
+_UNBATCHABLE = LOCAL_TOOLS | GRAPH_TOOLS | MESH_TOOLS | CHECKPOINT_TOOLS | {
     "ap_batch", "ap_quit", "ap_project_metadata", "ap_material_list", "ap_undo", "ap_redo",
 }
 
@@ -3130,12 +3366,28 @@ def _batch_tool(a: dict[str, Any]) -> dict[str, Any]:
         items.append((op, wire))
         names.append(tool)
         timeout += OP_TIMEOUTS.get(op, DEFAULT_TIMEOUT_S)
+    if _opt_bool(a, "atomic"):
+        bridge = graph_bridge()
+        cps, graphs, snaps = _checkpoint_stores()
+        entry = checkpoints.take(bridge, kind="auto", label="before atomic batch", store=cps,
+                                 graph_store=graphs, snapshot_dir=snaps)
+        result = bridge.batch(items, True)
+        _name_results(result, names)
+        if result.get("errors"):
+            rb = checkpoints.rollback(bridge, entry, graph_store=graphs)
+            return {"ok": False, "code": "batch_failed", "rolled_back": rb["ok"], "rollback": rb,
+                    "checkpoint_id": entry["id"], "result": result}
+        return {"ok": True, "op": "batch", "result": result, "checkpoint_id": entry["id"]}
     result = send_batch(items, min(timeout, 900.0), bool(_opt_bool(a, "stop_on_error")))
+    _name_results(result, names)
+    return {"ok": True, "op": "batch", "result": result}
+
+
+def _name_results(result: dict[str, Any], names: list[str]) -> None:
     for r in result.get("results") or []:
         i = r.get("i")
         if isinstance(i, int) and 0 <= i < len(names):
             r["tool"] = names[i]
-    return {"ok": True, "op": "batch", "result": result}
 
 
 SERVER_INSTRUCTIONS = (
@@ -3252,6 +3504,12 @@ async def call_tool(
         if name in GRAPH_TOOLS:
             return _text(await loop.run_in_executor(None, partial(_graph_tool, name, args)))
 
+        if name == "ap_mesh_op":
+            return _text(await loop.run_in_executor(None, partial(_mesh_op_tool, args)))
+
+        if name in CHECKPOINT_TOOLS:
+            return _text(await loop.run_in_executor(None, partial(_checkpoint_tool, name, args)))
+
         # --- bridge round trip --------------------------------------------
         wire = _build_wire_args(name, args)
         op = _wire_op(name, wire)
@@ -3263,6 +3521,7 @@ async def call_tool(
         if name in ("ap_undo", "ap_redo"):
             return _text(await loop.run_in_executor(None, partial(_undo_tool, op, wire)))
 
+        auto_cp = await loop.run_in_executor(None, partial(_auto_checkpoint, name))
         sent_at = time.monotonic()
         try:
             result = await loop.run_in_executor(
@@ -3292,6 +3551,9 @@ async def call_tool(
             # the handler alone, as measured inside ArmorPaint
             "handler_ms": result.get("elapsed_ms") if isinstance(result, dict) else None,
         }
+
+        if auto_cp is not None:
+            payload["checkpoint"] = auto_cp
 
         # Echo resolved enums so the caller can see what the name mapped to.
         if name == "ap_select_tool":

@@ -110,6 +110,7 @@ def frames(monkeypatch):
     monkeypatch.setattr(server, "capture_window", cap)
     monkeypatch.setattr(server, "send_to_armorpaint", send)
     monkeypatch.setattr(server, "read_heartbeat", lambda *a, **k: {"app_title": "t"})
+    monkeypatch.setenv("ARMORPAINT_MCP_AUTOCHECKPOINT", "0")  # fill_layer would take one first
     server._CAPTURES.clear()
     return queue, sent
 
