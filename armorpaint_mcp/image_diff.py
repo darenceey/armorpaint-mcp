@@ -104,3 +104,24 @@ def highlight(
                 row += bytes((r // 3, g // 3, bl // 3))
         rows.append(bytes(row))
     return _png(cx1 - cx0, cy1 - cy0, b"".join(rows))
+
+
+def contact_sheet(frames: list[tuple[int, int, bytes]], *, columns: int = 4, gap: int = 4) -> bytes:
+    """Tile same-sized RGB frames into one PNG, left to right, top to bottom."""
+    if not frames:
+        raise ValueError("no frames")
+    w, h = frames[0][0], frames[0][1]
+    columns = max(1, min(columns, len(frames)))
+    rows_n = (len(frames) + columns - 1) // columns
+    sheet_w = columns * w + (columns - 1) * gap
+    sheet_h = rows_n * h + (rows_n - 1) * gap
+    canvas = bytearray(sheet_w * sheet_h * 3)
+    for k, (fw, fh, rgb) in enumerate(frames):
+        if (fw, fh) != (w, h):
+            raise ValueError("frames differ in size")
+        ox, oy = (k % columns) * (w + gap), (k // columns) * (h + gap)
+        for y in range(h):
+            dst = ((oy + y) * sheet_w + ox) * 3
+            canvas[dst : dst + w * 3] = rgb[y * w * 3 : (y + 1) * w * 3]
+    rows = b"".join(b"\x00" + bytes(canvas[y * sheet_w * 3 : (y + 1) * sheet_w * 3]) for y in range(sheet_h))
+    return _png(sheet_w, sheet_h, rows)

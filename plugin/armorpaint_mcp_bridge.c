@@ -97,14 +97,35 @@
 //     with the frame: never park one in a global (see EMPTY_STR).
 // ============================================================================
 
-char *BRIDGE_VERSION = "2.0.0";
+char *BRIDGE_VERSION = "2.1.0";
 int   ENVELOPE_V     = 1;
 
-// Per-frame script-call budget. 48 stroke points cost 48*3 to_float calls; 64
-// list items cost 64*2 jesc calls. Both leave wide margin under ~280.
-// MAX_STROKE_POINTS must equal MAX_STROKE_POINTS in armorpaint_mcp/server.py.
+// Per-frame script-call budget. Every number in a stroke request costs one
+// to_float script call: 48 screen points are 96, 48 world points 144, and a
+// point with pressure (radius and opacity multipliers) adds two more. So a
+// request is capped at MAX_STROKE_POINTS points AND MAX_STROKE_VALUES numbers;
+// 64 list items cost 64*2 jesc calls. All leave margin under ~280.
+// Both limits must equal MAX_POINTS / MAX_VALUES in armorpaint_mcp/strokes.py.
 int MAX_STROKE_POINTS = 48;
+int MAX_STROKE_VALUES = 150;
 int MAX_LIST_ITEMS    = 64;
+
+// A STREAMED STROKE: stroke_begin, then any number of stroke_points requests
+// (one frame each), then stroke_end. It works because ArmorPaint keeps a script
+// stroke open across frames: script_paint_begin_stroke runs once per stroke
+// (guarded by script_paint_active, minic_impl.c) and only script_paint_end
+// dilates and closes it. So a stroke is no longer limited to what fits in one
+// frame. An open stroke is closed by end_stroke() before any other op runs, and
+// after STROKE_IDLE_S without points, so a stroke can never be left dangling.
+// stroke_r0/o0 are the brush radius and opacity to restore at the end: per-point
+// pressure multiplies them.
+int   stroke_open    = 0;
+int   stroke_world   = 0;
+int   stroke_total   = 0;
+float stroke_touched = 0.0;
+float stroke_r0      = 0.0;
+float stroke_o0      = 0.0;
+float STROKE_IDLE_S  = 5.0;
 
 // OPTIONAL BINDINGS ARE DETECTED, NOT CONFIGURED.
 //
@@ -896,16 +917,24 @@ void emit_object(object_t *o) {
 }
 
 // Walk a "x,y;x,y;..." (or "x,y,z;..." when is_world) point list and paint it.
-// The ';' between points and the ',' within one are server.py _points()'s
-// format; a JSON array cannot cross this wire because it corrupts
-// json_parse_to_map.
+// The ';' between points and the ',' within one are strokes.py's format; a JSON
+// array cannot cross this wire because it corrupts json_parse_to_map.
 //
-// Returns the number of points painted, or -1 if the list is longer than
-// MAX_STROKE_POINTS. The over-length case is detected by a counting pass BEFORE
-// anything is painted: silently truncating would leave a half-drawn stroke on
-// the user's model, and painting first and erroring afterwards is worse than
-// either. The counting pass is char_code_at only -- host calls, no arena frames.
-int do_stroke(char *pts, int is_world) {
+// A point may carry PRESSURE after its coordinates: a radius multiplier and an
+// opacity multiplier ("x,y,r" or "x,y,r,o"; world "x,y,z,r,o"). They scale the
+// brush radius/opacity the stroke started with, for that dab: upstream renders
+// each script_paint call immediately (render_path_paint_commands_paint), so the
+// value in the context at the call is the one that paints. With close = 1 the
+// stroke is ended and the brush restored; with close = 0 (stroke_points) it stays
+// open for the next request.
+//
+// Returns the number of points painted, or -1 if the list is over
+// MAX_STROKE_POINTS points or MAX_STROKE_VALUES numbers. That is detected by a
+// counting pass BEFORE anything is painted: silently truncating would leave a
+// half-drawn stroke on the user's model, and painting first and erroring
+// afterwards is worse than either. The counting pass is char_code_at only --
+// host calls, no arena frames.
+int do_stroke(char *pts, int is_world, int close) {
 	ncalls = ncalls + 1;
 	if (pts == NULL) {
 		return 0;
@@ -917,23 +946,45 @@ int do_stroke(char *pts, int is_world) {
 	int i   = 0;
 	int c   = 0;
 	int cnt = 1;
+	int cms = 0;
 	while (i < len) {
 		c = char_code_at(pts, i);
 		if (c == 59) { // ';'
 			cnt = cnt + 1;
+		}
+		if (c == 44) { // ','
+			cms = cms + 1;
 		}
 		i = i + 1;
 	}
 	if (cnt > MAX_STROKE_POINTS) {
 		return -1;
 	}
+	if (cnt + cms > MAX_STROKE_VALUES) {
+		return -1;
+	}
 
+	context_t *sc = script_get_context();
+	float      r0 = sc->brush_radius;
+	float      o0 = sc->brush_opacity;
+	if (stroke_open) {
+		r0 = stroke_r0;
+		o0 = stroke_o0;
+	}
+	int   need = 2 + is_world;
 	int   pos  = 0;
 	int   n    = 0;
 	int   sp   = 0;
-	int   c1   = 0;
-	int   c2   = 0;
+	int   q    = 0;
+	int   e    = 0;
+	int   nv   = 0;
 	int   tlen = 0;
+	float v    = 0.0;
+	float f0   = 0.0;
+	float f1   = 0.0;
+	float f2   = 0.0;
+	float f3   = 0.0;
+	float f4   = 0.0;
 	char *tok;
 	while (pos < len) {
 		sp = string_index_of_pos(pts, ";", pos);
@@ -943,28 +994,84 @@ int do_stroke(char *pts, int is_world) {
 		if (sp > pos) {
 			tok  = substring(pts, pos, sp);
 			tlen = string_length(tok);
-			c1   = string_index_of(tok, ",");
-			if (c1 > 0) {
+			nv   = 0;
+			q    = 0;
+			while (q < tlen) {
+				e = string_index_of_pos(tok, ",", q);
+				if (e < 0) {
+					e = tlen;
+				}
+				v = to_float(substring(tok, q, e));
+				if (nv == 0) {
+					f0 = v;
+				}
+				if (nv == 1) {
+					f1 = v;
+				}
+				if (nv == 2) {
+					f2 = v;
+				}
+				if (nv == 3) {
+					f3 = v;
+				}
+				if (nv == 4) {
+					f4 = v;
+				}
+				nv = nv + 1;
+				q  = e + 1;
+			}
+			if (nv >= need) {
+				// Pressure, when present: the numbers after the coordinates.
 				if (is_world) {
-					c2 = string_index_of_pos(tok, ",", c1 + 1);
-					if (c2 > c1) {
-						script_paint_world(to_float(substring(tok, 0, c1)), to_float(substring(tok, c1 + 1, c2)),
-						                   to_float(substring(tok, c2 + 1, tlen)));
-						n = n + 1;
+					if (nv > 3) {
+						sc->brush_radius = r0 * f3;
 					}
+					if (nv > 4) {
+						sc->brush_opacity = o0 * f4;
+					}
+					script_paint_world(f0, f1, f2);
 				}
 				else {
-					script_paint(to_float(substring(tok, 0, c1)), to_float(substring(tok, c1 + 1, tlen)));
-					n = n + 1;
+					if (nv > 2) {
+						sc->brush_radius = r0 * f2;
+					}
+					if (nv > 3) {
+						sc->brush_opacity = o0 * f3;
+					}
+					script_paint(f0, f1);
 				}
+				n = n + 1;
 			}
 		}
 		pos = sp + 1;
 	}
-	if (n > 0) {
-		script_paint_end(); // a stroke that is never ended stays open in the tool
+	if (close) {
+		if (n > 0) {
+			script_paint_end(); // a stroke that is never ended stays open in the tool
+		}
+		sc->brush_radius  = r0;
+		sc->brush_opacity = o0;
 	}
 	return n;
+}
+
+// Close the open streamed stroke, if any: end it (dilate + commit, as a normal
+// stroke's release does) and put the brush radius/opacity back. Returns 1 if a
+// stroke was open. The 32nd and last function minic allows (minic.c:2099); any
+// further logic must be a dispatch() arm.
+int end_stroke() {
+	ncalls = ncalls + 1;
+	if (!stroke_open) {
+		return 0;
+	}
+	script_paint_end();
+	context_t *ec = script_get_context();
+	if (ec != NULL) {
+		ec->brush_radius  = stroke_r0;
+		ec->brush_opacity = stroke_o0;
+	}
+	stroke_open = 0;
+	return 1;
 }
 
 // Rewritten roughly once per second. `t` is sys_time(): seconds since app start,
@@ -1003,6 +1110,7 @@ void write_heartbeat() {
 	json_encode_f32("linger", linger);
 	json_encode_bool("job_open", job_map != NULL);
 	json_encode_bool("job_held", job_held);
+	json_encode_bool("stroke_open", stroke_open);
 	json_encode_i32("ext", ext_state);
 	char *body = json_encode_end();
 	iron_file_save_bytes(path_heartbeat, sys_string_to_buffer(body), 0);
@@ -1102,6 +1210,9 @@ int op_cost(char *op) {
 	if (starts_with(op, "paint_stroke")) {
 		return 2;
 	}
+	if (starts_with(op, "stroke_")) {
+		return 2;
+	}
 	if (starts_with(op, "capture_")) {
 		return 2;
 	}
@@ -1171,6 +1282,19 @@ char *dispatch(void *m, char *op) {
 	int               i3;
 	int               i4;
 	int               n;
+
+	// An open streamed stroke is closed before any other op touches the app: the
+	// op might change the layer, tool or brush under it. Pings and context reads
+	// leave it open, so a capture can settle between two stroke_points.
+	if (stroke_open) {
+		if (!starts_with(op, "stroke_")) {
+			if (!string_equals(op, "ping")) {
+				if (!string_equals(op, "get_context")) {
+					end_stroke();
+				}
+			}
+		}
+	}
 
 	// ---- bridge & session -------------------------------------------------
 	if (string_equals(op, "ping")) {
@@ -2619,9 +2743,9 @@ char *dispatch(void *m, char *op) {
 		if (c->layer == NULL) {
 			return fail("no_project", "no layer is selected; script_paint would no-op");
 		}
-		n = do_stroke(s1, 0);
+		n = do_stroke(s1, 0, 1);
 		if (n < 0) {
-			return fail("bad_args", string("too many points; this bridge paints at most %d in the single frame a stroke runs in", MAX_STROKE_POINTS));
+			return fail("bad_args", string("too many points for one request (at most %d points and %d numbers); stream a longer stroke with stroke_begin / stroke_points / stroke_end", MAX_STROKE_POINTS, MAX_STROKE_VALUES));
 		}
 		if (n < 1) {
 			return fail("bad_args", "no parseable points; expected \"x,y;x,y;...\"");
@@ -2642,9 +2766,9 @@ char *dispatch(void *m, char *op) {
 		if (c->layer == NULL) {
 			return fail("no_project", "no layer is selected; script_paint_world would no-op");
 		}
-		n = do_stroke(s1, 1);
+		n = do_stroke(s1, 1, 1);
 		if (n < 0) {
-			return fail("bad_args", string("too many points; this bridge paints at most %d in the single frame a stroke runs in", MAX_STROKE_POINTS));
+			return fail("bad_args", string("too many points for one request (at most %d points and %d numbers); stream a longer stroke with stroke_begin / stroke_points / stroke_end", MAX_STROKE_POINTS, MAX_STROKE_VALUES));
 		}
 		if (n < 1) {
 			return fail("bad_args", "no parseable points; expected \"x,y,z;x,y,z;...\"");
@@ -2652,6 +2776,68 @@ char *dispatch(void *m, char *op) {
 		json_encode_begin();
 		json_encode_i32("points", n);
 		json_encode_i32("max_points", MAX_STROKE_POINTS);
+		return json_encode_end();
+	}
+	else if (string_equals(op, "stroke_begin")) {
+		// Streamed stroke (see stroke_open). Opens it; the first stroke_points
+		// starts the stroke in ArmorPaint (script_paint_begin_stroke is lazy).
+		if (c == NULL) {
+			return fail("internal", "no context");
+		}
+		if (c->layer == NULL) {
+			return fail("no_project", "no layer is selected; script_paint would no-op");
+		}
+		i1 = end_stroke(); // a stroke left open by an earlier caller
+		stroke_open    = 1;
+		stroke_world   = to_bool(arg(m, "world"));
+		stroke_total   = 0;
+		stroke_touched = sys_time();
+		stroke_r0      = c->brush_radius;
+		stroke_o0      = c->brush_opacity;
+		json_encode_begin();
+		json_encode_bool("open", 1);
+		json_encode_bool("world", stroke_world);
+		json_encode_bool("closed_previous", i1);
+		json_encode_i32("max_points", MAX_STROKE_POINTS);
+		json_encode_i32("max_values", MAX_STROKE_VALUES);
+		json_encode_f32("idle_close_s", STROKE_IDLE_S);
+		return json_encode_end();
+	}
+	else if (string_equals(op, "stroke_points")) {
+		if (!stroke_open) {
+			return fail("no_stroke", string("no stroke is open: call stroke_begin first (an open stroke is closed by any other op, and after %f s without points)", STROKE_IDLE_S));
+		}
+		s1 = arg(m, "points");
+		if (s1 == NULL) {
+			return fail("bad_args", "missing 'points'");
+		}
+		n = do_stroke(s1, stroke_world, 0);
+		if (n < 0) {
+			return fail("bad_args", string("too many points for one request (at most %d points and %d numbers); send them in more stroke_points requests", MAX_STROKE_POINTS, MAX_STROKE_VALUES));
+		}
+		if (n < 1) {
+			return fail("bad_args", "no parseable points");
+		}
+		stroke_total   = stroke_total + n;
+		stroke_touched = sys_time();
+		json_encode_begin();
+		json_encode_i32("points", n);
+		json_encode_i32("total", stroke_total);
+		return json_encode_end();
+	}
+	else if (string_equals(op, "stroke_end")) {
+		i1 = stroke_open;
+		if (stroke_open) {
+			script_paint_end();
+			if (c != NULL) {
+				c->brush_radius  = stroke_r0;
+				c->brush_opacity = stroke_o0;
+			}
+			stroke_open = 0;
+		}
+		json_encode_begin();
+		json_encode_bool("was_open", i1);
+		json_encode_i32("total", stroke_total);
 		return json_encode_end();
 	}
 	else if (string_equals(op, "fill_layer")) {
@@ -3095,6 +3281,9 @@ void on_update() {
 	if (refill_pending) {
 		awake = 1;
 	}
+	if (stroke_open) {
+		awake = 1;
+	}
 	if (awake) {
 		iron_delay_idle_sleep();
 	}
@@ -3115,6 +3304,15 @@ void on_update() {
 					script_fill_layer();
 				}
 			}
+		}
+	}
+
+	// A streamed stroke nobody finished (the server died, or never sent
+	// stroke_end) is closed here rather than left open in the paint tool.
+	if (stroke_open) {
+		if (now - stroke_touched > STROKE_IDLE_S) {
+			end_stroke();
+			write_heartbeat();
 		}
 	}
 

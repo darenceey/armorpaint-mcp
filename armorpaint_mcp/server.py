@@ -65,7 +65,7 @@ try:  # normal package import
         spool_resolution,
     )
     from .window_capture import MAX_DOWNSCALE, CaptureError, capture_window
-    from . import desktop_input, image_diff, local_tools, node_catalogue, node_graph, recipes
+    from . import desktop_input, image_diff, local_tools, node_catalogue, node_graph, recipes, strokes
     from .transport import send_batch
 except ImportError:  # running server.py as a loose script
     __version__ = "1.1.0"
@@ -90,6 +90,7 @@ except ImportError:  # running server.py as a loose script
     import node_catalogue  # type: ignore[no-redef]
     import node_graph  # type: ignore[no-redef]
     import recipes  # type: ignore[no-redef]
+    import strokes  # type: ignore[no-redef]
     from transport import send_batch  # type: ignore[no-redef]
 
 # ---------------------------------------------------------------------------
@@ -156,6 +157,9 @@ OP_TIMEOUTS: dict[str, float] = {
     "set_brush": 15,
     "paint_stroke": 120,
     "paint_stroke_world": 120,
+    "stroke_begin": 30,
+    "stroke_points": 60,
+    "stroke_end": 60,
     "fill_layer": 180,
     "set_display_channel": 30,
     "capture_to_project": 180,
@@ -219,7 +223,8 @@ UI_TOOLS = frozenset({"ap_ui_click", "ap_ui_key", "ap_ui_drag", "ap_ui_scroll"})
 
 # Tools answered entirely by this process — they work even when ArmorPaint is closed.
 LOCAL_TOOLS = frozenset(
-    {"ap_bridge_status", "ap_read_image_file", "ap_capture_window", "ap_resource_search"}
+    {"ap_bridge_status", "ap_read_image_file", "ap_capture_window", "ap_resource_search",
+     "ap_capture_sequence", "ap_paint_stroke_pointer"}
     | UI_TOOLS
 )
 
@@ -228,12 +233,9 @@ MAX_IMAGE_BYTES = 6_000_000
 MAX_CAPTURE_DIM = 4096
 MIN_CAPTURE_DIM = 16
 
-# MUST equal MAX_STROKE_POINTS in plugin/armorpaint_mcp_bridge.c. The bridge paints a
-# whole stroke inside one ArmorPaint frame, and each point costs three minic script calls
-# against a per-frame budget of roughly 280 before the 8 MB context arena overflows
-# (docs/MINIC_DIALECT_AND_API.md 1.11a). A longer list is rejected by the plugin rather
-# than truncated, so a mismatch here turns into a bad_args on every long stroke.
-MAX_STROKE_POINTS = 48
+# Points per bridge REQUEST (strokes.py has the per-request value budget too). Longer
+# strokes are streamed as stroke_begin / stroke_points... / stroke_end.
+MAX_STROKE_POINTS = strokes.MAX_POINTS
 
 # OBJ line breaks cannot cross the wire: the plugin's JSON parser does not decode escapes,
 # so encode_value() refuses any control character including "\n". Lines are joined with
@@ -436,68 +438,44 @@ def _vec(args: dict[str, Any], key: str, size: int) -> list[float] | None:
     return [_num(v, key) for v in value]
 
 
-def _points(args: dict[str, Any], key: str, dims: int) -> str:
-    """Flatten a point list to ``x,y[,z];x,y[,z]``.
-
-    No JSON array can cross this wire: an array anywhere in the request corrupts the
-    remainder of the plugin's parse (``iron_json.c:297``).
-    """
+def _point_list(args: dict[str, Any], key: str, dims: int | None) -> list[tuple[float, ...]]:
+    """Parse a stroke's points: [[x, y], ...] (``dims`` 2) or [[x, y, z], ...] (3), each
+    optionally followed by a radius and an opacity multiplier (pressure). ``dims`` None
+    accepts 2..5 numbers (the bridge knows whether the open stroke is in world space).
+    Also accepts objects {x, y[, z][, radius][, opacity]} and the wire string form."""
     value = args.get(key)
+    lo, hi = (2, 5) if dims is None else (dims, dims + 2)
+    shape = "[[0.4,0.5],[0.6,0.5]]" if dims != 3 else "[[0,0,0],[1,0,0]]"
     if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            raise BadArgs(f"'{key}' is empty.", arg=key)
-        groups = [g for g in text.split(";") if g.strip()]
-        for g in groups:
-            parts = g.split(",")
-            if len(parts) != dims:
-                raise BadArgs(
-                    f"'{key}': segment {g!r} has {len(parts)} components, expected {dims}.",
-                    arg=key,
-                )
-            for p in parts:
-                try:
-                    float(p)
-                except ValueError as exc:
-                    raise BadArgs(f"'{key}': {p!r} is not a number.", arg=key) from exc
-        if len(groups) > MAX_STROKE_POINTS:
-            raise BadArgs(
-                f"'{key}' has {len(groups)} points; the limit is {MAX_STROKE_POINTS} because "
-                f"the whole stroke is applied inside a single ArmorPaint frame.",
-                arg=key,
-            )
-        return ";".join(g.strip() for g in groups)
-
+        value = [g.split(",") for g in value.split(";") if g.strip()]
     if not isinstance(value, (list, tuple)) or not value:
-        raise BadArgs(
-            f"'{key}' is required: an array of {dims}-number points, e.g. "
-            f"{'[[0.4,0.5],[0.6,0.5]]' if dims == 2 else '[[0,0,0],[1,0,0]]'}.",
-            arg=key,
-        )
-    if len(value) > MAX_STROKE_POINTS:
-        raise BadArgs(
-            f"'{key}' has {len(value)} points; the limit is {MAX_STROKE_POINTS} because the "
-            f"whole stroke is applied inside a single ArmorPaint frame.",
-            arg=key,
-        )
-    out: list[str] = []
+        raise BadArgs(f"'{key}' is required: an array of points, e.g. {shape}.", arg=key)
+    if len(value) > strokes.MAX_TOTAL_POINTS:
+        raise BadArgs(f"'{key}' has {len(value)} points; the limit is {strokes.MAX_TOTAL_POINTS}.", arg=key)
+    out: list[tuple[float, ...]] = []
     for point in value:
         if isinstance(point, dict):
-            keys = ("x", "y", "z")[:dims]
+            keys = ("x", "y", "z")[: dims or 2]
             if any(k not in point for k in keys):
                 raise BadArgs(f"'{key}': each point object needs {', '.join(keys)}.", arg=key)
             comps = [_num(point[k], key) for k in keys]
+            if "radius" in point or "opacity" in point:
+                comps.append(_num(point.get("radius", 1.0), key))
+            if "opacity" in point:
+                comps.append(_num(point["opacity"], key))
         elif isinstance(point, (list, tuple)):
-            if len(point) != dims:
+            if not lo <= len(point) <= hi:
                 raise BadArgs(
-                    f"'{key}': each point needs exactly {dims} numbers (got {len(point)}).",
+                    f"'{key}': each point needs {lo} numbers"
+                    + (f", optionally followed by a radius and an opacity multiplier (got {len(point)})." if dims else
+                       f" to {hi} (got {len(point)})."),
                     arg=key,
                 )
             comps = [_num(c, key) for c in point]
         else:
             raise BadArgs(f"'{key}': each point must be an array or object.", arg=key)
-        out.append(",".join(f"{c:.6f}".rstrip("0").rstrip(".") or "0" for c in comps))
-    return ";".join(out)
+        out.append(tuple(comps))
+    return out
 
 
 def _pick(args: dict[str, Any], key: str, table: dict[str, int], label: str) -> int:
@@ -565,6 +543,33 @@ def _i(description: str, **extra: Any) -> dict[str, Any]:
 
 def _b(description: str, **extra: Any) -> dict[str, Any]:
     return {"type": "boolean", "description": description, **extra}
+
+
+def _stroke_points_schema(dims: int, what: str) -> dict[str, Any]:
+    return {
+        "type": "array",
+        "items": {"type": "array", "items": {"type": "number"}, "minItems": dims, "maxItems": dims + 2},
+        "description": (
+            f"Stroke path as [[{what}], ...]. Each point may add a radius multiplier and an "
+            f"opacity multiplier after its coordinates (pressure): [{what}, 0.4, 0.8] paints "
+            f"that dab at 40% of the brush radius and 80% of its opacity."
+        ),
+    }
+
+
+# Shaping options shared by the stroke tools (strokes.py).
+_STROKE_SHAPING: dict[str, Any] = {
+    "smooth": _b("Draw a smooth curve (Catmull-Rom) through the points instead of straight "
+                 "segments.", default=False),
+    "spacing": _n("Resample the path to a point every this many units (screen: fraction of "
+                  "the viewport; world: world units). Dense, even dabs.", minimum=0),
+    "taper": _s("Pressure-like taper of the brush radius along the stroke: 'in' (thin "
+                "start), 'out' (thin end), 'both'.", enum=["none", "in", "out", "both"], default="none"),
+    "taper_min": _n("Thinnest point of a taper, as a fraction of the radius.", minimum=0.01,
+                    maximum=1, default=0.15),
+    "jitter": _n("Seeded wobble, perpendicular to the stroke (same units as spacing).", minimum=0),
+    "seed": _i("Seed for jitter and generators, for repeatable results.", default=0),
+}
 
 
 _PATH_NOTE = "Absolute path, forward slashes (backslashes are converted for you)."
@@ -1153,38 +1158,83 @@ TOOLS: list[types.Tool] = [
         "across the viewport, so 0.5,0.5 is the centre and what gets painted depends on the "
         "current camera. Paints into the selected layer with the active tool/brush; silently "
         "does nothing if no project is open, no layer is selected, or the selected layer is "
-        f"a group. At most {MAX_STROKE_POINTS} points — the whole stroke runs inside one "
-        "frame.",
+        "a group (use 'capture' to catch that). Any length: a stroke longer than one "
+        f"request ({MAX_STROKE_POINTS} points) is streamed as one continuous stroke over "
+        "several frames. Shape it with smooth / spacing / taper / jitter, give points their "
+        "own pressure, or let 'generate' draw a scratch, zigzag, spiral or scattered dabs.",
         {
-            "points": {
-                "type": "array",
-                "items": {
-                    "type": "array",
-                    "items": {"type": "number"},
-                    "minItems": 2,
-                    "maxItems": 2,
-                },
-                "description": "Stroke path as [[x, y], ...] in normalised 0..1 screen space.",
-            }
+            "points": _stroke_points_schema(2, "x, y"),
+            "generate": {
+                "type": "object",
+                "description": (
+                    "Instead of points: {kind: 'scratch', start: [x,y], end: [x,y], wobble, "
+                    "segments} | {kind: 'zigzag', start, end, teeth, amplitude} | {kind: "
+                    "'spiral', center: [x,y], radius_start, radius_end, turns} | {kind: 'dabs', "
+                    "center, radius, count} (each dab a separate stroke). Shaping options apply."
+                ),
+            },
+            **_STROKE_SHAPING,
+            "record": {
+                "type": "object",
+                "description": "Film the stroke: a frame after each streamed chunk, returned as "
+                "one contact-sheet image. Optional 'downscale' (default 2) and 'crop'.",
+            },
+        },
+    ),
+    _tool(
+        "ap_paint_stroke_world",
+        "Paint a stroke in WORLD space and close it -- camera-independent, which makes it the "
+        "reliable choice for scripted painting (a point must still be visible from the "
+        "camera to paint). ArmorPaint's world is Z-up; use ap_get_main_object for the "
+        "object's bounds. Any length (streamed as one stroke); shaping and per-point pressure "
+        "as ap_paint_stroke.",
+        {
+            "points": _stroke_points_schema(3, "x, y, z"),
+            **{k: v for k, v in _STROKE_SHAPING.items() if k != "jitter"},
+            "jitter": _n("Seeded random offset per point, in world units.", minimum=0),
+            "record": {"type": "object", "description": "As ap_paint_stroke."},
         },
         ["points"],
     ),
     _tool(
-        "ap_paint_stroke_world",
-        "Paint a stroke in WORLD space and close it — camera-independent, which makes it the "
-        "reliable choice for scripted painting. ArmorPaint's world is Z-up; use "
-        "ap_get_main_object for the object's bounds.",
+        "ap_stroke_begin",
+        "Open a stroke to paint piece by piece: ap_stroke_points as often as you like -- "
+        "looking at the result in between (ap_capture_window) -- then ap_stroke_end. "
+        "ArmorPaint keeps it one continuous stroke. Any other tool call closes an open stroke "
+        "first (ap_capture_window does not), and so do 5 s without points.",
+        {"world": _b("World-space points (x, y, z) instead of screen (x, y).", default=False)},
+    ),
+    _tool(
+        "ap_stroke_points",
+        f"Add points to the open stroke (at most {MAX_STROKE_POINTS} per call; pressure as "
+        "in ap_paint_stroke). Screen or world as chosen in ap_stroke_begin.",
+        {"points": {"type": "array", "items": {"type": "array", "items": {"type": "number"},
+                                                "minItems": 2, "maxItems": 5},
+                    "description": "[[x, y(, z)(, radius)(, opacity)], ...]."}},
+        ["points"],
+    ),
+    _tool(
+        "ap_stroke_end",
+        "Close the open stroke (ArmorPaint dilates and commits it, as on mouse release) and "
+        "restore the brush radius and opacity that pressure changed.",
+    ),
+    _tool(
+        "ap_paint_stroke_pointer",
+        "Paint with a real press-drag-release of the mouse in ArmorPaint's window, so "
+        "ArmorPaint's OWN stroke engine does the work: its brush spacing, lazy mouse, "
+        "symmetry and pen-less pressure settings. Points are WINDOW PIXELS, as in "
+        "ap_capture_window's image (not 0..1). Delivered to the window without moving the "
+        "real pointer or taking focus. Needs synthetic input (Linux X11 verified).",
         {
-            "points": {
-                "type": "array",
-                "items": {
-                    "type": "array",
-                    "items": {"type": "number"},
-                    "minItems": 3,
-                    "maxItems": 3,
-                },
-                "description": "Stroke path as [[x, y, z], ...] in world space.",
-            }
+            "points": {"type": "array", "items": {"type": "array", "items": {"type": "number"},
+                                                   "minItems": 2, "maxItems": 2},
+                       "minItems": 2, "description": "[[x, y], ...] in window pixels."},
+            "step_ms": _i("Minimum delay between pointer moves. ArmorPaint samples the pointer "
+                          "once per frame and a stroke fed faster than that breaks up, so the "
+                          "tool measures the frame time and never goes below 1.25 frames.",
+                          minimum=1, maximum=200, default=20),
+            **{k: _STROKE_SHAPING[k] for k in ("smooth", "spacing", "jitter", "seed")},
+            "modifiers": {"type": "array", "items": {"type": "string", "enum": ["ctrl", "shift", "alt"]}},
         },
         ["points"],
     ),
@@ -1285,6 +1335,19 @@ TOOLS: list[types.Tool] = [
                 "fraction, and a second image zoomed on the change. Both captures need the "
                 "same crop and downscale."
             ),
+        },
+    ),
+    _tool(
+        "ap_capture_sequence",
+        "Film ArmorPaint's window for a few seconds: frames at up to 10 per second, returned "
+        "as one contact-sheet image (left to right, top to bottom). For reviewing something "
+        "that happens over time, such as a streamed stroke from another call or a bake.",
+        {
+            "duration_s": _n("How long to record (0.1..10 s).", minimum=0.1, maximum=10, default=2),
+            "fps": _i("Frames per second (1..10).", minimum=1, maximum=10, default=4),
+            "crop": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
+            "downscale": _i(f"1..{MAX_DOWNSCALE}.", default=2),
+            "columns": _i("Tiles per row of the sheet.", minimum=1, maximum=10, default=4),
         },
     ),
     _tool(
@@ -1968,11 +2031,32 @@ def _build_wire_args(name: str, a: dict[str, Any]) -> dict[str, Any]:
             raise BadArgs("Give at least one brush parameter to change.")
         return out
 
-    if name == "ap_paint_stroke":
-        return {"points": _points(a, "points", 2)}
+    if name in ("ap_paint_stroke", "ap_paint_stroke_world"):
+        paths = _stroke_paths(name, a)
+        plan = strokes.plan(paths[0], world=name.endswith("_world")) if len(paths) == 1 else []
+        if len(plan) != 1:
+            raise BadArgs(
+                "this stroke needs more than one bridge request, which a batch step cannot "
+                "make; call ap_paint_stroke on its own (it streams long strokes).",
+                arg="points",
+            )
+        return plan[0][1]
 
-    if name == "ap_paint_stroke_world":
-        return {"points": _points(a, "points", 3)}
+    if name == "ap_stroke_begin":
+        return {"world": bool(_opt_bool(a, "world"))}
+
+    if name == "ap_stroke_points":
+        pts = _point_list(a, "points", None)
+        if len(pts) > strokes.chunk_size(max(len(p) for p in pts)):
+            raise BadArgs(
+                f"at most {strokes.chunk_size(max(len(p) for p in pts))} points of this width "
+                f"per call; send the rest in further ap_stroke_points calls.",
+                arg="points",
+            )
+        return {"points": strokes.encode(pts)}
+
+    if name == "ap_stroke_end":
+        return {}
 
     if name == "ap_set_display_channel":
         return {"mode": _pick(a, "mode", VIEWPORT_MODES, "display mode")}
@@ -2311,11 +2395,209 @@ async def _capture_window_tool(
     return [_png_image(cap.png), *extra, text]
 
 
+# ---------------------------------------------------------------------------
+# Strokes (strokes.py): shaping, streaming, pointer strokes, filmstrip
+# ---------------------------------------------------------------------------
+
+
+def _stroke_paths(name: str, a: dict[str, Any]) -> list[list[tuple[float, ...]]]:
+    """The stroke(s) a paint call describes, shaped: points or a generator, then the
+    smooth / spacing / taper / jitter options."""
+    world = name.endswith("_world")
+    dims = 3 if world else 2
+    gen = a.get("generate")
+    if gen is not None:
+        if world:
+            raise BadArgs("'generate' draws in screen space; use ap_paint_stroke.", arg="generate")
+        if not isinstance(gen, dict):
+            raise BadArgs("'generate' must be an object with a 'kind'.", arg="generate")
+        paths = strokes.generate({**gen, "seed": gen.get("seed", a.get("seed", 0))})
+    else:
+        paths = [_point_list(a, "points", dims)]
+    opts = {
+        "smooth": bool(_opt_bool(a, "smooth")),
+        "spacing": _opt_float(a, "spacing", 0.0),
+        "taper": _opt_str(a, "taper") or "none",
+        "taper_min": _opt_float(a, "taper_min", 0.01, 1.0) or 0.15,
+        "jitter": _opt_float(a, "jitter", 0.0) or 0.0,
+        "seed": _opt_int(a, "seed") or 0,
+    }
+    shaped = [strokes.shape(path, dims=dims, **opts) for path in paths]
+    total = sum(len(path) for path in shaped)
+    if total > strokes.MAX_TOTAL_POINTS:
+        raise BadArgs(f"the shaped stroke has {total} points; the limit is {strokes.MAX_TOTAL_POINTS} "
+                      f"(use a larger 'spacing').", arg="spacing")
+    return shaped
+
+
+async def _stroke_tool(name: str, a: dict[str, Any]) -> list[types.TextContent | types.ImageContent]:
+    """Paint one or more strokes, streaming any that need more than one request. A
+    streamed stroke is always closed, even when a chunk fails."""
+    started = time.monotonic()
+    paths = _stroke_paths(name, a)
+    world = name.endswith("_world")
+    record = a.get("record")
+    if record is not None and not isinstance(record, dict):
+        raise BadArgs("'record' must be an object ({} for defaults).", arg="record")
+    film_args = {"downscale": 2, "settle_frames": 2, **(record or {})}
+    loop = asyncio.get_running_loop()
+    frames: list[Any] = []
+    painted = requests = 0
+    streamed = False
+
+    async def send(op: str, wire: dict[str, Any]) -> dict[str, Any]:
+        nonlocal requests
+        requests += 1
+        return await loop.run_in_executor(
+            None, partial(send_to_armorpaint, op, wire, OP_TIMEOUTS.get(op, DEFAULT_TIMEOUT_S))
+        )
+
+    for path in paths:
+        plan = strokes.plan(path, world=world)
+        streamed = streamed or len(plan) > 1
+        open_stroke = False
+        try:
+            for op, wire in plan:
+                result = await send(op, wire)
+                if op == "stroke_begin":
+                    open_stroke = True
+                elif op == "stroke_end":
+                    open_stroke = False
+                else:
+                    painted += int(result.get("points", 0))
+                if record is not None and op in ("stroke_points", "paint_stroke", "paint_stroke_world"):
+                    cap, _ = await _grab(film_args)
+                    if cap is not None:
+                        frames.append(cap)
+        except BridgeError as exc:
+            if open_stroke:
+                try:
+                    await send("stroke_end", {})
+                except BridgeError:
+                    pass
+            payload = exc.to_dict()
+            payload.update({"tool": name, "painted_points": painted, "failed_op": op,
+                            "note": "the stroke was closed; what was painted before the failure stays"})
+            return _text(payload)
+
+    result_block = {"points": painted, "strokes": len(paths), "requests": requests, "streamed": streamed}
+    payload: dict[str, Any] = {"ok": True, "op": name[3:], "result": result_block,
+                               "timing": {"total_ms": round((time.monotonic() - started) * 1000)}}
+    content: list[types.TextContent | types.ImageContent] = []
+    if frames:
+        sheet = image_diff.contact_sheet([(f.width, f.height, f.pixels()) for f in frames],
+                                         columns=min(4, len(frames)))
+        payload["record"] = {"frames": len(frames),
+                             "distinct_frames": len({f.pixels() for f in frames})}
+        content.append(_png_image(sheet))
+    content.append(types.TextContent(type="text", text=json.dumps(payload, indent=2)))
+    return content
+
+
+def _pointer_points(a: dict[str, Any]) -> list[tuple[int, int]]:
+    raw = _point_list(a, "points", 2)
+    if all(abs(v) <= 1.0 for p in raw for v in p[:2]):
+        raise BadArgs(
+            "ap_paint_stroke_pointer takes window pixels (as in ap_capture_window's image), "
+            "and these all look like normalised 0..1 coordinates; ap_paint_stroke takes those.",
+            arg="points",
+        )
+    shaped = strokes.shape(
+        [p[:2] for p in raw], dims=2, smooth=bool(_opt_bool(a, "smooth")),
+        spacing=_opt_float(a, "spacing", 0.0), jitter=_opt_float(a, "jitter", 0.0) or 0.0,
+        seed=_opt_int(a, "seed") or 0,
+    )
+    out: list[tuple[int, int]] = []
+    for x, y in shaped:
+        q = (int(round(x)), int(round(y)))
+        if not out or out[-1] != q:
+            out.append(q)
+    if len(out) < 2:
+        raise BadArgs("the path needs at least two distinct pixels.", arg="points")
+    if len(out) > 2048:
+        raise BadArgs(f"the path has {len(out)} pixels after shaping; at most 2048.", arg="points")
+    return out
+
+
+def _frame_interval_ms(pings: int = 3) -> float | None:
+    """ArmorPaint's current frame time: a ping is answered on the frame after the last
+    one, so N back-to-back pings take about N frames. None if the bridge is unreachable."""
+    started = time.monotonic()
+    try:
+        for _ in range(pings):
+            send_to_armorpaint("ping", {}, 5.0)
+    except BridgeError:
+        return None
+    return (time.monotonic() - started) * 1000.0 / pings
+
+
+def _pointer_step(requested_ms: int, frame_ms: float | None) -> int:
+    """At least 1.25 frames per pointer event. Measured live (lavapipe, ~16 fps): events
+    every 20 ms broke a stroke into pieces; at one frame or more per event it was whole."""
+    if frame_ms is None:
+        return requested_ms
+    return max(requested_ms, int(round(frame_ms * 1.25)))
+
+
+def _pointer_stroke_tool(a: dict[str, Any]) -> dict[str, Any]:
+    pts = _pointer_points(a)
+    frame_ms = _frame_interval_ms()
+    step_ms = _pointer_step(_opt_int(a, "step_ms", 1, 200) or 20, frame_ms)
+    hb = read_heartbeat()
+    title = (hb.get("app_title") if isinstance(hb, dict) else None) or None
+    try:
+        res = desktop_input.drag(pts, "left", _opt_list_str(a, "modifiers"), step_s=step_ms / 1000.0,
+                                 title_hint=title)
+    except desktop_input.InputError as exc:
+        return {"ok": False, "code": exc.code, "error": exc.message, "tool": "ap_paint_stroke_pointer"}
+    return {"ok": True, **res, "frame_ms": None if frame_ms is None else round(frame_ms, 1),
+            "step_ms_used": step_ms, "next_step": "ap_capture_window (or pass 'capture') to see it."}
+
+
+def _sequence_args(a: dict[str, Any]) -> tuple[float, int]:
+    duration = _opt_float(a, "duration_s")
+    duration = 2.0 if duration is None else duration
+    if not 0.1 <= duration <= 10:
+        raise BadArgs("'duration_s' must be 0.1..10.", arg="duration_s")
+    fps = _opt_int(a, "fps")
+    fps = 4 if fps is None else fps
+    if not 1 <= fps <= 10:
+        raise BadArgs("'fps' must be 1..10.", arg="fps")
+    return float(duration), fps
+
+
+async def _capture_sequence_tool(a: dict[str, Any]) -> list[types.TextContent | types.ImageContent]:
+    duration, fps = _sequence_args(a)
+    grab_args = {"crop": a.get("crop"), "downscale": a.get("downscale", 2), "settle": False}
+    grab_args = {k: v for k, v in grab_args.items() if v is not None}
+    # Keep the app awake for the recording: a dozing ArmorPaint renders no frames.
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, partial(send_to_armorpaint, "ping", {}, 5.0))
+    except BridgeError:
+        pass
+    frames: list[Any] = []
+    start = time.monotonic()
+    for i in range(max(1, int(round(duration * fps)))):
+        wait = start + i / fps - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        cap, report = await _grab(grab_args)
+        if cap is None:
+            return _text({**report, "tool": "ap_capture_sequence", "frames_taken": len(frames)})
+        frames.append(cap)
+    columns = _opt_int(a, "columns", 1, 10) or 4
+    sheet = image_diff.contact_sheet([(f.width, f.height, f.pixels()) for f in frames], columns=columns)
+    meta = {"ok": True, "frames": len(frames), "fps": fps, "duration_s": duration,
+            "distinct_frames": len({f.pixels() for f in frames}), "frame_size": [frames[0].width, frames[0].height],
+            "layout": f"{columns} per row, left to right, top to bottom"}
+    return [_png_image(sheet), types.TextContent(type="text", text=json.dumps(meta, indent=2))]
+
+
 # Tools that take an optional 'capture' argument: the window is captured after the
 # operation (and, for the diff, before it) and returned in the same reply.
 CAPTURE_TOOLS = frozenset(
     {"ap_paint_stroke", "ap_paint_stroke_world", "ap_fill_layer", "ap_batch",
-     "ap_node_graph_apply", "ap_node_recipe"}
+     "ap_node_graph_apply", "ap_node_recipe", "ap_paint_stroke_pointer", "ap_stroke_end"}
 )
 
 _CAPTURE_ARG = {
@@ -2696,6 +2978,16 @@ async def call_tool(
 
         if name == "ap_capture_window":
             return await _capture_window_tool(args)
+
+        if name == "ap_capture_sequence":
+            return await _capture_sequence_tool(args)
+
+        if name in ("ap_paint_stroke", "ap_paint_stroke_world"):
+            return await _stroke_tool(name, args)
+
+        if name == "ap_paint_stroke_pointer":
+            loop = asyncio.get_running_loop()
+            return _text(await loop.run_in_executor(None, partial(_pointer_stroke_tool, args)))
 
         if name == "ap_read_image_file":
             path_text = _norm_path(args, "path")
