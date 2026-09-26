@@ -1028,6 +1028,41 @@ def _await_response(
     )
 
 
+# Ops that change nothing in ArmorPaint's window. Any other request, and every batch,
+# counts as an edit: the server's capture settle (server._grab) waits for an edit's
+# pixels to reach the window, which can take 100-550 ms after the reply on a composited
+# desktop (measured on KWin/XWayland, 2026-09-26).
+NO_PIXEL_OPS = frozenset({
+    "ping", "get_app_info", "get_context", "get_config", "get_main_object", "get_object",
+    "camera_get", "project_get_info", "project_list_texture_assets", "project_list_scripts",
+    "material_get_active", "material_list", "node_list", "node_get", "shape_list",
+    "fs_list", "fs_stat", "fs_mkdir", "export_textures", "export_material_bake",
+    "export_mesh", "export_material", "bridge_set_idle", "bridge_set_poll_ms",
+    "layer_list", "history_list", "bake_status",
+})
+
+_last_edit_t: float | None = None
+_edit_count = 0
+
+
+def note_edit() -> None:
+    """Record that ArmorPaint's window may be about to change (an edit request, or
+    synthetic input)."""
+    global _last_edit_t, _edit_count
+    _last_edit_t = time.monotonic()
+    _edit_count += 1
+
+
+def edit_count() -> int:
+    """How many edits this process has sent."""
+    return _edit_count
+
+
+def seconds_since_edit() -> float | None:
+    """Seconds since the last edit this process sent, or None if it sent none."""
+    return None if _last_edit_t is None else time.monotonic() - _last_edit_t
+
+
 def send_to_armorpaint(
     op: str,
     args: dict[str, Any] | None = None,
@@ -1044,9 +1079,13 @@ def send_to_armorpaint(
     timeout = max(MIN_TIMEOUT_S, min(MAX_TIMEOUT_S, timeout))
     rid = mint_id()
     payload = build_request(op, args, rid, timeout)
-    result = _send_payload(op, rid, payload, timeout)
-    if follow_pending:
-        result = _follow_pending(result, op, _last_spool or spool_dir(), timeout)
+    try:
+        result = _send_payload(op, rid, payload, timeout)
+        if follow_pending:
+            result = _follow_pending(result, op, _last_spool or spool_dir(), timeout)
+    finally:
+        if op not in NO_PIXEL_OPS:
+            note_edit()
     return result
 
 
@@ -1065,7 +1104,11 @@ def send_batch(
     timeout = max(MIN_TIMEOUT_S, min(MAX_TIMEOUT_S, timeout))
     rid = mint_id()
     payload = build_batch_request(items, rid, timeout, stop_on_error)
-    return _send_payload("batch", rid, payload, timeout)
+    try:
+        return _send_payload("batch", rid, payload, timeout)
+    finally:
+        if any(op not in NO_PIXEL_OPS for op, _ in items):
+            note_edit()
 
 
 _last_spool: Path | None = None

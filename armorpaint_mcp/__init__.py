@@ -14,7 +14,7 @@ Answered by the server itself, on any ArmorPaint build:
 * ``armorpaint_mcp.local_tools``    — resource search and per-project metadata sidecars.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 WIRE_PROTOCOL_VERSION = 1
 

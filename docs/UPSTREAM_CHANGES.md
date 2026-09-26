@@ -9,7 +9,8 @@ This document describes the two **optional** native changes:
 1. **The native extension** (`patch/apply_ext_patch.py`) — one binding, `mcp_ext_call`, that
    gives the bridge layer management, undo/redo, export format / bit depth / preset, bakes,
    render settings, the texture-set resolution, live project lists, camera views, console
-   read-back and a file-based viewport capture. **Start here**: it supersedes the viewport patch.
+   read-back, a file-based viewport capture, mesh edits and project snapshots. **Start here**: it
+   supersedes the viewport patch.
 2. **The viewport patch** (`patch/apply_viewport_patch.py`) — the smaller, older change that only
    adds file-based viewport capture. It is upstream since 2026-09-09.
 
@@ -62,7 +63,7 @@ socket, thread or new dependency.
 | `layer_set` | `history_layer_name/visible/opacity/blending/object/scale/angle` + the field |
 | `layer_move` | `slot_layer_can_move` + `slot_layer_move` |
 | `layer_action` | the context-menu handlers: clear, merge down/group, to fill/paint, apply/invert mask |
-| `undo`, `redo`, `history` | `history_undo`, `history_redo`, `history_steps` |
+| `undo`, `redo`, `history` | `history_undo`, `history_redo`, `history_steps`. Since version 2 every step is listed (not the last 32) with an `id`, its address, stable for as long as the step lives, which the server's checkpoints use to find their step again |
 | `export_presets`, `export_textures_ex` | `box_export_*` presets; `g_context->format_type/format_quality/layers_export`, `base_bits_handle` + `layers_set_bits` (as the export dialog's Color combo), `ui_files_filename`, then `export_texture_run` |
 | `bake`, `bake_status`, `bake_settings` | the `context_t` bake fields; `bake` is `bake_texture_node_run` minus its mid-draw `draw_end`/`draw_begin` bracket (a request runs in the update phase, with no draw pass open) |
 | `render_settings` | `g_config->rp_*`, `box_preferences_lut_picked` / `import_lut_free`, `context_set_render_path`, `config_apply`, camera clip planes |
@@ -71,6 +72,19 @@ socket, thread or new dependency.
 | `camera` | `viewport_set_view` (the numpad views), `viewport_reset`, `viewport_orbit`, `viewport_zoom` |
 | `console_read` | `console_last_traces` |
 | `capture_viewport` | `viewport_capture_screenshot_to` + `iron_write_png(gpu_get_texture_pixels(...))`, reusing one target and **freeing** it on a size change (`gpu_delete_texture` is not bound for plugins) |
+| `mesh_op` (v2) | the Meshes tab's edit menu (`tab_meshes_draw_edit`): `plugin_uv_unwrap_button` (only in `WITH_PLUGINS` builds), `util_mesh_calc_normals` / `_flip_normals` / `_to_origin` / `_swap_axis` / `_decimate` / `_smooth` / `_subdivide` / `_bevel`, and a re-import through `import_mesh_run(path, false, true, true)`, which is what the modal Import Mesh box's button calls (`project_reimport_mesh` itself opens that box and waits for a click). None of these pushes a history step, in the menu either |
+| `project_snapshot` (v2) | `export_arm_run_project` with `g_project->_->filepath` pointed at the snapshot, then everything that function rewrites is put back: the file path, `envmap`, `assets`, `font_assets`, `sound_assets`, `mesh_assets` (all made relative to the path being written), and the Recent Projects entry it adds |
+
+## Version 2
+
+`MCP_EXT_VERSION` 2 adds `mesh_op` and `project_snapshot` and the step identities in `history`.
+The server reports an older extension as `ext_outdated` for history checkpoints instead of
+failing. Rebuild after updating `patch/mcp_ext.c`, then copy `build/Release/ArmorPaint` over
+`build/out/ArmorPaint`: `make` fills `build/out` only on the first build
+(`tools/live_harness.sh build` does this). Verified: builds with no warnings from `mcp_ext.c`,
+and `tests/test_live_state.py` passes on it (flip normals twice restores the normals, unwrap takes
+a fully overlapping mesh to under 1% overlap, re-import keeps the layer count, project snapshots
+roll back with the path intact).
 
 ## Verification
 

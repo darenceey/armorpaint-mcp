@@ -39,8 +39,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
+import os
 import re
+import sys
 import time
+from collections import OrderedDict
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -62,10 +66,10 @@ try:  # normal package import
         spool_resolution,
     )
     from .window_capture import MAX_DOWNSCALE, CaptureError, capture_window
-    from . import desktop_input, local_tools
-    from .transport import send_batch
+    from . import checkpoints, desktop_input, image_diff, local_tools, mesh_inspect, node_catalogue, node_graph, recipes, strokes
+    from .transport import edit_count, note_edit, seconds_since_edit, send_batch
 except ImportError:  # running server.py as a loose script
-    __version__ = "1.1.0"
+    __version__ = "1.2.0"
     from transport import (  # type: ignore[no-redef]
         BadArgs,
         BridgeError,
@@ -82,8 +86,15 @@ except ImportError:  # running server.py as a loose script
         capture_window,
     )
     import desktop_input  # type: ignore[no-redef]
+    import image_diff  # type: ignore[no-redef]
     import local_tools  # type: ignore[no-redef]
-    from transport import send_batch  # type: ignore[no-redef]
+    import node_catalogue  # type: ignore[no-redef]
+    import node_graph  # type: ignore[no-redef]
+    import recipes  # type: ignore[no-redef]
+    import strokes  # type: ignore[no-redef]
+    import mesh_inspect  # type: ignore[no-redef]
+    import checkpoints  # type: ignore[no-redef]
+    from transport import edit_count, note_edit, seconds_since_edit, send_batch  # type: ignore[no-redef]
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -125,6 +136,7 @@ OP_TIMEOUTS: dict[str, float] = {
     "set_config": 20,
     "get_main_object": 15,
     "get_object": 15,
+    "camera_get": 15,
     "shape_list": 15,
     "shape_add": 120,
     "object_duplicate": 120,
@@ -149,6 +161,9 @@ OP_TIMEOUTS: dict[str, float] = {
     "set_brush": 15,
     "paint_stroke": 120,
     "paint_stroke_world": 120,
+    "stroke_begin": 30,
+    "stroke_points": 60,
+    "stroke_end": 60,
     "fill_layer": 180,
     "set_display_channel": 30,
     "capture_to_project": 180,
@@ -176,6 +191,9 @@ OP_TIMEOUTS: dict[str, float] = {
     "project_lists": 15,
     "camera": 15,
     "console_read": 10,
+    "mesh_op": 600,
+    "project_snapshot": 600,
+    "project_set_path": 15,
 }
 
 # Answered by the optional native extension; on a stock build the bridge says "unsupported".
@@ -185,7 +203,7 @@ EXT_TOOLS = frozenset(
         "ap_layer_duplicate", "ap_layer_set", "ap_layer_move", "ap_layer_action",
         "ap_history", "ap_export_presets", "ap_bake", "ap_bake_status", "ap_bake_settings",
         "ap_render_settings", "ap_texture_resolution", "ap_project_lists", "ap_camera",
-        "ap_console_read",
+        "ap_console_read", "ap_mesh_op",
     }
 )
 EXT_HINT = (
@@ -212,7 +230,8 @@ UI_TOOLS = frozenset({"ap_ui_click", "ap_ui_key", "ap_ui_drag", "ap_ui_scroll"})
 
 # Tools answered entirely by this process — they work even when ArmorPaint is closed.
 LOCAL_TOOLS = frozenset(
-    {"ap_bridge_status", "ap_read_image_file", "ap_capture_window", "ap_resource_search"}
+    {"ap_bridge_status", "ap_read_image_file", "ap_capture_window", "ap_resource_search",
+     "ap_capture_sequence", "ap_paint_stroke_pointer"}
     | UI_TOOLS
 )
 
@@ -221,12 +240,9 @@ MAX_IMAGE_BYTES = 6_000_000
 MAX_CAPTURE_DIM = 4096
 MIN_CAPTURE_DIM = 16
 
-# MUST equal MAX_STROKE_POINTS in plugin/armorpaint_mcp_bridge.c. The bridge paints a
-# whole stroke inside one ArmorPaint frame, and each point costs three minic script calls
-# against a per-frame budget of roughly 280 before the 8 MB context arena overflows
-# (docs/MINIC_DIALECT_AND_API.md 1.11a). A longer list is rejected by the plugin rather
-# than truncated, so a mismatch here turns into a bad_args on every long stroke.
-MAX_STROKE_POINTS = 48
+# Points per bridge REQUEST (strokes.py has the per-request value budget too). Longer
+# strokes are streamed as stroke_begin / stroke_points... / stroke_end.
+MAX_STROKE_POINTS = strokes.MAX_POINTS
 
 # OBJ line breaks cannot cross the wire: the plugin's JSON parser does not decode escapes,
 # so encode_value() refuses any control character including "\n". Lines are joined with
@@ -283,20 +299,11 @@ VIEWPORT_MODES = {
     "path_trace": 15,
 }
 
-# Valid script_material_create_node(type) strings: nodes_material/*.c plus the pre-created
-# OUTPUT_MATERIAL_PBR. Validated here so a typo cannot reach the binding.
-NODE_TYPES = frozenset(
-    """ATTRIBUTE BAKE_CURVATURE BLUR BOOL BRIGHTCONTRAST BUMP CLAMP COLMASK COMBINE_COLOR
-    COMBXYZ CURVE_RGB CURVE_VEC CUSTOM DIRECT_WARP ENUM FLOAT_CURVE GAMMA GROUP GROUP_INPUT
-    GROUP_OUTPUT HUE_SAT INVERT_COLOR LAYER LAYER_MASK MAPPING MAPRANGE MATERIAL MATH
-    MIX_NORMAL_MAP MIX_RGB NEURAL_EDIT_IMAGE NEURAL_IMAGE_TO_3D_MESH NEURAL_IMAGE_TO_PBR
-    NEURAL_REPEAT NEURAL_SAVE_IMAGE NEURAL_TEXT_TO_IMAGE NEURAL_UPSCALE_IMAGE NEW_GEOMETRY
-    NORMAL NORMAL_MAP OBJECT_INFO OUTPUT_MATERIAL_PBR PICKER QUANTIZE REPLACECOL RGB RGBA
-    RGBTOBW SCRIPT_CPU SEPARATE_COLOR SEPXYZ SHADER_GPU STRING TEX_BAKE TEX_BRICK TEX_CAMERA
-    TEX_CHECKER TEX_COORD TEX_GABOR TEX_GRADIENT TEX_IMAGE TEX_MAGIC TEX_NOISE TEX_TEXT
-    TEX_VORONOI TEX_WAVE TILESHEET TILESHEET_ANIM UVMAP VALTORGB VALUE VECTOR VECT_MATH
-    VECT_ROTATE VECT_TRANSFORM WIREFRAME""".split()
-)
+# Valid script_material_create_node(type) strings: the node types in the socket catalogue
+# (data/node_sockets.json, generated from nodes_material/*.c and nodes_neural/*.c) that a
+# material canvas can create on this platform. The output node is pre-created with each
+# material. Validated here so a typo cannot reach the binding.
+NODE_TYPES = frozenset(node_catalogue.creatable(node_catalogue.load(), sys.platform))
 
 # Built-in primitives accepted by script_shape_add (minic_impl.c:702). Reported, not
 # enforced — the list is per-build and the plugin validates against script_shape_list().
@@ -438,68 +445,44 @@ def _vec(args: dict[str, Any], key: str, size: int) -> list[float] | None:
     return [_num(v, key) for v in value]
 
 
-def _points(args: dict[str, Any], key: str, dims: int) -> str:
-    """Flatten a point list to ``x,y[,z];x,y[,z]``.
-
-    No JSON array can cross this wire: an array anywhere in the request corrupts the
-    remainder of the plugin's parse (``iron_json.c:297``).
-    """
+def _point_list(args: dict[str, Any], key: str, dims: int | None) -> list[tuple[float, ...]]:
+    """Parse a stroke's points: [[x, y], ...] (``dims`` 2) or [[x, y, z], ...] (3), each
+    optionally followed by a radius and an opacity multiplier (pressure). ``dims`` None
+    accepts 2..5 numbers (the bridge knows whether the open stroke is in world space).
+    Also accepts objects {x, y[, z][, radius][, opacity]} and the wire string form."""
     value = args.get(key)
+    lo, hi = (2, 5) if dims is None else (dims, dims + 2)
+    shape = "[[0.4,0.5],[0.6,0.5]]" if dims != 3 else "[[0,0,0],[1,0,0]]"
     if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            raise BadArgs(f"'{key}' is empty.", arg=key)
-        groups = [g for g in text.split(";") if g.strip()]
-        for g in groups:
-            parts = g.split(",")
-            if len(parts) != dims:
-                raise BadArgs(
-                    f"'{key}': segment {g!r} has {len(parts)} components, expected {dims}.",
-                    arg=key,
-                )
-            for p in parts:
-                try:
-                    float(p)
-                except ValueError as exc:
-                    raise BadArgs(f"'{key}': {p!r} is not a number.", arg=key) from exc
-        if len(groups) > MAX_STROKE_POINTS:
-            raise BadArgs(
-                f"'{key}' has {len(groups)} points; the limit is {MAX_STROKE_POINTS} because "
-                f"the whole stroke is applied inside a single ArmorPaint frame.",
-                arg=key,
-            )
-        return ";".join(g.strip() for g in groups)
-
+        value = [g.split(",") for g in value.split(";") if g.strip()]
     if not isinstance(value, (list, tuple)) or not value:
-        raise BadArgs(
-            f"'{key}' is required: an array of {dims}-number points, e.g. "
-            f"{'[[0.4,0.5],[0.6,0.5]]' if dims == 2 else '[[0,0,0],[1,0,0]]'}.",
-            arg=key,
-        )
-    if len(value) > MAX_STROKE_POINTS:
-        raise BadArgs(
-            f"'{key}' has {len(value)} points; the limit is {MAX_STROKE_POINTS} because the "
-            f"whole stroke is applied inside a single ArmorPaint frame.",
-            arg=key,
-        )
-    out: list[str] = []
+        raise BadArgs(f"'{key}' is required: an array of points, e.g. {shape}.", arg=key)
+    if len(value) > strokes.MAX_TOTAL_POINTS:
+        raise BadArgs(f"'{key}' has {len(value)} points; the limit is {strokes.MAX_TOTAL_POINTS}.", arg=key)
+    out: list[tuple[float, ...]] = []
     for point in value:
         if isinstance(point, dict):
-            keys = ("x", "y", "z")[:dims]
+            keys = ("x", "y", "z")[: dims or 2]
             if any(k not in point for k in keys):
                 raise BadArgs(f"'{key}': each point object needs {', '.join(keys)}.", arg=key)
             comps = [_num(point[k], key) for k in keys]
+            if "radius" in point or "opacity" in point:
+                comps.append(_num(point.get("radius", 1.0), key))
+            if "opacity" in point:
+                comps.append(_num(point["opacity"], key))
         elif isinstance(point, (list, tuple)):
-            if len(point) != dims:
+            if not lo <= len(point) <= hi:
                 raise BadArgs(
-                    f"'{key}': each point needs exactly {dims} numbers (got {len(point)}).",
+                    f"'{key}': each point needs {lo} numbers"
+                    + (f", optionally followed by a radius and an opacity multiplier (got {len(point)})." if dims else
+                       f" to {hi} (got {len(point)})."),
                     arg=key,
                 )
             comps = [_num(c, key) for c in point]
         else:
             raise BadArgs(f"'{key}': each point must be an array or object.", arg=key)
-        out.append(",".join(f"{c:.6f}".rstrip("0").rstrip(".") or "0" for c in comps))
-    return ";".join(out)
+        out.append(tuple(comps))
+    return out
 
 
 def _pick(args: dict[str, Any], key: str, table: dict[str, int], label: str) -> int:
@@ -569,7 +552,47 @@ def _b(description: str, **extra: Any) -> dict[str, Any]:
     return {"type": "boolean", "description": description, **extra}
 
 
+def _stroke_points_schema(dims: int, what: str) -> dict[str, Any]:
+    return {
+        "type": "array",
+        "items": {"type": "array", "items": {"type": "number"}, "minItems": dims, "maxItems": dims + 2},
+        "description": (
+            f"Stroke path as [[{what}], ...]. Each point may add a radius multiplier and an "
+            f"opacity multiplier after its coordinates (pressure): [{what}, 0.4, 0.8] paints "
+            f"that dab at 40% of the brush radius and 80% of its opacity."
+        ),
+    }
+
+
+# A pointer stroke sends one event per point and each costs at least a frame, so points
+# closer than this are dropped. Measured live: a short smoothed curve with fine spacing
+# was 423 events and took 11.5 s.
+POINTER_MIN_STEP_PX = 3
+
+# Shaping options shared by the stroke tools (strokes.py).
+_STROKE_SHAPING: dict[str, Any] = {
+    "smooth": _b("Draw a smooth curve (Catmull-Rom) through the points instead of straight "
+                 "segments.", default=False),
+    "spacing": _n("Resample the path to a point every this many units (screen: fraction of "
+                  "the viewport; world: world units). Dense, even dabs.", minimum=0),
+    "taper": _s("Pressure-like taper of the brush radius along the stroke: 'in' (thin "
+                "start), 'out' (thin end), 'both'.", enum=["none", "in", "out", "both"], default="none"),
+    "taper_min": _n("Thinnest point of a taper, as a fraction of the radius.", minimum=0.01,
+                    maximum=1, default=0.15),
+    "jitter": _n("Seeded wobble, perpendicular to the stroke (same units as spacing).", minimum=0),
+    "seed": _i("Seed for jitter and generators, for repeatable results.", default=0),
+}
+
+
 _PATH_NOTE = "Absolute path, forward slashes (backslashes are converted for you)."
+_DISCARD_NOTE = (
+    "With the native extension a project checkpoint is taken first (ap_rollback restores it), "
+    "so the call goes ahead."
+)
+_DISCARD_ARG = _b(
+    "Replace the project even though its unsaved changes cannot be checkpointed; they are lost.",
+    default=False,
+)
 
 TOOLS: list[types.Tool] = [
     # ---- bridge & session -------------------------------------------------
@@ -647,13 +670,17 @@ TOOLS: list[types.Tool] = [
     # ---- project ----------------------------------------------------------
     _tool(
         "ap_project_new",
-        "Start a new, empty project. Discards the current project WITHOUT prompting and "
-        "without saving — call ap_project_save first if the work matters.",
+        "Start a new, empty project. Replaces the current project without saving it. If "
+        "that project has unsaved changes and no checkpoint can protect them (a stock build "
+        f"has none), the call is refused with code 'unsaved_changes'. {_DISCARD_NOTE}",
+        {"discard_unsaved": _DISCARD_ARG},
     ),
     _tool(
         "ap_project_open",
-        "Open an existing .arm project file. Discards the current project without prompting.",
-        {"path": _s(f"Project .arm file. {_PATH_NOTE}")},
+        "Open an existing .arm project file. Replaces the current project without saving it; "
+        "like ap_project_new, it is refused with code 'unsaved_changes' when that project has "
+        f"unsaved changes no checkpoint can protect. {_DISCARD_NOTE}",
+        {"path": _s(f"Project .arm file. {_PATH_NOTE}"), "discard_unsaved": _DISCARD_ARG},
         ["path"],
     ),
     _tool(
@@ -729,7 +756,9 @@ TOOLS: list[types.Tool] = [
         "on any build and uses ArmorPaint's current settings (8-bit PNG, 'generic' preset, "
         "base name from the last export dialog or 'untitled'). The format / bits / quality / "
         "preset / layers / filename options need the native extension (see "
-        "ap_export_presets). NOTE: ArmorPaint exports at the layers' own bit depth, so asking "
+        "ap_export_presets), and they STAY SET for later exports, as the dialog's do: a "
+        "plain call after preset='unreal' exports Unreal maps, so name what you want each "
+        "time. NOTE: ArmorPaint exports at the layers' own bit depth, so asking "
         "for 16/32-bit EXR converts the project's layers to that depth first, exactly as the "
         "export dialog's Color setting does.",
         {
@@ -1024,14 +1053,15 @@ TOOLS: list[types.Tool] = [
     ),
     _tool(
         "ap_node_set_value",
-        "Set a value on a node. Four kinds: 'float' (one number on a socket), 'color' "
-        "(r,g,b,a on a socket), 'vector' (x,y,z on a socket), and 'button' (a node's own "
+        "Set a value on a node. Five kinds: 'float' (one number on a socket), 'color' "
+        "(r,g,b,a on a socket), 'vector' (x,y,z on a socket), 'button' (a node's own "
         "widget — dropdown index, checkbox 0/1, or a slider value; see the node reference "
-        "for each type's button list). Socket-based kinds default to the node's INPUT "
+        "for each type's button list), and 'string' (a text button, such as ATTRIBUTE's "
+        "Name; needs bridge 2.2.0). Socket-based kinds default to the node's INPUT "
         "sockets. Follow a batch of edits with ap_material_update.",
         {
             "id": _i("Node id from ap_node_list."),
-            "kind": _s("What to set.", enum=["float", "color", "vector", "button"]),
+            "kind": _s("What to set.", enum=["float", "color", "vector", "button", "string"]),
             "socket": _i("Socket index for float/color/vector kinds.", default=0),
             "is_input": _b("Target an input socket (true) or an output socket.", default=True),
             "value": _n("The number, for kind 'float' or 'button'."),
@@ -1049,9 +1079,85 @@ TOOLS: list[types.Tool] = [
                 "maxItems": 3,
                 "description": "[x, y, z] for kind 'vector'.",
             },
-            "button": _i("Button index, for kind 'button'."),
+            "button": _i("Button index, for kind 'button' or 'string'."),
+            "text": _s("The text, for kind 'string'. No quotes, backslashes or control characters."),
         },
         ["id", "kind"],
+    ),
+    # ---- whole graphs --------------------------------------------------------
+    _tool(
+        "ap_node_graph_get",
+        "The active material's WHOLE node graph in one call: every node with its input and "
+        "output sockets BY NAME and their current values, every button, and every link with "
+        "both ends named. Use it instead of ap_node_list + one ap_node_get per node.",
+    ),
+    _tool(
+        "ap_node_graph_apply",
+        "Build or change the active material's graph from a declarative spec, as one "
+        "operation. The spec names nodes with your own keys and sockets BY NAME, so no ids or "
+        "socket indices are needed: {\"nodes\": {\"noise\": {\"type\": \"TEX_NOISE\", "
+        "\"inputs\": {\"Scale\": 4}}, \"mix\": {\"type\": \"MIX_RGB\", \"buttons\": "
+        "{\"blend_type\": \"Multiply\"}}, \"out\": {\"existing\": \"OUTPUT_MATERIAL_PBR\"}}, "
+        "\"links\": [\"noise.Color -> mix.Color 2\", \"mix.Color -> out.Base Color\"]}. "
+        "A node is new ({type, optional x/y}), or an existing one ({existing: TYPE} for the "
+        "first of that type, or {id: N}). 'inputs'/'outputs' set socket values (a number, or "
+        "[r,g,b(,a)] / [x,y,z]); 'buttons' set dropdowns by option name, checkboxes by "
+        "true/false, sliders by number. Where several sockets share a name, write "
+        "'Value[1]' (the second) or '#1' (index). Everything is validated against the node "
+        "catalogue BEFORE anything changes; then nodes are added, values set and links made "
+        "in batches, the material is recompiled, and (fill=true, the default) the selected "
+        "layer is filled so the result is visible. If any step fails the graph is put back "
+        "exactly as it was. The previous graph is kept as a snapshot (snapshot_id) for "
+        "ap_node_graph_restore. Missing positions are laid out automatically.",
+        {
+            "spec": {"type": "object", "description": "The graph spec (see above)."},
+            "mode": _s("'merge' adds to the graph; 'replace' first removes every node except "
+                       "the output and nodes the spec refers to.", enum=["merge", "replace"],
+                       default="merge"),
+            "dry_run": _b("Validate and return the plan without changing anything.", default=False),
+            "fill": _b("Fill the selected layer afterwards so the change shows.", default=True),
+            "label": _s("Label for the automatic before-snapshot."),
+        },
+        ["spec"],
+    ),
+    _tool(
+        "ap_node_graph_lint",
+        "Check the active material's graph for problems that otherwise only show as a wrong "
+        "render: link cycles, nodes that feed nothing reaching the output, links into paint "
+        "channels the material has switched off, and socket type conversions.",
+    ),
+    _tool(
+        "ap_node_graph_snapshot",
+        "Save the active material's graph so it can be put back with ap_node_graph_restore. "
+        "ArmorPaint's undo history does not record node edits, so this is how a graph edit "
+        "is taken back. With list=true, list the saved snapshots instead.",
+        {"label": _s("A label to find it by."), "list": _b("List snapshots instead.", default=False)},
+    ),
+    _tool(
+        "ap_node_graph_restore",
+        "Put the active material's graph back to a snapshot: removes nodes added since, "
+        "re-creates removed ones (they get new ids; id_map says which), resets socket and "
+        "button values and relinks. Node positions and custom node names cannot be written "
+        "by the bridge and stay as they are.",
+        {
+            "snapshot_id": _s("From ap_node_graph_snapshot or ap_node_graph_apply."),
+            "force": _b("Restore even if a different material is now active.", default=False),
+        },
+        ["snapshot_id"],
+    ),
+    _tool(
+        "ap_node_recipe",
+        "Ready-made material graphs with parameters (worn_painted_metal, painted_wood, stone, "
+        "edge_wear_grunge, ...). No name: list them with their parameters. With a name: "
+        "return the filled-in spec, or with apply=true build it (as ap_node_graph_apply).",
+        {
+            "name": _s("Recipe name."),
+            "params": {"type": "object", "description": "Parameter values; defaults for the rest."},
+            "apply": _b("Build it into the active material.", default=False),
+            "mode": _s("As ap_node_graph_apply.", enum=["merge", "replace"], default="replace"),
+            "fill": _b("As ap_node_graph_apply.", default=True),
+            "dry_run": _b("As ap_node_graph_apply.", default=False),
+        },
     ),
     # ---- painting & viewport ---------------------------------------------
     _tool(
@@ -1080,40 +1186,192 @@ TOOLS: list[types.Tool] = [
         "across the viewport, so 0.5,0.5 is the centre and what gets painted depends on the "
         "current camera. Paints into the selected layer with the active tool/brush; silently "
         "does nothing if no project is open, no layer is selected, or the selected layer is "
-        f"a group. At most {MAX_STROKE_POINTS} points — the whole stroke runs inside one "
-        "frame.",
+        "a group (use 'capture' to catch that). Any length: a stroke longer than one "
+        f"request ({MAX_STROKE_POINTS} points) is streamed as one continuous stroke over "
+        "several frames. Shape it with smooth / spacing / taper / jitter, give points their "
+        "own pressure, or let 'generate' draw a scratch, zigzag, spiral or scattered dabs.",
         {
-            "points": {
-                "type": "array",
-                "items": {
-                    "type": "array",
-                    "items": {"type": "number"},
-                    "minItems": 2,
-                    "maxItems": 2,
-                },
-                "description": "Stroke path as [[x, y], ...] in normalised 0..1 screen space.",
-            }
+            "points": _stroke_points_schema(2, "x, y"),
+            "generate": {
+                "type": "object",
+                "description": (
+                    "Instead of points: {kind: 'scratch', start: [x,y], end: [x,y], wobble, "
+                    "segments} | {kind: 'zigzag', start, end, teeth, amplitude} | {kind: "
+                    "'spiral', center: [x,y], radius_start, radius_end, turns} | {kind: 'dabs', "
+                    "center, radius, count} (each dab a separate stroke). Shaping options apply."
+                ),
+            },
+            **_STROKE_SHAPING,
+            "record": {
+                "type": "object",
+                "description": "Film the stroke: a frame after each streamed chunk, returned as "
+                "one contact-sheet image. Optional 'downscale' (default 2) and 'crop'.",
+            },
+        },
+    ),
+    _tool(
+        "ap_paint_stroke_world",
+        "Paint a stroke in WORLD space and close it -- camera-independent, which makes it the "
+        "reliable choice for scripted painting (a point must still be visible from the "
+        "camera to paint). ArmorPaint's world is Z-up; use ap_get_main_object for the "
+        "object's bounds. Any length (streamed as one stroke); shaping and per-point pressure "
+        "as ap_paint_stroke.",
+        {
+            "points": _stroke_points_schema(3, "x, y, z"),
+            **{k: v for k, v in _STROKE_SHAPING.items() if k != "jitter"},
+            "jitter": _n("Seeded random offset per point, in world units.", minimum=0),
+            "record": {"type": "object", "description": "As ap_paint_stroke."},
         },
         ["points"],
     ),
     _tool(
-        "ap_paint_stroke_world",
-        "Paint a stroke in WORLD space and close it — camera-independent, which makes it the "
-        "reliable choice for scripted painting. ArmorPaint's world is Z-up; use "
-        "ap_get_main_object for the object's bounds.",
+        "ap_stroke_begin",
+        "Open a stroke to paint piece by piece: ap_stroke_points as often as you like -- "
+        "looking at the result in between (ap_capture_window) -- then ap_stroke_end. "
+        "ArmorPaint keeps it one continuous stroke. Any other tool call closes an open stroke "
+        "first (ap_capture_window does not), and so do 5 s without points.",
+        {"world": _b("World-space points (x, y, z) instead of screen (x, y).", default=False)},
+    ),
+    _tool(
+        "ap_stroke_points",
+        f"Add points to the open stroke (at most {MAX_STROKE_POINTS} per call; pressure as "
+        "in ap_paint_stroke). Screen or world as chosen in ap_stroke_begin.",
+        {"points": {"type": "array", "items": {"type": "array", "items": {"type": "number"},
+                                                "minItems": 2, "maxItems": 5},
+                    "description": "[[x, y(, z)(, radius)(, opacity)], ...]."}},
+        ["points"],
+    ),
+    _tool(
+        "ap_stroke_end",
+        "Close the open stroke (ArmorPaint dilates and commits it, as on mouse release) and "
+        "restore the brush radius and opacity that pressure changed.",
+    ),
+    _tool(
+        "ap_paint_stroke_pointer",
+        "Paint with a real press-drag-release of the mouse in ArmorPaint's window, so "
+        "ArmorPaint's OWN stroke engine does the work: its brush spacing, lazy mouse, "
+        "symmetry and pen-less pressure settings. Points are WINDOW PIXELS, as in "
+        "ap_capture_window's image (not 0..1). Delivered to the window without moving the "
+        "real pointer or taking focus. Needs synthetic input (Linux X11 verified).",
         {
-            "points": {
-                "type": "array",
-                "items": {
-                    "type": "array",
-                    "items": {"type": "number"},
-                    "minItems": 3,
-                    "maxItems": 3,
-                },
-                "description": "Stroke path as [[x, y, z], ...] in world space.",
-            }
+            "points": {"type": "array", "items": {"type": "array", "items": {"type": "number"},
+                                                   "minItems": 2, "maxItems": 2},
+                       "minItems": 2, "description": "[[x, y], ...] in window pixels."},
+            "step_ms": _i("Minimum delay between pointer moves. ArmorPaint samples the pointer "
+                          "once per frame and a stroke fed faster than that breaks up, so the "
+                          "tool measures the frame time and never goes below 1.25 frames.",
+                          minimum=1, maximum=200, default=20),
+            **{k: _STROKE_SHAPING[k] for k in ("smooth", "jitter", "seed")},
+            "spacing": _n(f"Resample the path to a point every this many WINDOW PIXELS. Points closer "
+                          f"than {POINTER_MIN_STEP_PX} px are dropped: each one costs a frame "
+                          f"(20-60 ms), and ArmorPaint draws the segment between two pointer "
+                          f"positions itself.", minimum=0),
+            "modifiers": {"type": "array", "items": {"type": "string", "enum": ["ctrl", "shift", "alt"]}},
         },
         ["points"],
+    ),
+    _tool(
+        "ap_paint_stroke_uv",
+        "Paint a stroke given in UV / TEXTURE space: [[u, v], ...] with u to the right and v "
+        "DOWN, (0,0) the top-left of an exported texture -- read positions straight off "
+        "ap_mesh_uv_layout's image. Each point is mapped onto the model through the mesh's UVs "
+        "and painted as a world-space stroke; a path that crosses from one UV island to "
+        "another is split, so it never cuts across the model, and points off the layout are "
+        "skipped and counted. Paints only where the camera sees the surface (the reply names "
+        "the direction each run faces). Shaping and pressure as ap_paint_stroke; spacing is "
+        "in UV units.",
+        {
+            "points": _stroke_points_schema(2, "u, v"),
+            **_STROKE_SHAPING,
+            "spacing": _n("Resample the path to a point every this many UV units (0.003 is about 6 "
+                          "texels at 2048). Dense, even dabs.", minimum=0),
+            "jitter": _n("Seeded wobble, perpendicular to the stroke, in UV units.", minimum=0),
+            "refresh": _b("Re-export the mesh first (it is cached for 30 s).", default=False),
+            "backfaces": _s("'skip' (default) leaves out parts of the path on surfaces turned away "
+                            "from the camera -- painted through the camera they would land on the "
+                            "front surface instead; 'paint' paints them anyway.",
+                            enum=["skip", "paint"], default="skip"),
+            "record": {"type": "object", "description": "As ap_paint_stroke."},
+        },
+        ["points"],
+    ),
+    _tool(
+        "ap_mesh_inspect",
+        "Check the paint mesh BEFORE painting: UV islands and seams, overlapping UVs (paint "
+        "lands in two places), mirrored or collapsed UV triangles, UDIM tiles, texel-density "
+        "spread between islands (some parts sharp, others blurry), and boundary / non-manifold "
+        "edges -- as numbers plus a list of issues with suggestions, and the UV layout as an "
+        "image. Exports the mesh as OBJ (as ap_export_mesh) and reads it; any build.",
+        {
+            "grid": _i("Raster resolution for the overlap measure.", minimum=32, maximum=1024, default=256),
+            "layout": _b("Include the UV layout image.", default=True),
+            "layout_size": _i("Layout image size.", minimum=64, maximum=2048, default=512),
+            "heat": _b("Colour the layout by texel density instead of flat.", default=False),
+            "refresh": _b("Re-export even if a recent export is cached (30 s).", default=False),
+        },
+    ),
+    _tool(
+        "ap_mesh_uv_layout",
+        "The paint mesh's UV layout as an image, v down like an exported texture: islands "
+        "filled, edges drawn, overlaps in RED; with heat=true islands are coloured by texel "
+        "density. Coordinates read off it are what ap_paint_stroke_uv takes.",
+        {
+            "size": _i("Image size in pixels.", minimum=64, maximum=4096, default=1024),
+            "heat": _b("Colour islands by texel density.", default=False),
+            "refresh": _b("Re-export the mesh first.", default=False),
+        },
+    ),
+    _tool(
+        "ap_mesh_op",
+        "Edit the paint mesh as the Meshes tab does (native extension): 'unwrap' (new UVs), "
+        "'calc_normals' (smooth or flat), 'flip_normals', 'to_origin', 'rotate_x/y/z' (90 "
+        "degrees), 'decimate', 'smooth', 'subdivide', 'bevel', and 'reimport' (load the mesh "
+        "file again -- or another OBJ/FBX/... given as 'path' -- keeping the layers). None of "
+        "these is in ArmorPaint's undo history, so a PROJECT checkpoint is written first; "
+        "ap_rollback(checkpoint_id) takes it back. unwrap, decimate, smooth, subdivide, bevel "
+        "and reimport change UVs or topology: paint already on the layers stays where it is "
+        "in texture space and no longer lines up with the model, so they need "
+        "confirm_invalidates_paint=true. Check a mesh first with ap_mesh_inspect.",
+        {
+            "action": _s("What to do.", enum=["unwrap", "calc_normals", "flip_normals", "to_origin",
+                                               "rotate_x", "rotate_y", "rotate_z", "decimate", "smooth",
+                                               "subdivide", "bevel", "reimport"]),
+            "smooth": _b("calc_normals: smooth (true) or flat.", default=True),
+            "strength": _n("decimate: 0..1, how much to reduce.", default=0.5),
+            "amount": _n("bevel: 0..1.", default=0.1),
+            "path": _s(f"reimport: the mesh file (default: the project's own). {_PATH_NOTE}"),
+            "confirm_invalidates_paint": _b("Required for ops that change UVs or topology.", default=False),
+        },
+        ["action"],
+    ),
+    _tool(
+        "ap_checkpoint",
+        "Mark a point to roll back to with ap_rollback. 'auto' (default) records ArmorPaint's "
+        "undo history position (native extension) and a snapshot of the node graph (node "
+        "edits are not in that history); 'project' writes the whole project to a snapshot "
+        "file (extension) for things no history records -- mesh edits, texture resolution, "
+        "opening another project. A history checkpoint lasts as long as its step is in the "
+        "history: undo_steps (ap_set_config) bounds how far back that is. Destructive tools "
+        "take one automatically (their reply names it); set ARMORPAINT_MCP_AUTOCHECKPOINT=0 "
+        "to turn that off.",
+        {
+            "label": _s("A label to find it by."),
+            "kind": _s("Which parts.", enum=list(checkpoints.KINDS), default="auto"),
+        },
+    ),
+    _tool(
+        "ap_rollback",
+        "Roll back to a checkpoint: undo (or redo) to its history step, restore its node graph, "
+        "or reopen its project snapshot. Checked against the live state first: if its history "
+        "step is gone -- it fell off the end of the history, or was undone and replaced by a "
+        "new action -- it refuses and says which, instead of undoing to the wrong place.",
+        {"checkpoint_id": _s("From ap_checkpoint, ap_checkpoint_list, or a tool's 'checkpoint'.")},
+        ["checkpoint_id"],
+    ),
+    _tool(
+        "ap_checkpoint_list",
+        "The checkpoints kept by this server, newest last, each with how many more history "
+        "steps it survives (history_headroom; 0 means it is gone or about to go).",
     ),
     _tool(
         "ap_fill_layer",
@@ -1200,10 +1458,31 @@ TOOLS: list[types.Tool] = [
                 "if the bridge is not running.",
                 default=True,
             ),
+            "settle_frames": _i("How many frames to wait when settling (a fill needs 3).",
+                                minimum=1, maximum=30, default=3),
             "include_image": _b(
                 "Return the PNG inline. Set false (with 'path') to keep the response small.",
                 default=True,
             ),
+            "diff_against": _s(
+                "Compare with an earlier capture: 'last', or a capture_id from an earlier "
+                "reply (the server keeps the last 8). Adds the changed-pixel bounding box and "
+                "fraction, and a second image zoomed on the change. Both captures need the "
+                "same crop and downscale."
+            ),
+        },
+    ),
+    _tool(
+        "ap_capture_sequence",
+        "Film ArmorPaint's window for a few seconds: frames at up to 10 per second, returned "
+        "as one contact-sheet image (left to right, top to bottom). For reviewing something "
+        "that happens over time, such as a streamed stroke from another call or a bake.",
+        {
+            "duration_s": _n("How long to record (0.1..10 s).", minimum=0.1, maximum=10, default=2),
+            "fps": _i("Frames per second (1..10).", minimum=1, maximum=10, default=4),
+            "crop": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
+            "downscale": _i(f"1..{MAX_DOWNSCALE}.", default=2),
+            "columns": _i("Tiles per row of the sheet.", minimum=1, maximum=10, default=4),
         },
     ),
     _tool(
@@ -1270,6 +1549,13 @@ TOOLS += [
                 },
                 "description": "Steps to run in order.",
             },
+            "atomic": _b(
+                "All or nothing: take a checkpoint first (undo history position with the "
+                "native extension, and the node graph), stop at the first failing step, and "
+                "roll back to the checkpoint if any step fails. On a stock build only the "
+                "graph part can be rolled back.",
+                default=False,
+            ),
             "stop_on_error": _b("Skip the remaining steps after the first failure.", default=False),
         },
         ["steps"],
@@ -1343,22 +1629,27 @@ TOOLS += [
     # ---- history ---------------------------------------------------------------
     _tool(
         "ap_undo",
-        "Undo the last step(s) — anything ArmorPaint records: paint, fills, node edits, "
-        "layer and material changes. Uses the native extension (exact, and reports the "
-        "history); on a stock build it presses the app's own undo shortcut (ctrl+z) through "
-        "synthetic input instead, which cannot report what was undone.",
+        "Undo the last step(s) of ArmorPaint's own history: paint strokes, fills, layer "
+        "changes and material create/delete. Material NODE edits are NOT in that history "
+        "(ArmorPaint's node API records no undo step), and neither are config, camera or "
+        "mesh changes: to take back a graph edit, restore a graph snapshot "
+        "(ap_node_graph_snapshot / ap_node_graph_restore; ap_node_graph_apply keeps one "
+        "automatically). Uses the native extension (exact, and reports the history); on a "
+        "stock build it presses the app's own undo shortcut (ctrl+z) through synthetic input "
+        "instead, which cannot report what was undone.",
         {"steps": _i("How many steps.", minimum=1, maximum=64, default=1)},
     ),
     _tool(
         "ap_redo",
-        "Redo undone step(s). Native extension, or the ctrl+shift+z shortcut on a stock "
-        "build (see ap_undo).",
+        "Redo undone step(s) of ArmorPaint's history, which does NOT include node edits (see "
+        "ap_undo). Native extension, or the ctrl+shift+z shortcut on a stock build.",
         {"steps": _i("How many steps.", minimum=1, maximum=64, default=1)},
     ),
     _tool(
         "ap_history",
         "The undo history: the last 32 step names, which are undone, and how many "
-        "undos/redos are available. Needs the native extension.",
+        "undos/redos are available. Node edits never appear in it (see ap_undo). Needs the "
+        "native extension.",
     ),
     # ---- export / bake / render ------------------------------------------------
     _tool(
@@ -1778,11 +2069,15 @@ def _build_wire_args(name: str, a: dict[str, Any]) -> dict[str, Any]:
         node_type = _req_str(a, "type").upper()
         if node_type not in NODE_TYPES:
             raise BadArgs(
-                f"Unknown node type {node_type!r}. This list comes from the running build's "
-                f"own --api dump; a node added by a newer ArmorPaint would need this server "
-                f"updated. Valid types: " + " ".join(sorted(NODE_TYPES)),
+                f"Unknown node type {node_type!r}. This list is the socket catalogue "
+                f"(data/node_sockets.json, generated from ArmorPaint 1.0's node sources); a node "
+                f"added by a newer ArmorPaint needs it regenerated (tools/gen_node_sockets.py). "
+                f"Valid types: " + " ".join(sorted(NODE_TYPES)),
                 arg="type",
             )
+        refused = node_graph.unstable_reason(node_type)
+        if refused:
+            raise BadArgs(f"{node_type} is refused: it {refused}.", arg="type")
         return {
             "type": node_type,
             "x": _opt_float(a, "x") or 0.0,
@@ -1859,8 +2154,16 @@ def _build_wire_args(name: str, a: dict[str, Any]) -> dict[str, Any]:
                     arg="value",
                 )
             out.update({"button": button, "value": value})
+        elif kind == "string":
+            button = _opt_int(a, "button", 0, 63)
+            if button is None:
+                raise BadArgs("kind 'string' needs 'button' (the button index).", arg="button")
+            text = a.get("text")
+            if not isinstance(text, str):
+                raise BadArgs("kind 'string' needs 'text'.", arg="text")
+            out.update({"button": button, "value": text})
         else:
-            raise BadArgs("'kind' must be one of float, color, vector, button.", arg="kind")
+            raise BadArgs("'kind' must be one of float, color, vector, button, string.", arg="kind")
         return out
 
     if name == "ap_select_tool":
@@ -1881,11 +2184,32 @@ def _build_wire_args(name: str, a: dict[str, Any]) -> dict[str, Any]:
             raise BadArgs("Give at least one brush parameter to change.")
         return out
 
-    if name == "ap_paint_stroke":
-        return {"points": _points(a, "points", 2)}
+    if name in ("ap_paint_stroke", "ap_paint_stroke_world"):
+        paths = _stroke_paths(name, a)
+        plan = strokes.plan(paths[0], world=name.endswith("_world")) if len(paths) == 1 else []
+        if len(plan) != 1:
+            raise BadArgs(
+                "this stroke needs more than one bridge request, which a batch step cannot "
+                "make; call ap_paint_stroke on its own (it streams long strokes).",
+                arg="points",
+            )
+        return plan[0][1]
 
-    if name == "ap_paint_stroke_world":
-        return {"points": _points(a, "points", 3)}
+    if name == "ap_stroke_begin":
+        return {"world": bool(_opt_bool(a, "world"))}
+
+    if name == "ap_stroke_points":
+        pts = _point_list(a, "points", None)
+        if len(pts) > strokes.chunk_size(max(len(p) for p in pts)):
+            raise BadArgs(
+                f"at most {strokes.chunk_size(max(len(p) for p in pts))} points of this width "
+                f"per call; send the rest in further ap_stroke_points calls.",
+                arg="points",
+            )
+        return {"points": strokes.encode(pts)}
+
+    if name == "ap_stroke_end":
+        return {}
 
     if name == "ap_set_display_channel":
         return {"mode": _pick(a, "mode", VIEWPORT_MODES, "display mode")}
@@ -2091,56 +2415,190 @@ def _image_content(path: Path, max_bytes: int) -> types.ImageContent:
 # MCP server definition
 # ---------------------------------------------------------------------------
 
-async def _capture_window_tool(
-    args: dict[str, Any],
-) -> list[types.TextContent | types.ImageContent]:
-    crop_raw = args.get("crop")
-    crop: tuple[int, int, int, int] | None = None
-    if crop_raw is not None:
-        if (
-            not isinstance(crop_raw, list)
-            or len(crop_raw) != 4
-            or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in crop_raw)
-        ):
-            raise BadArgs("'crop' must be [x, y, width, height] as four numbers.", arg="crop")
-        crop = (int(crop_raw[0]), int(crop_raw[1]), int(crop_raw[2]), int(crop_raw[3]))
-    downscale = _opt_int(args, "downscale", 1, MAX_DOWNSCALE) or 1
-    save_to = _norm_path(args, "path", required=False)
-    if save_to is not None and not save_to.lower().endswith(".png"):
-        raise BadArgs("'path' must end in .png.", arg="path")
+_CAPTURE_RING = 8
 
+# Pings (one per ArmorPaint frame) before a capture. Measured live: a fill's result is
+# complete on the 3rd frame after it -- 440, 54 772, 55 011 changed pixels after 1, 2 and 3
+# pings -- because the fill is repeated on the next frame and the viewport redraws after.
+SETTLE_FRAMES = 3
+
+# Rendered is not yet visible. Measured on KWin/XWayland (radeonsi, 2026-09-26), with
+# ArmorPaint at a frame per 20 ms and upstream setting ddirty after every stroke and fill:
+# strokes, fills and transforms showed up in captures 100-550 ms after the bridge replied,
+# and after the window had been idle for 1.5 s the first capture still showed the old frame
+# in 4 of 16 tries (the next one, 60 ms later, the new frame). No frame count covers that
+# (30 pings left 2 of 8 captures stale), and two equal captures prove nothing: two stale
+# ones match too. So the settle watches the window itself (_settle_display):
+#   * with a before-image (a diff), it waits until the window differs from it, then
+#     until it stops changing;
+#   * without one, until SETTLE_LAG_S after the last edit, then until it stops changing.
+SETTLE_POLL_S = 0.03         # pause between settle captures
+SETTLE_QUIET_S = 0.25        # unchanged this long counts as settled
+SETTLE_LAG_S = 0.6           # how long after an edit the window may still show the old frame
+SETTLE_CHANGE_WAIT_S = 1.5   # with a before-image: how long to wait for the edit to show
+SETTLE_MAX_S = 2.5           # never settle longer than this in all
+_CAPTURES: "OrderedDict[str, Any]" = OrderedDict()
+_capture_seq = 0
+
+NO_CHANGE_WARNING = (
+    "The window shows no visible change (at most a few pixels, as the brush cursor or a UI "
+    "widget alone would change). The operation may have been a silent no-op -- no "
+    "layer selected, a group layer, paint refused on a fill layer, a stroke off the model or "
+    "behind the camera -- or the change lies outside the captured area."
+)
+
+
+def _remember_capture(cap: Any) -> str:
+    global _capture_seq
+    _capture_seq += 1
+    cid = f"c{_capture_seq}"
+    _CAPTURES[cid] = cap
+    while len(_CAPTURES) > _CAPTURE_RING:
+        _CAPTURES.popitem(last=False)
+    return cid
+
+
+def _parse_crop(args: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    crop_raw = args.get("crop")
+    if crop_raw is None:
+        return None
+    if (
+        not isinstance(crop_raw, list)
+        or len(crop_raw) != 4
+        or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in crop_raw)
+    ):
+        raise BadArgs("'crop' must be [x, y, width, height] as four numbers.", arg="crop")
+    return (int(crop_raw[0]), int(crop_raw[1]), int(crop_raw[2]), int(crop_raw[3]))
+
+
+def _same_image(a: Any, b: Any) -> bool:
+    """No visible change between two captures (the brush cursor alone does not count)."""
+    if (a.width, a.height) != (b.width, b.height):
+        return False
+    pa, pb = a.pixels(), b.pixels()
+    return pa == pb or image_diff.diff(a.width, a.height, pa, pb)["no_visible_change"]
+
+
+def _settle_display(grab: Any, cap: Any, baseline: Any | None) -> tuple[Any, dict[str, Any]]:
+    """Capture until the window shows the latest edit and has stopped changing (see
+    SETTLE_LAG_S). Blocking: ``grab`` captures the window, ``cap`` is its first capture.
+    Returns the settled capture and what the settle saw."""
+    t0 = time.monotonic()
+    deadline = t0 + SETTLE_MAX_S
+    info: dict[str, Any] = {}
+    if baseline is not None and (baseline.width, baseline.height) == (cap.width, cap.height):
+        change_by = t0 + SETTLE_CHANGE_WAIT_S
+        while _same_image(baseline, cap) and time.monotonic() < change_by:
+            time.sleep(SETTLE_POLL_S)
+            cap = grab()
+        info["changed"] = not _same_image(baseline, cap)
+        lag_until = t0
+    else:
+        age = seconds_since_edit()
+        lag_until = t0 + (0.0 if age is None else max(0.0, SETTLE_LAG_S - age))
+    last_change = time.monotonic()
+    stable = False
+    while True:
+        now = time.monotonic()
+        if now - last_change >= SETTLE_QUIET_S and now >= lag_until:
+            stable = True
+            break
+        if now >= deadline:
+            break
+        time.sleep(SETTLE_POLL_S)
+        nxt = grab()
+        if not _same_image(cap, nxt):
+            last_change = time.monotonic()
+        cap = nxt
+    info["stable"] = stable
+    info["settled_ms"] = round((time.monotonic() - t0) * 1000)
+    return cap, info
+
+
+async def _grab(args: dict[str, Any], baseline: Any | None = None) -> tuple[Any, dict[str, Any]]:
+    """Settle (pings, so the last edit has rendered; then _settle_display, so it has reached
+    the window), then capture the window. ``baseline``, a capture from before the edit,
+    lets the settle wait for the edit to show. Returns (capture or None, report)."""
+    crop = _parse_crop(args)
+    downscale = _opt_int(args, "downscale", 1, MAX_DOWNSCALE) or 1
     loop = asyncio.get_running_loop()
     report: dict[str, Any] = {"ok": True}
+    started = time.monotonic()
 
     # Settle: a ping is answered in the frame AFTER any earlier request, and that earlier
     # frame has been rendered by then. The heartbeat's title picks the right window if
     # more than one ArmorPaint is open.
     hb = read_heartbeat()
     title = hb.get("app_title") if isinstance(hb, dict) else None
-    if _opt_bool(args, "settle") is not False and hb is not None:
+    frames = _opt_int(args, "settle_frames", 1, 30) or SETTLE_FRAMES
+    settle = _opt_bool(args, "settle") is not False and hb is not None
+    if settle:
         try:
-            await loop.run_in_executor(None, partial(send_to_armorpaint, "ping", {}, 5.0))
-            await asyncio.sleep(0.05)  # let the compositor pick up the presented frame
-            report["settled"] = True
+            for _ in range(frames):
+                await loop.run_in_executor(None, partial(send_to_armorpaint, "ping", {}, 5.0))
+            report["settled"] = frames
         except BridgeError as exc:
             report["settled"] = False
             report["settle_error"] = exc.message
     else:
         report["settled"] = False
 
+    grab = partial(capture_window, title or None, crop, downscale)
     try:
-        cap = await loop.run_in_executor(
-            None, partial(capture_window, title or None, crop, downscale)
-        )
+        cap = await loop.run_in_executor(None, grab)
+        if settle:
+            cap, info = await loop.run_in_executor(None, partial(_settle_display, grab, cap, baseline))
+            report.update(info)
     except CaptureError as exc:
-        return _text(
-            {"ok": False, "code": exc.code, "error": exc.message, "tool": "ap_capture_window"}
-        )
-
+        return None, {"ok": False, "code": exc.code, "error": exc.message}
     report.update(cap.describe())
+    report["capture_id"] = _remember_capture(cap)
+    report["capture_ms"] = round((time.monotonic() - started) * 1000)
+    return cap, report
+
+
+def _png_image(png: bytes) -> types.ImageContent:
+    return types.ImageContent(type="image", data=base64.b64encode(png).decode("ascii"), mimeType="image/png")
+
+
+def _compare(before: Any, after: Any) -> tuple[dict[str, Any], bytes | None]:
+    """image_diff over two captures; the highlight PNG when something changed."""
+    try:
+        d = image_diff.diff(before.width, before.height, before.pixels(), after.pixels(),
+                            w2=after.width, h2=after.height)
+    except ValueError as exc:
+        return {"error": str(exc)}, None
+    if d["bbox"] is None:
+        return d, None
+    return d, image_diff.highlight(after.width, after.height, before.pixels(), after.pixels(), d["bbox"])
+
+
+async def _capture_window_tool(
+    args: dict[str, Any],
+) -> list[types.TextContent | types.ImageContent]:
+    save_to = _norm_path(args, "path", required=False)
+    if save_to is not None and not save_to.lower().endswith(".png"):
+        raise BadArgs("'path' must end in .png.", arg="path")
+    against = _opt_str(args, "diff_against")
+    previous = next(reversed(_CAPTURES)) if (against == "last" and _CAPTURES) else against
+
+    cap, report = await _grab(args, _CAPTURES.get(previous) if previous else None)
+    if cap is None:
+        report["tool"] = "ap_capture_window"
+        return _text(report)
     if save_to is not None:
         Path(save_to).write_bytes(cap.png)
         report["path"] = save_to
+    extra: list[types.ImageContent] = []
+    if against is not None:
+        if previous is None or previous not in _CAPTURES or previous == report["capture_id"]:
+            report["diff"] = {"error": f"no capture {against!r} to compare with (the server keeps the last "
+                                       f"{_CAPTURE_RING}: {', '.join(_CAPTURES) or 'none'})"}
+        else:
+            d, hl = _compare(_CAPTURES[previous], cap)
+            report["diff"] = {"against": previous, **d}
+            if hl is not None:
+                extra.append(_png_image(hl))
     if len(cap.png) > MAX_IMAGE_BYTES:
         report["image_error"] = (
             f"PNG is {len(cap.png)} bytes, over the {MAX_IMAGE_BYTES}-byte inline limit; "
@@ -2149,11 +2607,453 @@ async def _capture_window_tool(
         return _text(report)
     text = types.TextContent(type="text", text=json.dumps(report, indent=2))
     if _opt_bool(args, "include_image") is False:
-        return [text]
-    image = types.ImageContent(
-        type="image", data=base64.b64encode(cap.png).decode("ascii"), mimeType="image/png"
+        return [*extra, text]
+    return [_png_image(cap.png), *extra, text]
+
+
+# ---------------------------------------------------------------------------
+# Strokes (strokes.py): shaping, streaming, pointer strokes, filmstrip
+# ---------------------------------------------------------------------------
+
+
+def _stroke_paths(name: str, a: dict[str, Any]) -> list[list[tuple[float, ...]]]:
+    """The stroke(s) a paint call describes, shaped: points or a generator, then the
+    smooth / spacing / taper / jitter options."""
+    world = name.endswith("_world")
+    dims = 3 if world else 2
+    gen = a.get("generate")
+    if gen is not None:
+        if world:
+            raise BadArgs("'generate' draws in screen space; use ap_paint_stroke.", arg="generate")
+        if not isinstance(gen, dict):
+            raise BadArgs("'generate' must be an object with a 'kind'.", arg="generate")
+        paths = strokes.generate({**gen, "seed": gen.get("seed", a.get("seed", 0))})
+    else:
+        paths = [_point_list(a, "points", dims)]
+    opts = {
+        "smooth": bool(_opt_bool(a, "smooth")),
+        "spacing": _opt_float(a, "spacing", 0.0),
+        "taper": _opt_str(a, "taper") or "none",
+        "taper_min": _opt_float(a, "taper_min", 0.01, 1.0) or 0.15,
+        "jitter": _opt_float(a, "jitter", 0.0) or 0.0,
+        "seed": _opt_int(a, "seed") or 0,
+    }
+    shaped = [strokes.shape(path, dims=dims, **opts) for path in paths]
+    total = sum(len(path) for path in shaped)
+    if total > strokes.MAX_TOTAL_POINTS:
+        raise BadArgs(f"the shaped stroke has {total} points; the limit is {strokes.MAX_TOTAL_POINTS} "
+                      f"(use a larger 'spacing').", arg="spacing")
+    return shaped
+
+
+async def _paint_paths(
+    name: str, paths: list[list[tuple[float, ...]]], *, world: bool, record: dict[str, Any] | None
+) -> tuple[dict[str, Any] | None, dict[str, Any], list[Any]]:
+    """Paint strokes, streaming any that need more than one request. A streamed stroke is
+    always closed, even when a chunk fails. Returns (error payload or None, result, frames)."""
+    film_args = {"downscale": 2, "settle_frames": 2, **(record or {})}
+    loop = asyncio.get_running_loop()
+    frames: list[Any] = []
+    painted = requests = 0
+    streamed = False
+
+    async def send(op: str, wire: dict[str, Any]) -> dict[str, Any]:
+        nonlocal requests
+        requests += 1
+        return await loop.run_in_executor(
+            None, partial(send_to_armorpaint, op, wire, OP_TIMEOUTS.get(op, DEFAULT_TIMEOUT_S))
+        )
+
+    for path in paths:
+        plan = strokes.plan(path, world=world)
+        streamed = streamed or len(plan) > 1
+        open_stroke = False
+        op = ""
+        try:
+            for op, wire in plan:
+                result = await send(op, wire)
+                if op == "stroke_begin":
+                    open_stroke = True
+                elif op == "stroke_end":
+                    open_stroke = False
+                else:
+                    painted += int(result.get("points", 0))
+                if record is not None and op in ("stroke_points", "paint_stroke", "paint_stroke_world"):
+                    cap, _ = await _grab(film_args, frames[-1] if frames else None)
+                    if cap is not None:
+                        frames.append(cap)
+        except BridgeError as exc:
+            if open_stroke:
+                try:
+                    await send("stroke_end", {})
+                except BridgeError:
+                    pass
+            payload = exc.to_dict()
+            payload.update({"tool": name, "painted_points": painted, "failed_op": op,
+                            "note": "the stroke was closed; what was painted before the failure stays"})
+            return payload, {}, frames
+    return None, {"points": painted, "strokes": len(paths), "requests": requests, "streamed": streamed}, frames
+
+
+def _record_arg(a: dict[str, Any]) -> dict[str, Any] | None:
+    record = a.get("record")
+    if record is not None and not isinstance(record, dict):
+        raise BadArgs("'record' must be an object ({} for defaults).", arg="record")
+    return record
+
+
+def _with_frames(payload: dict[str, Any], frames: list[Any]) -> list[types.TextContent | types.ImageContent]:
+    content: list[types.TextContent | types.ImageContent] = []
+    if frames:
+        sheet = image_diff.contact_sheet([(f.width, f.height, f.pixels()) for f in frames],
+                                         columns=min(4, len(frames)))
+        payload["record"] = {"frames": len(frames), "distinct_frames": len({f.pixels() for f in frames})}
+        content.append(_png_image(sheet))
+    content.append(types.TextContent(type="text", text=json.dumps(payload, indent=2)))
+    return content
+
+
+async def _stroke_tool(name: str, a: dict[str, Any]) -> list[types.TextContent | types.ImageContent]:
+    started = time.monotonic()
+    paths = _stroke_paths(name, a)
+    error, result, frames = await _paint_paths(name, paths, world=name.endswith("_world"), record=_record_arg(a))
+    if error is not None:
+        return _text(error)
+    payload: dict[str, Any] = {"ok": True, "op": name[3:], "result": result,
+                               "timing": {"total_ms": round((time.monotonic() - started) * 1000)}}
+    return _with_frames(payload, frames)
+
+
+# ---------------------------------------------------------------------------
+# Mesh (mesh_inspect.py): inspection, UV layout, UV-space strokes
+# ---------------------------------------------------------------------------
+
+_MESH_CACHE: dict[str, Any] = {}
+MESH_CACHE_S = 30.0
+
+
+def _current_mesh(refresh: bool) -> tuple[Any, dict[str, Any]]:
+    """Export the paint mesh (script_export_mesh -> OBJ) and parse it; reused for
+    MESH_CACHE_S unless ``refresh``. Upstream's exporter merges shared vertices with a
+    quadratic search, so a very large mesh takes a while -- as the Export Mesh dialog does."""
+    cached = _MESH_CACHE.get("entry")
+    if cached and not refresh and time.monotonic() - cached[1]["at"] < MESH_CACHE_S:
+        return cached[0], cached[1]
+    folder = _state_dir() / "mesh"
+    folder.mkdir(parents=True, exist_ok=True)
+    base = (folder / "current").as_posix()
+    obj = Path(base + ".obj")
+    if obj.exists():
+        obj.unlink()  # never parse a stale export if this one fails
+    started = time.monotonic()
+    send_to_armorpaint("export_mesh", {"path": base}, OP_TIMEOUTS["export_mesh"])
+    if not obj.exists():
+        raise BadArgs(f"ArmorPaint did not write {obj}; is a mesh loaded? (ap_get_main_object)")
+    mesh = mesh_inspect.parse_obj(obj.read_text(encoding="utf-8", errors="replace"))
+    info = {"obj_path": str(obj), "export_ms": round((time.monotonic() - started) * 1000), "at": time.monotonic()}
+    _MESH_CACHE["entry"] = (mesh, info)
+    return mesh, info
+
+
+def _mesh_tool(name: str, a: dict[str, Any]) -> list[types.TextContent | types.ImageContent]:
+    mesh, info = _current_mesh(bool(_opt_bool(a, "refresh")))
+    meta = {k: v for k, v in info.items() if k != "at"}
+    if name == "ap_mesh_uv_layout":
+        size = _opt_int(a, "size", 64, 4096) or 1024
+        png = mesh_inspect.uv_layout_png(mesh, size, heat=bool(_opt_bool(a, "heat")))
+        payload = {"ok": True, "size": size, **meta,
+                   "legend": "UDIM tile 1001, v down like an exported texture: blue islands, light edges, "
+                             "RED = covered more than once" + ("; islands coloured by texel density "
+                             "(blue low .. red high)" if _opt_bool(a, "heat") else "")}
+        return [_png_image(png), types.TextContent(type="text", text=json.dumps(payload, indent=2))]
+    grid = _opt_int(a, "grid", 32, 1024) or 256
+    payload = {"ok": True, "report": mesh_inspect.inspect(mesh, grid), **meta}
+    if _opt_bool(a, "layout") is False:
+        return _text(payload)
+    size = _opt_int(a, "layout_size", 64, 2048) or 512
+    png = mesh_inspect.uv_layout_png(mesh, size, heat=bool(_opt_bool(a, "heat")))
+    return [_png_image(png), types.TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+
+def _uv_points(a: dict[str, Any]) -> list[tuple[float, ...]]:
+    pts = _point_list(a, "points", 2)
+    if any(not (-0.001 <= p[0] <= 10.0 and -0.001 <= p[1] <= 10.0) for p in pts):
+        raise BadArgs("UV points are image-convention texture coordinates (u right, v down, 0..1 per UDIM "
+                      "tile); these are out of range.", arg="points")
+    return pts
+
+
+def _facing(normals: list[tuple[float, float, float]]) -> str:
+    n = [sum(v[k] for v in normals) for k in range(3)]
+    k = max(range(3), key=lambda i: abs(n[i]))
+    return ("+" if n[k] >= 0 else "-") + "xyz"[k]
+
+
+# A UV run paints only if its surface faces the camera by more than this cosine (about 81
+# degrees from the view direction). Found live: a run on the default cube's bottom face,
+# edge-on to the default camera, passed a plain "dot > 0" test, was reported as painted,
+# and put nothing in the texture.
+GRAZING_COS = 0.15
+
+
+def _run_visibility(normals: list[tuple[float, ...]], points: list[tuple[float, ...]],
+                    camera: tuple[float, float, float]) -> tuple[str | None, float]:
+    """Whether a run can be painted through the camera: (None, mean cosine) if most of its
+    points face the camera, else ('back_facing' or 'grazing', mean cosine). The cosine is
+    between the surface normal and the direction to the camera."""
+    coss = []
+    for n, p in zip(normals, points):
+        d = [camera[k] - p[k] for k in range(3)]
+        ln, ld = math.sqrt(sum(v * v for v in n[:3])), math.sqrt(sum(v * v for v in d))
+        coss.append(sum(n[k] * d[k] for k in range(3)) / (ln * ld) if ln and ld else 0.0)
+    if not coss:
+        return "grazing", 0.0
+    mean = sum(coss) / len(coss)
+    if sum(c > GRAZING_COS for c in coss) * 2 >= len(coss):
+        return None, mean
+    return ("back_facing" if sum(c <= 0 for c in coss) * 2 >= len(coss) else "grazing"), mean
+
+
+async def _uv_stroke_tool(a: dict[str, Any]) -> list[types.TextContent | types.ImageContent]:
+    started = time.monotonic()
+    pts = _uv_points(a)
+    shaped = strokes.shape(
+        pts, dims=2, smooth=bool(_opt_bool(a, "smooth")), spacing=_opt_float(a, "spacing", 0.0),
+        taper=_opt_str(a, "taper") or "none", taper_min=_opt_float(a, "taper_min", 0.01, 1.0) or 0.15,
+        jitter=_opt_float(a, "jitter", 0.0) or 0.0, seed=_opt_int(a, "seed") or 0,
     )
-    return [image, text]
+    loop = asyncio.get_running_loop()
+    mesh, _ = await loop.run_in_executor(None, partial(_current_mesh, bool(_opt_bool(a, "refresh"))))
+    runs, missed = mesh_inspect.uv_path_to_runs(mesh, shaped)
+    if not runs:
+        return _text({"ok": False, "code": "off_uv_layout", "tool": "ap_paint_stroke_uv",
+                      "error": "no point of the path lies on the UV layout (ap_mesh_uv_layout shows it)",
+                      "missed_points": len(missed)})
+    transforms: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        if run["object"] not in transforms:
+            transforms[run["object"]] = await loop.run_in_executor(
+                None, partial(send_to_armorpaint, "get_object", {"name": run["object"]}, OP_TIMEOUTS["get_object"])
+            )
+    backfaces = _opt_str(a, "backfaces") or "skip"
+    if backfaces not in ("skip", "paint"):
+        raise BadArgs("'backfaces' must be skip or paint.", arg="backfaces")
+    camera = None
+    if backfaces == "skip":
+        try:
+            cam = await loop.run_in_executor(None, partial(send_to_armorpaint, "camera_get", {}, 15.0))
+            if all(k in cam for k in ("world_x", "world_y", "world_z")):
+                camera = (cam["world_x"], cam["world_y"], cam["world_z"])
+        except BridgeError:
+            camera = None
+    paths = []
+    summary = []
+    skipped = []
+    for run in runs:
+        t = transforms[run["object"]]
+        world = [mesh_inspect.to_world(t, p[:3]) + tuple(p[3:]) for p in run["points"]]
+        normals = [mesh_inspect.to_world(t, n, direction=True) for n in run["normals"]]
+        entry = {"object": run["object"], "island": run["island"], "points": len(world),
+                 "from_index": run["indices"][0], "to_index": run["indices"][-1], "facing": _facing(normals)}
+        if camera is not None:
+            reason, cos = _run_visibility(normals, world, camera)
+            entry["camera_cos"] = round(cos, 3)
+            if reason is not None:
+                skipped.append({**entry, "reason": reason})
+                continue
+        paths.append(world)
+        summary.append(entry)
+    if not paths:
+        return _text({"ok": False, "code": "all_back_facing", "tool": "ap_paint_stroke_uv",
+                      "error": "every part of the path is on a surface turned away from the camera or "
+                               "edge-on to it; painting it would land on whatever faces the camera "
+                               "instead, or on nothing",
+                      "skipped_runs": skipped,
+                      "hint": "turn the view towards the 'facing' axis (ap_camera, native extension), or pass "
+                              "backfaces='paint' to paint through the camera anyway"})
+    error, result, frames = await _paint_paths("ap_paint_stroke_uv", paths, world=True, record=_record_arg(a))
+    if error is not None:
+        return _text(error)
+    result.update({"runs": summary, "skipped_runs": skipped, "missed_points": len(missed),
+                   "missed_first": missed[:10],
+                   "camera_known": camera is not None})
+    payload = {
+        "ok": True, "op": "paint_stroke_uv", "result": result,
+        "note": "each run is painted as a world-space stroke through the camera. Runs on faces "
+                "turned away from the camera, or edge-on to it (camera_cos under "
+                f"{GRAZING_COS}), are skipped and listed in skipped_runs with the reason. A run "
+                "hidden behind other geometry is NOT detected and paints nothing -- check with "
+                "'capture' (no_visible_change), and turn the view (ap_camera, extension) towards "
+                "its 'facing' axis",
+        "timing": {"total_ms": round((time.monotonic() - started) * 1000)},
+    }
+    return _with_frames(payload, frames)
+
+def _pointer_points(a: dict[str, Any]) -> list[tuple[int, int]]:
+    raw = _point_list(a, "points", 2)
+    if all(abs(v) <= 1.0 for p in raw for v in p[:2]):
+        raise BadArgs(
+            "ap_paint_stroke_pointer takes window pixels (as in ap_capture_window's image), "
+            "and these all look like normalised 0..1 coordinates; ap_paint_stroke takes those.",
+            arg="points",
+        )
+    shaped = strokes.shape(
+        [p[:2] for p in raw], dims=2, smooth=bool(_opt_bool(a, "smooth")),
+        spacing=_opt_float(a, "spacing", 0.0), jitter=_opt_float(a, "jitter", 0.0) or 0.0,
+        seed=_opt_int(a, "seed") or 0,
+    )
+    out: list[tuple[int, int]] = []
+    for x, y in shaped:
+        q = (int(round(x)), int(round(y)))
+        if not out or math.hypot(q[0] - out[-1][0], q[1] - out[-1][1]) >= POINTER_MIN_STEP_PX:
+            out.append(q)
+    end = (int(round(shaped[-1][0])), int(round(shaped[-1][1])))
+    if out[-1] != end:
+        if len(out) > 1 and math.hypot(end[0] - out[-1][0], end[1] - out[-1][1]) < POINTER_MIN_STEP_PX:
+            out[-1] = end  # keep the path's true end
+        else:
+            out.append(end)
+    if len(out) < 2:
+        raise BadArgs("the path needs at least two distinct pixels.", arg="points")
+    if len(out) > 2048:
+        raise BadArgs(f"the path has {len(out)} pixels after shaping; at most 2048.", arg="points")
+    return out
+
+
+def _frame_interval_ms(pings: int = 3) -> float | None:
+    """ArmorPaint's current frame time: a ping is answered on the frame after the last
+    one, so N back-to-back pings take about N frames. None if the bridge is unreachable."""
+    started = time.monotonic()
+    try:
+        for _ in range(pings):
+            send_to_armorpaint("ping", {}, 5.0)
+    except BridgeError:
+        return None
+    return (time.monotonic() - started) * 1000.0 / pings
+
+
+def _pointer_step(requested_ms: int, frame_ms: float | None) -> int:
+    """At least 1.25 frames per pointer event. Measured live (lavapipe, ~16 fps): events
+    every 20 ms broke a stroke into pieces; at one frame or more per event it was whole."""
+    if frame_ms is None:
+        return requested_ms
+    return max(requested_ms, int(round(frame_ms * 1.25)))
+
+
+def _pointer_stroke_tool(a: dict[str, Any]) -> dict[str, Any]:
+    pts = _pointer_points(a)
+    frame_ms = _frame_interval_ms()
+    step_ms = _pointer_step(_opt_int(a, "step_ms", 1, 200) or 20, frame_ms)
+    hb = read_heartbeat()
+    title = (hb.get("app_title") if isinstance(hb, dict) else None) or None
+    try:
+        res = desktop_input.drag(pts, "left", _opt_list_str(a, "modifiers"), step_s=step_ms / 1000.0,
+                                 title_hint=title)
+    except desktop_input.InputError as exc:
+        return {"ok": False, "code": exc.code, "error": exc.message, "tool": "ap_paint_stroke_pointer"}
+    note_edit()
+    return {"ok": True, **res, "frame_ms": None if frame_ms is None else round(frame_ms, 1),
+            "step_ms_used": step_ms, "next_step": "ap_capture_window (or pass 'capture') to see it."}
+
+
+def _sequence_args(a: dict[str, Any]) -> tuple[float, int]:
+    duration = _opt_float(a, "duration_s")
+    duration = 2.0 if duration is None else duration
+    if not 0.1 <= duration <= 10:
+        raise BadArgs("'duration_s' must be 0.1..10.", arg="duration_s")
+    fps = _opt_int(a, "fps")
+    fps = 4 if fps is None else fps
+    if not 1 <= fps <= 10:
+        raise BadArgs("'fps' must be 1..10.", arg="fps")
+    return float(duration), fps
+
+
+async def _capture_sequence_tool(a: dict[str, Any]) -> list[types.TextContent | types.ImageContent]:
+    duration, fps = _sequence_args(a)
+    grab_args = {"crop": a.get("crop"), "downscale": a.get("downscale", 2), "settle": False}
+    grab_args = {k: v for k, v in grab_args.items() if v is not None}
+    # Keep the app awake for the recording: a dozing ArmorPaint renders no frames.
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, partial(send_to_armorpaint, "ping", {}, 5.0))
+    except BridgeError:
+        pass
+    frames: list[Any] = []
+    start = time.monotonic()
+    for i in range(max(1, int(round(duration * fps)))):
+        wait = start + i / fps - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        cap, report = await _grab(grab_args)
+        if cap is None:
+            return _text({**report, "tool": "ap_capture_sequence", "frames_taken": len(frames)})
+        frames.append(cap)
+    columns = _opt_int(a, "columns", 1, 10) or 4
+    sheet = image_diff.contact_sheet([(f.width, f.height, f.pixels()) for f in frames], columns=columns)
+    meta = {"ok": True, "frames": len(frames), "fps": fps, "duration_s": duration,
+            "distinct_frames": len({f.pixels() for f in frames}), "frame_size": [frames[0].width, frames[0].height],
+            "layout": f"{columns} per row, left to right, top to bottom"}
+    return [_png_image(sheet), types.TextContent(type="text", text=json.dumps(meta, indent=2))]
+
+
+# Tools that take an optional 'capture' argument: the window is captured after the
+# operation (and, for the diff, before it) and returned in the same reply.
+CAPTURE_TOOLS = frozenset(
+    {"ap_paint_stroke", "ap_paint_stroke_world", "ap_fill_layer", "ap_batch",
+     "ap_node_graph_apply", "ap_node_recipe", "ap_paint_stroke_pointer", "ap_stroke_end",
+     "ap_paint_stroke_uv"}
+)
+
+_CAPTURE_ARG = {
+    "type": "object",
+    "description": (
+        "Look in the same call: capture ArmorPaint's window after the operation and return "
+        "it with the result, saving a round trip. {} for the whole window; optional 'crop' "
+        "[x,y,w,h] and 'downscale' as ap_capture_window. By default the window is also "
+        "captured BEFORE and the reply says what changed (bounding box, fraction) with a "
+        "zoomed image of it, and flags no_visible_change -- the tell-tale of a silent "
+        "no-op. 'diff': false skips the before-capture."
+    ),
+    "properties": {
+        "crop": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
+        "downscale": {"type": "integer", "minimum": 1, "maximum": MAX_DOWNSCALE},
+        "settle_frames": {"type": "integer", "minimum": 1, "maximum": 30, "default": 3},
+        "diff": {"type": "boolean", "default": True},
+    },
+}
+
+for _t in TOOLS:
+    if _t.name in CAPTURE_TOOLS:
+        _t.inputSchema.setdefault("properties", {})["capture"] = _CAPTURE_ARG
+
+
+async def _with_capture(
+    name: str, args: dict[str, Any]
+) -> list[types.TextContent | types.ImageContent]:
+    opts = args.get("capture")
+    if not isinstance(opts, dict):
+        raise BadArgs("'capture' must be an object ({} captures the whole window).", arg="capture")
+    grab_args = {k: opts[k] for k in ("crop", "downscale", "settle_frames") if k in opts}
+    want_diff = opts.get("diff", True) is not False
+    before, before_report = (await _grab(grab_args)) if want_diff else (None, None)
+    content = await call_tool(name, {k: v for k, v in args.items() if k != "capture"})
+    texts = [c for c in content if getattr(c, "type", "") == "text"]
+    others = [c for c in content if getattr(c, "type", "") != "text"]
+    payload = json.loads(texts[-1].text) if texts else {}
+    after, block = await _grab(grab_args, before)
+    images: list[types.ImageContent] = []
+    if after is not None:
+        images.append(_png_image(after.png))
+        if before is not None:
+            d, hl = _compare(before, after)
+            block["diff"] = {"against": before_report["capture_id"], **d}
+            if hl is not None:
+                images.append(_png_image(hl))
+            if d.get("no_visible_change"):
+                block["warning"] = NO_CHANGE_WARNING
+        elif want_diff:
+            block["diff"] = {"error": f"no before-capture: {before_report.get('error')}"}
+    payload["capture"] = block
+    return [*others, *images, types.TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
 
 
 def _frame_fence() -> desktop_input.Fence:
@@ -2192,6 +3092,7 @@ def _ui_tool(name: str, a: dict[str, Any]) -> dict[str, Any]:
             res = desktop_input.scroll(_req_int(a, "x"), _req_int(a, "y"), _req_int(a, "clicks", -50, 50), title)
     except desktop_input.InputError as exc:
         return {"ok": False, "code": exc.code, "error": exc.message, "tool": name}
+    note_edit()
     res = dict(res)
     res["ok"] = True
     res["next_step"] = "Call ap_capture_window to see the result."
@@ -2280,6 +3181,7 @@ def _undo_tool(op: str, wire: dict[str, Any]) -> dict[str, Any]:
     hb = read_heartbeat()
     title = (hb.get("app_title") if isinstance(hb, dict) else None) or None
     fence = _frame_fence()
+    before = _state_fingerprint()
     try:
         for _ in range(steps):
             desktop_input.key("z", mods, title, fence)
@@ -2291,18 +3193,363 @@ def _undo_tool(op: str, wire: dict[str, Any]) -> dict[str, Any]:
             f"ArmorPaint's window, and the latter failed: {exc.message}",
             "hint": EXT_HINT,
         }
+    note_edit()
+    after = _state_fingerprint(before.get("window"))
+    changed = _compare_fingerprints(before, after)
+    looked_at = [k for k, v in before.items() if v is not None]
     return {
         "ok": True,
         "op": op,
         "method": f"keyboard shortcut {'+'.join(mods)}+z sent {steps}x (stock build)",
-        "note": "Sent as ArmorPaint's default keymap shortcut; if the keymap was changed, or a "
-        "text field has focus, it may not act. The history cannot be read back without the "
-        "native extension -- verify with ap_capture_window.",
+        # A stock build cannot read the history, so compare what it can read before and
+        # after: the context, the material and its graph, and the window's pixels.
+        "verified": {
+            "changed": bool(changed),
+            "changed_parts": changed,
+            "compared": looked_at,
+            "note": (
+                "only the window changed: the shortcut undid paint or something else the bridge "
+                "cannot read" if changed == ["window"] else
+                "the state changed after the shortcut" if changed else
+                "nothing the bridge or the window shows changed: the shortcut may not have reached "
+                "ArmorPaint (a focused text field, a changed keymap), or there was nothing to "
+                f"{op}"
+            ),
+        },
     }
 
 
-# Tools that cannot be batch steps: answered locally, or would end the session.
-_UNBATCHABLE = LOCAL_TOOLS | {"ap_batch", "ap_quit", "ap_project_metadata", "ap_material_list", "ap_undo", "ap_redo"}
+# ---------------------------------------------------------------------------
+# Checkpoints (checkpoints.py), automatic checkpoints, mesh ops, verified undo
+# ---------------------------------------------------------------------------
+
+CHECKPOINT_TOOLS = frozenset({"ap_checkpoint", "ap_rollback", "ap_checkpoint_list", "ap_mesh_op"})
+AUTOCHECKPOINT_ENV = "ARMORPAINT_MCP_AUTOCHECKPOINT"
+
+# Tools that destroy state, and the checkpoint taken before them. 'history' needs the
+# native extension (a stock build has no readable history, so gets none); 'project' too.
+AUTO_CHECKPOINT = {
+    "ap_fill_layer": "history",
+    "ap_layer_delete": "history",
+    "ap_layer_action": "history",
+    "ap_material_delete": "history",
+    "ap_texture_resolution": "project",
+    "ap_project_new": "project",
+    "ap_project_open": "project",
+}
+
+UV_CHANGING_MESH_OPS = frozenset({"unwrap", "decimate", "smooth", "subdivide", "bevel", "reimport"})
+
+
+def _checkpoint_stores() -> tuple[Any, Any, Path]:
+    state = _state_dir()
+    return checkpoints.CheckpointStore(state / "checkpoints"), _snapshots(), state / "project_snapshots"
+
+
+def _take_checkpoint(kind: str, label: str) -> dict[str, Any]:
+    cps, graphs, snaps = _checkpoint_stores()
+    return checkpoints.take(graph_bridge(), kind=kind, label=label, store=cps, graph_store=graphs, snapshot_dir=snaps)
+
+
+# Why a stock build gets no automatic checkpoint, by kind: said in the reply, so a caller
+# never assumes a safety net that is not there.
+NO_CHECKPOINT_REASON = {
+    "history": (
+        "history checkpoints need the native extension (ext_state 1); on this stock build the "
+        "change is not checkpointed and ap_rollback cannot undo it (ap_undo may)"
+    ),
+    "project": (
+        "project checkpoints need the native extension (ext_state 1); on this stock build the "
+        "open project was not snapshotted, so unsaved work in it is not protected"
+    ),
+}
+
+
+def _auto_checkpoint(name: str) -> dict[str, Any] | None:
+    kind = AUTO_CHECKPOINT.get(name)
+    if kind is None or os.environ.get(AUTOCHECKPOINT_ENV) == "0":
+        return None
+    try:
+        entry = _take_checkpoint(kind, f"before {name}")
+    except OpFailed as exc:
+        if exc.code == "unsupported":
+            return {"taken": False, "reason": NO_CHECKPOINT_REASON.get(kind, "needs the native extension")}
+        return {"taken": False, "error": f"no checkpoint could be taken ({exc.code}: {exc.message}); "
+                                         f"the operation ran anyway"}
+    return {"taken": True, "id": entry["id"], "kinds": entry["kinds"],
+            "rollback": f"ap_rollback(checkpoint_id='{entry['id']}')"}
+
+
+# edit_count() right after this server last created or opened a project: while it is
+# unchanged, an untitled project is known to be empty.
+_project_fresh_at: int | None = None
+
+
+def _mark_project_fresh() -> None:
+    global _project_fresh_at
+    _project_fresh_at = edit_count()
+
+
+def _unsaved_changes() -> bool:
+    """Whether the open project may hold unsaved work. ArmorPaint marks it in the title
+    ("name* - ArmorPaint"), but an untitled project carries the '*' from the start, so an
+    untitled one counts only once this server has edited it (or did not create it)."""
+    hb = read_heartbeat()
+    title = hb.get("app_title") if isinstance(hb, dict) else None
+    if not isinstance(title, str) or not title:
+        return False
+    name = title.rsplit(" - ", 1)[0]
+    if not name.endswith("*"):
+        return False
+    if name == "untitled*" and _project_fresh_at is not None and edit_count() == _project_fresh_at:
+        return False
+    return True
+
+
+GRAPH_ONLY_ROLLBACK_NOTE = (
+    "Only the node graph was restored. Layer paint -- including the fill that "
+    "ap_node_graph_apply or ap_node_recipe made -- is not part of a stock-build checkpoint and "
+    "was left as it is. ap_fill_layer would re-fill the layer with the restored graph, but it "
+    "also overwrites anything painted on that layer since."
+)
+
+
+def _checkpoint_tool(name: str, a: dict[str, Any]) -> dict[str, Any]:
+    cps, graphs, _ = _checkpoint_stores()
+    if name == "ap_checkpoint_list":
+        bridge = graph_bridge()
+        out = []
+        for e in cps.list():
+            out.append({k: e.get(k) for k in ("id", "label", "created", "kinds", "material")}
+                       | {"history_headroom": checkpoints.headroom(bridge, e)})
+        return {"ok": True, "checkpoints": out}
+    if name == "ap_rollback":
+        cid = _req_str(a, "checkpoint_id")
+        try:
+            entry = cps.get(cid)
+        except KeyError:
+            return {"ok": False, "code": "not_found", "error": f"no checkpoint {cid!r}",
+                    "hint": "ap_checkpoint_list lists them."}
+        report = checkpoints.rollback(graph_bridge(), entry, graph_store=graphs)
+        _MESH_CACHE.clear()
+        if report.get("parts") == ["graph"]:
+            report["note"] = GRAPH_ONLY_ROLLBACK_NOTE
+        return {**report, "checkpoint_id": cid}
+    kind = _opt_str(a, "kind") or "auto"
+    if kind not in checkpoints.KINDS:
+        raise BadArgs(f"'kind' must be one of {', '.join(checkpoints.KINDS)}.", arg="kind")
+    try:
+        entry = _take_checkpoint(kind, _opt_str(a, "label") or "")
+    except OpFailed as exc:
+        out = {"ok": False, "code": exc.code, "error": exc.message}
+        if exc.code == "unsupported":
+            out["hint"] = EXT_HINT
+        return out
+    return {"ok": True, "checkpoint_id": entry["id"], "kinds": entry["kinds"],
+            "history_headroom": checkpoints.headroom(graph_bridge(), entry)}
+
+
+def _mesh_op_args(a: dict[str, Any]) -> dict[str, Any]:
+    action = _req_str(a, "action")
+    known = {"unwrap", "calc_normals", "flip_normals", "to_origin", "rotate_x", "rotate_y", "rotate_z",
+             "decimate", "smooth", "subdivide", "bevel", "reimport"}
+    if action not in known:
+        raise BadArgs(f"'action' must be one of {', '.join(sorted(known))}.", arg="action")
+    if action in UV_CHANGING_MESH_OPS and not _opt_bool(a, "confirm_invalidates_paint"):
+        raise BadArgs(
+            f"'{action}' changes the mesh's UVs or topology: paint already on the layers stays where it "
+            f"is in texture space and will no longer line up with the model. Pass "
+            f"confirm_invalidates_paint=true to go ahead (a project checkpoint is taken first).",
+            arg="confirm_invalidates_paint",
+        )
+    wire: dict[str, Any] = {"action": action}
+    if action == "calc_normals":
+        wire["smooth"] = _opt_bool(a, "smooth") is not False
+    if action == "decimate" and a.get("strength") is not None:
+        wire["strength"] = _num(a["strength"], "strength")
+    if action == "bevel" and a.get("amount") is not None:
+        wire["amount"] = _num(a["amount"], "amount")
+    if action == "reimport":
+        path = _norm_path(a, "path", required=False)
+        if path:
+            wire["path"] = path
+    return wire
+
+
+def _mesh_op_tool(a: dict[str, Any]) -> dict[str, Any]:
+    wire = _mesh_op_args(a)
+    try:
+        entry = _take_checkpoint("project", f"before mesh {wire['action']}")
+    except OpFailed as exc:
+        out = {"ok": False, "code": exc.code, "error": exc.message, "tool": "ap_mesh_op"}
+        if exc.code == "unsupported":
+            # The checkpoint runs first, so its refusal names project_snapshot; name the tool.
+            out["error"] = ("ap_mesh_op needs the native extension (ext_state 1): a stock build can "
+                            "neither edit the mesh nor snapshot the project first.")
+            out["hint"] = EXT_HINT
+        return out
+    result = send_to_armorpaint("mesh_op", wire, OP_TIMEOUTS["mesh_op"])
+    _MESH_CACHE.clear()
+    return {"ok": True, "op": "mesh_op", "result": result,
+            "checkpoint": {"id": entry["id"], "kinds": entry["kinds"],
+                           "rollback": f"ap_rollback(checkpoint_id='{entry['id']}')"}}
+
+
+# get_context fields that move on every frame with nothing edited (measured idle: ddirty
+# and pdirty count down each frame), so they must not count as a change.
+VOLATILE_CONTEXT_KEYS = frozenset({"ddirty", "pdirty", "elapsed_ms"})
+
+
+def _settled_window(baseline: Any | None = None) -> Any:
+    """The window at downscale 2 once it shows the latest edit (see _settle_display)."""
+    hb = read_heartbeat()
+    title = (hb.get("app_title") if isinstance(hb, dict) else None) or None
+    try:
+        for _ in range(SETTLE_FRAMES):
+            send_to_armorpaint("ping", {}, 5.0)
+    except BridgeError:
+        pass
+    grab = partial(capture_window, title, None, 2)
+    cap, _ = _settle_display(grab, grab(), baseline)
+    return cap
+
+
+def _state_fingerprint(window_baseline: Any | None = None) -> dict[str, Any]:
+    """What a stock build lets the server see of the project: the context, the active
+    material and its graph, and the window's pixels. Parts that cannot be read are None.
+    ``window_baseline`` (an earlier fingerprint's window) lets the capture wait for a
+    change to reach the window."""
+    parts: dict[str, Any] = {}
+    for key, op in (("context", "get_context"), ("node_graph", "node_list"), ("material", "material_get_active")):
+        try:
+            reply = send_to_armorpaint(op, {}, 15.0)
+            skip = VOLATILE_CONTEXT_KEYS if key == "context" else {"elapsed_ms"}
+            parts[key] = json.dumps({k: v for k, v in reply.items() if k not in skip}, sort_keys=True)
+        except BridgeError:
+            parts[key] = None
+    try:
+        parts["window"] = _settled_window(window_baseline)
+    except (CaptureError, OSError):
+        parts["window"] = None
+    return parts
+
+
+def _compare_fingerprints(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    changed = []
+    for key in before:
+        a, b = before[key], after.get(key)
+        if a is None or b is None:
+            continue
+        if key == "window":
+            try:
+                d = image_diff.diff(a.width, a.height, a.pixels(), b.pixels(), w2=b.width, h2=b.height)
+            except ValueError:
+                changed.append(key)
+                continue
+            if not d["no_visible_change"]:
+                changed.append(key)
+        elif a != b:
+            changed.append(key)
+    return changed
+
+
+GRAPH_TOOLS = frozenset(
+    {"ap_node_graph_get", "ap_node_graph_apply", "ap_node_graph_lint", "ap_node_graph_snapshot",
+     "ap_node_graph_restore", "ap_node_recipe"}
+)
+
+class _SpoolBridge:
+    """node_graph's two-method bridge over the real mailbox."""
+
+    def call(self, op: str, wire: dict[str, Any]) -> dict[str, Any]:
+        return send_to_armorpaint(op, wire, OP_TIMEOUTS.get(op, DEFAULT_TIMEOUT_S))
+
+    def batch(self, items: list[tuple[str, dict[str, Any]]], stop_on_error: bool = False) -> dict[str, Any]:
+        timeout = sum(OP_TIMEOUTS.get(op, DEFAULT_TIMEOUT_S) for op, _ in items)
+        return send_batch(items, min(timeout, 900.0), stop_on_error)
+
+
+def graph_bridge() -> node_graph.Bridge:
+    return _SpoolBridge()
+
+
+STATE_ENV = "ARMORPAINT_MCP_STATE"
+
+
+def _state_dir() -> Path:
+    """Where the server keeps its own state (graph snapshots, ...): $ARMORPAINT_MCP_STATE,
+    else a folder in the spool, which the plugin never touches."""
+    env = os.environ.get(STATE_ENV)
+    return Path(env) if env else spool_resolution().path / "mcp_state"
+
+
+def _snapshots() -> node_graph.SnapshotStore:
+    return node_graph.SnapshotStore(_state_dir() / "graph_snapshots")
+
+
+def _apply_report(report: dict[str, Any], label: str | None) -> dict[str, Any]:
+    snap = report.pop("snapshot", None)
+    if report.get("ok") and snap is not None:
+        report["snapshot_id"] = _snapshots().put(snap, label=label or "before ap_node_graph_apply")
+    return report
+
+
+def _graph_tool(name: str, a: dict[str, Any]) -> dict[str, Any]:
+    bridge = graph_bridge()
+    try:
+        if name == "ap_node_graph_get":
+            return {"ok": True, "graph": node_graph.read_graph(bridge)}
+        if name == "ap_node_graph_lint":
+            return {"ok": True, "issues": node_graph.lint(node_graph.read_graph(bridge))}
+        if name == "ap_node_graph_snapshot":
+            store = _snapshots()
+            if _opt_bool(a, "list"):
+                return {"ok": True, "snapshots": store.list()}
+            sid = store.put(node_graph.snapshot(bridge), label=_opt_str(a, "label"))
+            return {"ok": True, "snapshot_id": sid}
+        if name == "ap_node_graph_restore":
+            sid = _req_str(a, "snapshot_id")
+            try:
+                entry = _snapshots().get(sid)
+            except KeyError:
+                return {"ok": False, "code": "not_found", "error": f"no graph snapshot {sid!r}",
+                        "hint": "ap_node_graph_snapshot(list=true) lists them."}
+            return node_graph.restore(bridge, entry["snapshot"], force=bool(_opt_bool(a, "force")))
+
+        mode = _opt_str(a, "mode")
+        dry_run = bool(_opt_bool(a, "dry_run"))
+        fill = _opt_bool(a, "fill") is not False
+        if name == "ap_node_graph_apply":
+            spec = a.get("spec")
+            if not isinstance(spec, dict):
+                raise BadArgs("'spec' must be an object with 'nodes' (and optionally 'links').", arg="spec")
+            report = node_graph.apply(bridge, spec, mode=mode or "merge", dry_run=dry_run, fill=fill)
+            return _apply_report(report, _opt_str(a, "label"))
+        if name == "ap_node_recipe":
+            rname = _opt_str(a, "name")
+            if not rname:
+                return {"ok": True, "recipes": recipes.list_recipes()}
+            params = a.get("params") or {}
+            if not isinstance(params, dict):
+                raise BadArgs("'params' must be an object.", arg="params")
+            spec = recipes.render(rname, params)
+            if not _opt_bool(a, "apply") and not dry_run:
+                return {"ok": True, "name": rname, "spec": spec,
+                        "hint": "apply=true builds it; or edit the spec and pass it to ap_node_graph_apply."}
+            report = node_graph.apply(bridge, spec, mode=mode or "replace", dry_run=dry_run, fill=fill)
+            return _apply_report(report, f"before recipe {rname}")
+    except node_graph.SpecError as exc:
+        return {"ok": False, "code": "bad_spec", "problems": exc.problems}
+    raise BadArgs(f"unhandled graph tool {name}")
+
+
+# Tools that cannot be batch steps: answered locally, composed of several requests, or
+# would end the session.
+MESH_TOOLS = frozenset({"ap_mesh_inspect", "ap_mesh_uv_layout", "ap_paint_stroke_uv"})
+
+_UNBATCHABLE = LOCAL_TOOLS | GRAPH_TOOLS | MESH_TOOLS | CHECKPOINT_TOOLS | {
+    "ap_batch", "ap_quit", "ap_project_metadata", "ap_material_list", "ap_undo", "ap_redo",
+}
 
 
 def _batch_tool(a: dict[str, Any]) -> dict[str, Any]:
@@ -2333,12 +3580,28 @@ def _batch_tool(a: dict[str, Any]) -> dict[str, Any]:
         items.append((op, wire))
         names.append(tool)
         timeout += OP_TIMEOUTS.get(op, DEFAULT_TIMEOUT_S)
+    if _opt_bool(a, "atomic"):
+        bridge = graph_bridge()
+        cps, graphs, snaps = _checkpoint_stores()
+        entry = checkpoints.take(bridge, kind="auto", label="before atomic batch", store=cps,
+                                 graph_store=graphs, snapshot_dir=snaps)
+        result = bridge.batch(items, True)
+        _name_results(result, names)
+        if result.get("errors"):
+            rb = checkpoints.rollback(bridge, entry, graph_store=graphs)
+            return {"ok": False, "code": "batch_failed", "rolled_back": rb["ok"], "rollback": rb,
+                    "checkpoint_id": entry["id"], "result": result}
+        return {"ok": True, "op": "batch", "result": result, "checkpoint_id": entry["id"]}
     result = send_batch(items, min(timeout, 900.0), bool(_opt_bool(a, "stop_on_error")))
+    _name_results(result, names)
+    return {"ok": True, "op": "batch", "result": result}
+
+
+def _name_results(result: dict[str, Any], names: list[str]) -> None:
     for r in result.get("results") or []:
         i = r.get("i")
         if isinstance(i, int) and 0 <= i < len(names):
             r["tool"] = names[i]
-    return {"ok": True, "op": "batch", "result": result}
 
 
 SERVER_INSTRUCTIONS = (
@@ -2365,14 +3628,38 @@ async def list_tools() -> list[types.Tool]:
     return TOOLS
 
 
+def _reports_failure(content: list[Any]) -> bool:
+    """True when a reply's JSON (its last text block) says ``"ok": false``."""
+    texts = [c for c in content if getattr(c, "type", "") == "text"]
+    if not texts:
+        return False
+    try:
+        payload = json.loads(texts[-1].text)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("ok") is False
+
+
 @server.call_tool()
+async def _mcp_call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+    """The MCP entry point: call_tool's reply, flagged isError when it reports a failure,
+    so a client sees a failed call without parsing the JSON. A batch whose steps failed is
+    not a failure unless it was atomic (and then its reply says ok: false)."""
+    content = await call_tool(name, arguments)
+    return types.CallToolResult(content=content, isError=_reports_failure(content))
+
+
 async def call_tool(
     name: str, arguments: dict[str, Any]
 ) -> list[types.TextContent | types.ImageContent]:
     """Route one MCP tool call through the file mailbox to the ArmorPaint bridge."""
     args = arguments or {}
+    started = time.monotonic()
 
     try:
+        if name in CAPTURE_TOOLS and args.get("capture") is not None:
+            return await _with_capture(name, args)
+
         # --- locally answered tools ---------------------------------------
         if name == "ap_bridge_status":
             probe = _opt_bool(args, "probe")
@@ -2384,6 +3671,23 @@ async def call_tool(
 
         if name == "ap_capture_window":
             return await _capture_window_tool(args)
+
+        if name == "ap_capture_sequence":
+            return await _capture_sequence_tool(args)
+
+        if name in ("ap_paint_stroke", "ap_paint_stroke_world"):
+            return await _stroke_tool(name, args)
+
+        if name == "ap_paint_stroke_uv":
+            return await _uv_stroke_tool(args)
+
+        if name in ("ap_mesh_inspect", "ap_mesh_uv_layout"):
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, partial(_mesh_tool, name, args))
+
+        if name == "ap_paint_stroke_pointer":
+            loop = asyncio.get_running_loop()
+            return _text(await loop.run_in_executor(None, partial(_pointer_stroke_tool, args)))
 
         if name == "ap_read_image_file":
             path_text = _norm_path(args, "path")
@@ -2431,6 +3735,15 @@ async def call_tool(
         if name == "ap_batch":
             return _text(await loop.run_in_executor(None, partial(_batch_tool, args)))
 
+        if name in GRAPH_TOOLS:
+            return _text(await loop.run_in_executor(None, partial(_graph_tool, name, args)))
+
+        if name == "ap_mesh_op":
+            return _text(await loop.run_in_executor(None, partial(_mesh_op_tool, args)))
+
+        if name in CHECKPOINT_TOOLS:
+            return _text(await loop.run_in_executor(None, partial(_checkpoint_tool, name, args)))
+
         # --- bridge round trip --------------------------------------------
         wire = _build_wire_args(name, args)
         op = _wire_op(name, wire)
@@ -2442,6 +3755,22 @@ async def call_tool(
         if name in ("ap_undo", "ap_redo"):
             return _text(await loop.run_in_executor(None, partial(_undo_tool, op, wire)))
 
+        unsaved = _unsaved_changes() if name in ("ap_project_new", "ap_project_open") else None
+        auto_cp = await loop.run_in_executor(None, partial(_auto_checkpoint, name))
+        if unsaved and not (auto_cp or {}).get("taken") and not args.get("discard_unsaved"):
+            refusal: dict[str, Any] = {
+                "ok": False,
+                "code": "unsaved_changes",
+                "tool": name,
+                "error": "The open project has unsaved changes and no checkpoint could be taken, "
+                         "so this call would lose them. Nothing was changed.",
+                "fix": "Save first (ap_project_save / ap_project_save_as), or call again with "
+                       "discard_unsaved=true to throw the changes away.",
+            }
+            if auto_cp is not None:
+                refusal["checkpoint"] = auto_cp
+            return _text(refusal)
+        sent_at = time.monotonic()
         try:
             result = await loop.run_in_executor(
                 None, partial(send_to_armorpaint, op, wire, timeout)
@@ -2462,6 +3791,34 @@ async def call_tool(
             raise
 
         payload: dict[str, Any] = {"ok": True, "op": op, "result": result}
+        now = time.monotonic()
+        payload["timing"] = {
+            "total_ms": round((now - started) * 1000),
+            # request written -> reply read: poll latency, frame wait and the handler
+            "round_trip_ms": round((now - sent_at) * 1000),
+            # the handler alone, as measured inside ArmorPaint
+            "handler_ms": result.get("elapsed_ms") if isinstance(result, dict) else None,
+        }
+
+        if auto_cp is not None:
+            payload["checkpoint"] = auto_cp
+        if name in ("ap_project_new", "ap_project_open"):
+            _mark_project_fresh()
+        if unsaved and not (auto_cp or {}).get("taken"):
+            payload["warning"] = (
+                "The previous project's unsaved changes were discarded (discard_unsaved=true); "
+                "no checkpoint was taken, so they cannot be recovered."
+            )
+
+        if name == "ap_get_app_info" and isinstance(result, dict) and "window_w" in result:
+            # The bridge's window_* are sys_x/y/w/h: the 3D VIEWPORT's rectangle, not the
+            # window (read live: 893x738 at 36,60 in a 1209x831 window).
+            info = {k: v for k, v in result.items() if not k.startswith("window_")}
+            info["viewport_rect"] = [result.get("window_x"), result.get("window_y"),
+                                     result.get("window_w"), result.get("window_h")]
+            info["viewport_rect_note"] = ("the 3D viewport as [x, y, width, height] in window pixels "
+                                          "(ap_capture_window reports the whole window's size)")
+            payload["result"] = info
 
         # Echo resolved enums so the caller can see what the name mapped to.
         if name == "ap_select_tool":

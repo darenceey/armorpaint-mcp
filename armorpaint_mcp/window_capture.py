@@ -51,7 +51,6 @@ class CaptureError(Exception):
 
 @dataclass
 class Capture:
-    png: bytes
     width: int
     height: int
     window_width: int
@@ -59,6 +58,32 @@ class Capture:
     window_id: int
     window_title: str
     method: str
+    scan: bytes | None = None     # PNG scanlines (filter byte 0 + packed RGB per row)
+    rgb: bytes | None = None      # packed 8-bit RGB, derived lazily by pixels()
+    encoded: bytes | None = None  # the PNG, encoded lazily by .png
+
+    @property
+    def png(self) -> bytes:
+        """The PNG. Encoded on first use: a settle loop compares many captures and
+        returns one, and encoding is most of a capture's cost (38 of 58 ms at 1209x831)."""
+        if self.encoded is None:
+            scan = self.scan
+            if scan is None:
+                stride = self.width * 3
+                rgb = self.pixels()
+                scan = b"".join(b"\x00" + rgb[y * stride : (y + 1) * stride] for y in range(self.height))
+            self.encoded = _png(self.width, self.height, scan)
+        return self.encoded
+
+    def pixels(self) -> bytes:
+        """The image as packed RGB rows (for diffing)."""
+        if self.rgb is None:
+            if self.scan is not None:
+                stride = self.width * 3 + 1
+                self.rgb = b"".join(self.scan[y * stride + 1 : (y + 1) * stride] for y in range(self.height))
+            else:
+                _, _, self.rgb = _decode_png_rgb(self.encoded or b"")
+        return self.rgb
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -377,7 +402,7 @@ def _capture_x11(
         x.XCloseDisplay(dpy)
 
     return Capture(
-        png=_png(out_w, out_h, scan),
+        scan=scan,
         width=out_w,
         height=out_h,
         window_width=ww,
@@ -490,7 +515,7 @@ def _capture_win32(
         user32.ReleaseDC(hwnd, hdc_win)
 
     return Capture(
-        png=_png(out_w, out_h, scan), width=out_w, height=out_h, window_width=ww,
+        scan=scan, width=out_w, height=out_h, window_width=ww,
         window_height=wh, window_id=int(hwnd or 0), window_title=title,
         method="win32 PrintWindow(PW_RENDERFULLCONTENT)",
     )
@@ -615,7 +640,7 @@ def _capture_macos(
         rows.append(b"\x00" + bytes(row))
     out_w = len(range(0, w, downscale))
     return Capture(
-        png=_png(out_w, len(rows), b"".join(rows)), width=out_w, height=len(rows),
+        scan=b"".join(rows), width=out_w, height=len(rows),
         window_width=ww, window_height=wh, window_id=win["id"], window_title=win["title"],
         method="macos screencapture -l",
     )
@@ -646,7 +671,7 @@ def _decode_png_rgb(data: bytes) -> tuple[int, int, bytes]:
     for y in range(height):
         f = raw[y * (stride + 1)]
         line = bytearray(raw[y * (stride + 1) + 1 : (y + 1) * (stride + 1)])
-        for i in range(stride):
+        for i in range(stride if f else 0):  # filter 0 (what the capture backends write): as is
             a = line[i - bpp] if i >= bpp else 0
             b = prev[i]
             c = prev[i - bpp] if i >= bpp else 0
